@@ -1,0 +1,16 @@
+[Unit]
+Description=Check for Arch Linux updates and show popup (daily + on boot)
+Requires=arch-update-popup.service
+
+[Timer]
+# Run 5 minutes after the graphical session starts (give the desktop time to load)
+OnStartupSec=5min
+# Then once every day
+OnCalendar=daily
+# If a run was missed (machine was off), run it on next boot
+Persistent=true
+# Randomize by up to 30 minutes so it doesn't fire at an exact known time
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

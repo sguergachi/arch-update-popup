@@ -1,0 +1,13 @@
+[Unit]
+Description=Arch Linux update popup notifier
+After=graphical-session.target network-online.target
+Wants=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/arch-update-popup
+# Exit 0 = no updates (silent), anything else is real failure
+SuccessExitStatus=0
+
+[Install]
+WantedBy=graphical-session.target

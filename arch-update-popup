@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""
+arch-update-popup: Background Arch Linux updater with rich update popup.
+
+Changelog sources tried in order per package:
+  1. GitHub Releases API (if GitHub repo found)
+  2. CHANGELOG.md / NEWS.md from GitHub default branch
+  3. GitLab Releases API (gnome/kde/freedesktop/gitlab.com)
+  4. Arch packaging GitLab commit message (official repos)
+  5. Version-bump string (final fallback)
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QColor
+from PyQt6.QtWidgets import (
+    QApplication, QHeaderView, QHBoxLayout, QLabel, QMainWindow,
+    QProgressBar, QPushButton, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────────────
+
+OFFICIAL_REPOS = {"core", "extra", "multilib", "core-testing", "extra-testing"}
+
+GITLAB_HOSTS = [
+    "gitlab.gnome.org",
+    "invent.kde.org",
+    "gitlab.freedesktop.org",
+    "gitlab.com",
+]
+
+CHANGELOG_FILENAMES = [
+    "CHANGELOG.md", "CHANGELOG", "CHANGES.md", "CHANGES",
+    "NEWS.md", "NEWS", "HISTORY.md", "HISTORY",
+    "ReleaseNotes.md", "releasenotes.md",
+]
+
+UA = {"User-Agent": "arch-update-popup/1.0"}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Low-level helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _get(url: str, accept: str = "application/json", timeout: int = 6) -> bytes:
+    req = urllib.request.Request(url, headers={**UA, "Accept": accept})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def strip_version(ver: str) -> str:
+    """'2:1.2.3-4' → '1.2.3'"""
+    ver = re.sub(r"^\d+:", "", ver)   # strip epoch
+    ver = re.sub(r"-\d+$", "", ver)   # strip pkgrel
+    return ver
+
+
+# Headers that indicate the end of useful content in GitHub release bodies
+_STOP_HEADER_RE = re.compile(
+    r"^##\s*(Install|Download|Assets|Windows|macOS|Linux|Building|Usage"
+    r"|Note[s]?|Other|Requirements|Checksums|SHA|Verify)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Lines that are noise — "See full changelog at …", "For a full list…", etc.
+_BOILERPLATE_RE = re.compile(
+    r"(?:^for a full|^see (?:the |full )|full changelog|release notes at\b"
+    r"|^compare.*https?://)",
+    re.IGNORECASE,
+)
+
+
+def _truncate_github_body(body: str) -> str:
+    """Remove platform-specific install / asset sections from a GitHub release body."""
+    m = _STOP_HEADER_RE.search(body)
+    return body[: m.start()].strip() if m else body
+
+
+def summarize_notes(text: str, max_len: int = 300) -> str:
+    """
+    Clean markdown, extract key bullet points, return a one-liner ≤ max_len chars.
+    """
+    if not text or not text.strip():
+        return ""
+
+    # Drop code fences entirely
+    text = re.sub(r"```[\s\S]*?```", " ", text)
+    text = re.sub(r"`([^`\n]+)`", r"\1", text)
+
+    # Remove whole lines that are just "See CHANGELOG" / "N.N.N CHANGELOG" links
+    # (do this BEFORE link removal so the bare label doesn't bleed through)
+    text = re.sub(
+        r"^\[.*?(?:changelog|release notes?|changes|history)\].*$",
+        "",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+
+    # Flatten markdown links → just the label
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+
+    # Drop PR / commit / issue refs:  (#1234)  (abc1234)  ([#12])
+    text = re.sub(r"\s*\(\[?#\d+\]?\)", "", text)
+    text = re.sub(r"\s*\([0-9a-f]{7,40}\)", "", text)
+
+    # Bare URLs
+    text = re.sub(r"\s*https?://\S+", "", text)
+
+    lines = text.strip().splitlines()
+    intro_parts: list[str] = []
+    bullets: list[str] = []
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # Skip markdown section headers (## Features, ### Fixes, etc.)
+        if re.match(r"^#{1,4}\s", line):
+            continue
+        # Skip category label lines like "Fixes:", "Usability improvements:", "Themes:"
+        if re.match(r"^[A-Za-z][^.!?\n]{0,45}:$", line) and len(line.split()) <= 5:
+            continue
+        # Skip boilerplate "see full changelog" lines
+        if _BOILERPLATE_RE.match(line):
+            continue
+        # Bullet points (- / * / •)
+        if re.match(r"^[-*•]\s+", line):
+            item = re.sub(r"^[-*•]\s+", "", line).strip()
+            if len(item) > 12:
+                bullets.append(item)
+        elif not bullets and len(line) > 12:
+            intro_parts.append(line)
+
+    # Compose: optional intro sentence, then up to 5 bullets
+    parts: list[str] = []
+    intro = " ".join(intro_parts)
+    if intro and len(intro) < 160:
+        parts.append(intro)
+    parts.extend(bullets[:5])
+
+    result = " · ".join(p for p in parts if p).strip(" ·")
+    if not result:
+        result = " ".join(text.split())   # fallback: raw cleaned text
+
+    if len(result) > max_len:
+        result = result[: max_len - 1] + "…"
+    return result
+
+
+def extract_version_section(content: str, ver: str) -> str | None:
+    """
+    Pull out the CHANGELOG.md section that covers `ver`.
+    Handles formats:
+      ## 1.2.3          ## [1.2.3] - 2024-01-01
+      ## v1.2.3         ### Version 1.2.3
+
+    Uses a negative lookahead (?![\\d.]) so that searching for "25.01"
+    does NOT accidentally match the "25.01.1" section header.
+    """
+    lines = content.splitlines()
+    ver_esc = re.escape(ver)
+
+    # Match header lines that contain exactly this version (not a sub-version).
+    # (?![\d.]) prevents "1.2" from matching "1.2.3".
+    header_re = re.compile(
+        rf"^#{{1,4}}\s.*?[Vv]?{ver_esc}(?![\d.])",
+        re.IGNORECASE,
+    )
+
+    start = None
+    for i, line in enumerate(lines):
+        if header_re.search(line):
+            start = i + 1
+            break
+
+    if start is None:
+        return None
+
+    # Collect until the next same-level or higher header
+    section: list[str] = []
+    for line in lines[start:]:
+        if re.match(r"^#{1,4}\s", line) and section:
+            break
+        section.append(line)
+        if len(section) > 60:
+            break
+
+    return "\n".join(section).strip() or None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GitHub
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _parse_github_url(url: str) -> tuple[str, str] | None:
+    m = re.match(r"https?://github\.com/([^/\s#?]+)/([^/\s#?.]+)", url)
+    if m:
+        return m.group(1), m.group(2).rstrip("/")
+    return None
+
+
+def _pkgbuild_github_repo(pkg: str) -> tuple[str, str] | None:
+    """Read the PKGBUILD from Arch GitLab to find the upstream GitHub repo."""
+    try:
+        raw = _get(
+            f"https://gitlab.archlinux.org/archlinux/packaging/packages/{pkg}/-/raw/main/PKGBUILD",
+            accept="text/plain",
+            timeout=5,
+        ).decode(errors="replace")
+        # Look for a non-patch, non-asset GitHub URL
+        for m in re.finditer(
+            r"https://github\.com/([^/\s#?\"'\\)]+)/([^/\s#?.\"'\\)]+?)(?:\.git)?(?:#tag=|/(?:archive|releases)|$|\s)",
+            raw,
+        ):
+            owner, repo = m.group(1), m.group(2)
+            # Skip orgs that are just forks / mirrors
+            if owner.lower() in ("archlinux",):
+                continue
+            return owner, repo
+    except Exception:
+        pass
+    return None
+
+
+def _version_matches_release(ver: str, release: dict) -> bool:
+    """Does an Arch version string correspond to this GitHub release?"""
+    tag = release.get("tag_name", "").lstrip("vV")
+    name = (release.get("name") or "").lstrip("vV")
+    # Numeric component match (most reliable across tag conventions)
+    v_nums = re.findall(r"\d+", ver)
+    for cand in (tag, name):
+        c_nums = re.findall(r"\d+", cand)
+        if v_nums and c_nums and v_nums == c_nums[: len(v_nums)]:
+            return True
+    return False
+
+
+def fetch_github_release_notes(owner: str, repo: str, ver: str) -> str | None:
+    """List recent GitHub releases and return summarized notes for `ver`."""
+    try:
+        data = json.loads(
+            _get(f"https://api.github.com/repos/{owner}/{repo}/releases?per_page=10",
+                 accept="application/vnd.github+json")
+        )
+    except Exception:
+        return None
+
+    for rel in data:
+        if _version_matches_release(ver, rel):
+            body = rel.get("body") or ""
+            if body.strip():
+                body = _truncate_github_body(body)
+                cleaned = summarize_notes(body)
+                if len(cleaned) > 25:   # not just a link dump
+                    return cleaned
+            return None  # matched but no useful body
+
+    return None
+
+
+def fetch_github_changelog_file(owner: str, repo: str, ver: str) -> str | None:
+    """
+    Fetch CHANGELOG.md (or similar) from the GitHub repo and extract
+    the section relevant to `ver`.
+    """
+    for branch in ("main", "master", "HEAD"):
+        for fname in CHANGELOG_FILENAMES:
+            url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{fname}"
+            try:
+                content = _get(url, accept="text/plain", timeout=5).decode(errors="replace")
+                section = extract_version_section(content, ver)
+                if section and len(section) > 40:
+                    return summarize_notes(section)
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    continue
+                break
+            except Exception:
+                break
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GitLab (generic: gnome / kde / freedesktop / gitlab.com)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def fetch_gitlab_release_notes(upstream_url: str, ver: str) -> str | None:
+    for host in GITLAB_HOSTS:
+        pat = rf"https?://{re.escape(host)}/([^/\s#?\"']+/[^/\s#?\"'.]+?)(?:\.git)?(?:/|$)"
+        m = re.match(pat, upstream_url)
+        if not m:
+            continue
+        project = urllib.request.quote(m.group(1), safe="")
+        for tag in (f"v{ver}", ver, f"V{ver}"):
+            try:
+                data = json.loads(
+                    _get(f"https://{host}/api/v4/projects/{project}/releases/{tag}")
+                )
+                desc = data.get("description") or ""
+                if desc.strip():
+                    return summarize_notes(desc)
+            except Exception:
+                continue
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Arch GitLab commit message (fallback for official packages)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def fetch_arch_commit_msg(pkg: str) -> str | None:
+    try:
+        commits = json.loads(
+            _get(
+                f"https://gitlab.archlinux.org/api/v4/projects/"
+                f"archlinux%2Fpackaging%2Fpackages%2F{pkg}"
+                f"/repository/commits?per_page=1"
+            )
+        )
+        if not commits:
+            return None
+        title = commits[0].get("title", "")
+        body_lines = commits[0].get("message", "").strip().splitlines()
+        extras = [l.strip() for l in body_lines[1:] if l.strip()]
+        if extras:
+            return (title + " — " + " ".join(extras[:3]))[:200]
+        return title[:120] if title else None
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main orchestrator
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_whats_new(pkg_name: str, new_ver: str, upstream_url: str, pacman_repo: str) -> str:
+    ver = strip_version(new_ver)
+
+    # ── 1. Find GitHub owner/repo ──────────────────────────────────────────
+    gh = _parse_github_url(upstream_url)
+    if not gh and pacman_repo in OFFICIAL_REPOS:
+        gh = _pkgbuild_github_repo(pkg_name)
+
+    if gh:
+        owner, repo = gh
+        # 1a. CHANGELOG.md/NEWS (more detailed than release body)
+        notes = fetch_github_changelog_file(owner, repo, ver)
+        if notes:
+            return notes
+        # 1b. GitHub Releases body (fallback when no CHANGELOG section found)
+        notes = fetch_github_release_notes(owner, repo, ver)
+        if notes:
+            return notes
+
+    # ── 2. GitLab (GNOME, KDE, freedesktop, gitlab.com) ───────────────────
+    if any(host in upstream_url for host in GITLAB_HOSTS):
+        notes = fetch_gitlab_release_notes(upstream_url, ver)
+        if notes:
+            return notes
+
+    # ── 3. Arch GitLab commit message ──────────────────────────────────────
+    if pacman_repo in OFFICIAL_REPOS:
+        notes = fetch_arch_commit_msg(pkg_name)
+        if notes:
+            return notes
+
+    return f"Version bump: {new_ver}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pacman helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_pending_updates() -> list[dict]:
+    result = subprocess.run(["checkupdates"], capture_output=True, text=True)
+    updates = []
+    if result.returncode == 0:
+        for line in result.stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 4:
+                updates.append({"name": parts[0], "old": parts[1], "new": parts[3]})
+    return updates
+
+
+def fetch_pacman_info(pkg: str) -> dict:
+    result = subprocess.run(["pacman", "-Si", pkg], capture_output=True, text=True)
+    info = {"desc": "", "repo": "", "url": ""}
+    for line in result.stdout.splitlines():
+        if line.startswith("Description"):
+            info["desc"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Repository"):
+            info["repo"] = line.split(":", 1)[1].strip()
+        elif line.startswith("URL "):
+            info["url"] = line.split(":", 1)[1].strip()
+    return info
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Background threads
+# ──────────────────────────────────────────────────────────────────────────────
+
+class InfoFetcher(QThread):
+    row_ready = pyqtSignal(int, str, str)   # row, description, whats_new
+
+    def __init__(self, updates: list[dict]):
+        super().__init__()
+        self.updates = updates
+
+    def run(self):
+        for i, pkg in enumerate(self.updates):
+            info = fetch_pacman_info(pkg["name"])
+            desc = info["desc"] or "No description available"
+            whats_new = get_whats_new(
+                pkg["name"], pkg["new"], info["url"], info["repo"]
+            )
+            self.row_ready.emit(i, desc, whats_new)
+
+
+class UpdateRunner(QThread):
+    done = pyqtSignal(bool, str)
+
+    def run(self):
+        result = subprocess.run(
+            ["pkexec", "pacman", "-Syu", "--noconfirm"],
+            capture_output=True, text=True,
+        )
+        self.done.emit(result.returncode == 0, result.stdout + result.stderr)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main window
+# ──────────────────────────────────────────────────────────────────────────────
+
+class UpdateWindow(QMainWindow):
+    C_PKG  = 0
+    C_OLD  = 1
+    C_NEW  = 2
+    C_DESC = 3
+    C_NEWS = 4
+
+    def __init__(self, updates: list[dict]):
+        super().__init__()
+        self.updates = updates
+        n = len(updates)
+        self.setWindowTitle(f"Arch Linux — {n} Update{'s' if n != 1 else ''} Available")
+        self.setMinimumSize(1300, 640)
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        lay = QVBoxLayout(root)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+
+        hdr = QLabel(
+            f"<b>{n} package{'s' if n != 1 else ''}</b> ready to install"
+            f" &nbsp;·&nbsp; fetching release notes in background…"
+        )
+        hdr.setStyleSheet("font-size: 13px;")
+        lay.addWidget(hdr)
+
+        self.table = QTableWidget(n, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["Package", "Installed", "New Version", "Description", "What's New"]
+        )
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+
+        for i, pkg in enumerate(updates):
+            self._cell(i, self.C_PKG,  pkg["name"], bold=True)
+            self._cell(i, self.C_OLD,  pkg["old"],  muted=True)
+            self._cell(i, self.C_NEW,  pkg["new"],  color="#2ecc71")
+            self._cell(i, self.C_DESC, "Loading…",  muted=True)
+            self._cell(i, self.C_NEWS, "Fetching release notes…", muted=True)
+
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(self.C_PKG,  QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(self.C_OLD,  QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(self.C_NEW,  QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(self.C_DESC, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(self.C_NEWS, QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(self.table)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, n)
+        self.progress.setValue(0)
+        self.progress.setFormat("Loading package info…  %v / %m")
+        lay.addWidget(self.progress)
+
+        self.status = QLabel("")
+        self.status.setStyleSheet("font-style: italic; color: gray; font-size: 12px;")
+        lay.addWidget(self.status)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        self.skip_btn = QPushButton("Skip for Now")
+        self.skip_btn.setFixedHeight(38)
+        self.skip_btn.setMinimumWidth(110)
+        self.skip_btn.clicked.connect(self.close)
+        btn_row.addWidget(self.skip_btn)
+
+        self.update_btn = QPushButton("  Update All  ")
+        self.update_btn.setFixedHeight(38)
+        self.update_btn.setMinimumWidth(130)
+        self.update_btn.setStyleSheet(
+            "QPushButton { background-color:#3584e4; color:white; border-radius:5px;"
+            " font-weight:bold; font-size:13px; padding:0 18px; }"
+            "QPushButton:hover { background-color:#1c71d8; }"
+            "QPushButton:disabled { background-color:#888; color:#ccc; }"
+        )
+        self.update_btn.clicked.connect(self.start_update)
+        btn_row.addWidget(self.update_btn)
+        lay.addLayout(btn_row)
+
+        self.fetcher = InfoFetcher(updates)
+        self.fetcher.row_ready.connect(self._on_row_ready)
+        self.fetcher.finished.connect(self._on_fetch_done)
+        self.fetcher.start()
+        self.runner = None
+
+    def _cell(self, row, col, text, bold=False, color="", muted=False):
+        item = QTableWidgetItem(text)
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        if bold:
+            f = item.font(); f.setBold(True); item.setFont(f)
+        if color:
+            item.setForeground(QColor(color))
+        elif muted:
+            item.setForeground(QColor("#888888"))
+        self.table.setItem(row, col, item)
+
+    def _on_row_ready(self, row, desc, whats_new):
+        self._cell(row, self.C_DESC, desc)
+        self._cell(row, self.C_NEWS, whats_new)
+        self.table.resizeRowToContents(row)
+        self.progress.setValue(self.progress.value() + 1)
+
+    def _on_fetch_done(self):
+        self.progress.setFormat("Release notes loaded  ✓")
+
+    def start_update(self):
+        self.update_btn.setEnabled(False)
+        self.skip_btn.setEnabled(False)
+        self.status.setText("Waiting for authentication — check for polkit popup…")
+        self.progress.setRange(0, 0)
+        self.progress.setFormat("Running update…")
+
+        self.runner = UpdateRunner()
+        self.runner.done.connect(self._on_update_done)
+        self.runner.start()
+
+    def _on_update_done(self, success, _output):
+        n = len(self.updates)
+        if success:
+            subprocess.Popen([
+                "notify-send", "Arch Update Complete",
+                f"Successfully updated {n} package{'s' if n != 1 else ''}.",
+                "-i", "system-software-update", "-t", "9000",
+            ])
+            self.close()
+        else:
+            self.progress.setRange(0, 1); self.progress.setValue(0)
+            self.progress.setFormat("Update failed or was cancelled")
+            self.status.setText("Update failed. Check 'journalctl -xe' for details.")
+            self.update_btn.setEnabled(True)
+            self.skip_btn.setEnabled(True)
+
+    def closeEvent(self, event):
+        if self.fetcher.isRunning():
+            self.fetcher.terminate()
+            self.fetcher.wait(2000)
+        super().closeEvent(event)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main():
+    updates = get_pending_updates()
+    if not updates:
+        sys.exit(0)
+
+    os.environ.setdefault("WAYLAND_DISPLAY", "wayland-0")
+    os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("arch-update-popup")
+
+    win = UpdateWindow(updates)
+    win.show()
+    win.raise_()
+    win.activateWindow()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
