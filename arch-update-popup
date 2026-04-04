@@ -451,13 +451,12 @@ class UpdateRunner(QThread):
 
     def __init__(self, aur_helper: str | None) -> None:
         super().__init__()
-        # AUR helpers run as the current user and handle auth internally.
-        # Without one, use pkexec to elevate pacman.
-        self._cmd = (
-            [aur_helper, "-Syu", "--noconfirm"]
-            if aur_helper
-            else ["pkexec", "pacman", "-Syu", "--noconfirm"]
-        )
+        if aur_helper:
+            # Tell paru/yay to use pkexec instead of sudo so KDE's polkit
+            # agent handles authentication (sudo needs a TTY; pkexec does not).
+            self._cmd = [aur_helper, "--sudo", "/usr/bin/pkexec", "-Syu", "--noconfirm"]
+        else:
+            self._cmd = ["pkexec", "pacman", "-Syu", "--noconfirm"]
 
     def run(self) -> None:
         try:
@@ -568,6 +567,7 @@ class UpdateWindow(QMainWindow):
 
         self._status = QLabel("")
         self._status.setStyleSheet("font-style: italic; color: gray; font-size: 12px;")
+        self._status.setWordWrap(True)
         lay.addWidget(self._status)
 
         # ── Buttons ────────────────────────────────────────────────────────────
@@ -656,7 +656,7 @@ class UpdateWindow(QMainWindow):
         )
         self._status.setText(f"Installing {pkg}…")
 
-    def _on_update_done(self, success: bool, _output: str) -> None:
+    def _on_update_done(self, success: bool, output: str) -> None:
         n = len(self._updates)
         if success:
             subprocess.Popen([
@@ -671,7 +671,10 @@ class UpdateWindow(QMainWindow):
             self._progress.setRange(0, 1)
             self._progress.setValue(0)
             self._progress.setFormat("Update failed or was cancelled")
-            self._status.setText("Update failed — check 'journalctl -xe' for details.")
+            # Show last meaningful lines from the captured output
+            last = [l for l in output.splitlines() if l.strip()][-3:]
+            hint = " · ".join(last) if last else "No output captured"
+            self._status.setText(f"Update failed: {hint}")
             self._update_btn.setEnabled(True)
             self._skip_btn.setEnabled(True)
 
