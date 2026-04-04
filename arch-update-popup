@@ -244,27 +244,28 @@ def _version_matches_release(ver: str, release: dict) -> bool:
     return False
 
 
-def fetch_github_release_notes(owner: str, repo: str, ver: str) -> str | None:
-    """List recent GitHub releases and return summarized notes for `ver`."""
+def fetch_github_release_notes(owner: str, repo: str, ver: str) -> tuple[str | None, str]:
+    """List recent GitHub releases and return (summarized notes, release date) for `ver`."""
     try:
         data = json.loads(
             _get(f"https://api.github.com/repos/{owner}/{repo}/releases?per_page=10",
                  accept="application/vnd.github+json")
         )
     except Exception:
-        return None
+        return None, ""
 
     for rel in data:
         if _version_matches_release(ver, rel):
+            date_str = (rel.get("published_at") or "")[:10]
             body = rel.get("body") or ""
             if body.strip():
                 body = _truncate_github_body(body)
                 cleaned = summarize_notes(body)
                 if len(cleaned) > 25:   # not just a link dump
-                    return cleaned
-            return None  # matched but no useful body
+                    return cleaned, date_str
+            return None, date_str  # matched but no useful body
 
-    return None
+    return None, ""
 
 
 def fetch_github_changelog_file(owner: str, repo: str, ver: str) -> str | None:
@@ -293,7 +294,7 @@ def fetch_github_changelog_file(owner: str, repo: str, ver: str) -> str | None:
 # GitLab (generic: gnome / kde / freedesktop / gitlab.com)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def fetch_gitlab_release_notes(upstream_url: str, ver: str) -> str | None:
+def fetch_gitlab_release_notes(upstream_url: str, ver: str) -> tuple[str | None, str]:
     for host in GITLAB_HOSTS:
         pat = rf"https?://{re.escape(host)}/([^/\s#?\"']+/[^/\s#?\"'.]+?)(?:\.git)?(?:/|$)"
         m = re.match(pat, upstream_url)
@@ -305,19 +306,21 @@ def fetch_gitlab_release_notes(upstream_url: str, ver: str) -> str | None:
                 data = json.loads(
                     _get(f"https://{host}/api/v4/projects/{project}/releases/{tag}")
                 )
+                date_str = (data.get("released_at") or "")[:10]
                 desc = data.get("description") or ""
                 if desc.strip():
-                    return summarize_notes(desc)
+                    return summarize_notes(desc), date_str
+                return None, date_str
             except Exception:
                 continue
-    return None
+    return None, ""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Arch GitLab commit message (fallback for official packages)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def fetch_arch_commit_msg(pkg: str) -> str | None:
+def fetch_arch_commit_msg(pkg: str) -> tuple[str | None, str]:
     try:
         commits = json.loads(
             _get(
@@ -327,22 +330,24 @@ def fetch_arch_commit_msg(pkg: str) -> str | None:
             )
         )
         if not commits:
-            return None
+            return None, ""
+        date_str = (commits[0].get("committed_date") or "")[:10]
         title = commits[0].get("title", "")
         body_lines = commits[0].get("message", "").strip().splitlines()
         extras = [l.strip() for l in body_lines[1:] if l.strip()]
         if extras:
-            return (title + " — " + " ".join(extras[:3]))[:200]
-        return title[:120] if title else None
+            return (title + " — " + " ".join(extras[:3]))[:200], date_str
+        return (title[:120] if title else None), date_str
     except Exception:
-        return None
+        return None, ""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main orchestrator
 # ──────────────────────────────────────────────────────────────────────────────
 
-def get_whats_new(pkg_name: str, new_ver: str, upstream_url: str, pacman_repo: str) -> str:
+def get_whats_new(pkg_name: str, new_ver: str, upstream_url: str, pacman_repo: str) -> tuple[str, str]:
+    """Return (release notes, release date YYYY-MM-DD)."""
     ver = strip_version(new_ver)
 
     # ── 1. Find GitHub owner/repo ──────────────────────────────────────────
@@ -352,28 +357,27 @@ def get_whats_new(pkg_name: str, new_ver: str, upstream_url: str, pacman_repo: s
 
     if gh:
         owner, repo = gh
-        # 1a. CHANGELOG.md/NEWS (more detailed than release body)
-        notes = fetch_github_changelog_file(owner, repo, ver)
+        # Always hit the releases API so we get the release date.
+        rel_notes, date = fetch_github_release_notes(owner, repo, ver)
+        # Prefer CHANGELOG.md/NEWS (more detailed) when available.
+        changelog_notes = fetch_github_changelog_file(owner, repo, ver)
+        notes = changelog_notes or rel_notes
         if notes:
-            return notes
-        # 1b. GitHub Releases body (fallback when no CHANGELOG section found)
-        notes = fetch_github_release_notes(owner, repo, ver)
-        if notes:
-            return notes
+            return notes, date
 
     # ── 2. GitLab (GNOME, KDE, freedesktop, gitlab.com) ───────────────────
     if any(host in upstream_url for host in GITLAB_HOSTS):
-        notes = fetch_gitlab_release_notes(upstream_url, ver)
+        notes, date = fetch_gitlab_release_notes(upstream_url, ver)
         if notes:
-            return notes
+            return notes, date
 
     # ── 3. Arch GitLab commit message ──────────────────────────────────────
     if pacman_repo in OFFICIAL_REPOS:
-        notes = fetch_arch_commit_msg(pkg_name)
+        notes, date = fetch_arch_commit_msg(pkg_name)
         if notes:
-            return notes
+            return notes, date
 
-    return f"Version bump: {new_ver}"
+    return f"Version bump: {new_ver}", ""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -409,7 +413,7 @@ def fetch_pacman_info(pkg: str) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class InfoFetcher(QThread):
-    row_ready = pyqtSignal(int, str, str)   # row, description, whats_new
+    row_ready = pyqtSignal(int, str, str, str)   # row, description, whats_new, date
 
     def __init__(self, updates: list[dict]):
         super().__init__()
@@ -419,10 +423,10 @@ class InfoFetcher(QThread):
         for i, pkg in enumerate(self.updates):
             info = fetch_pacman_info(pkg["name"])
             desc = info["desc"] or "No description available"
-            whats_new = get_whats_new(
+            whats_new, date = get_whats_new(
                 pkg["name"], pkg["new"], info["url"], info["repo"]
             )
-            self.row_ready.emit(i, desc, whats_new)
+            self.row_ready.emit(i, desc, whats_new, date)
 
 
 class UpdateRunner(QThread):
@@ -444,8 +448,9 @@ class UpdateWindow(QMainWindow):
     C_PKG  = 0
     C_OLD  = 1
     C_NEW  = 2
-    C_DESC = 3
-    C_NEWS = 4
+    C_DATE = 3
+    C_DESC = 4
+    C_NEWS = 5
 
     def __init__(self, updates: list[dict]):
         super().__init__()
@@ -467,9 +472,9 @@ class UpdateWindow(QMainWindow):
         hdr.setStyleSheet("font-size: 13px;")
         lay.addWidget(hdr)
 
-        self.table = QTableWidget(n, 5)
+        self.table = QTableWidget(n, 6)
         self.table.setHorizontalHeaderLabels(
-            ["Package", "Installed", "New Version", "Description", "What's New"]
+            ["Package", "Installed", "New Version", "Release Date", "Description", "What's New"]
         )
         self.table.setAlternatingRowColors(True)
         self.table.setWordWrap(True)
@@ -481,6 +486,7 @@ class UpdateWindow(QMainWindow):
             self._cell(i, self.C_PKG,  pkg["name"], bold=True)
             self._cell(i, self.C_OLD,  pkg["old"],  muted=True)
             self._cell(i, self.C_NEW,  pkg["new"],  color="#2ecc71")
+            self._cell(i, self.C_DATE, "–",          muted=True)
             self._cell(i, self.C_DESC, "Loading…",  muted=True)
             self._cell(i, self.C_NEWS, "Fetching release notes…", muted=True)
 
@@ -488,6 +494,7 @@ class UpdateWindow(QMainWindow):
         h.setSectionResizeMode(self.C_PKG,  QHeaderView.ResizeMode.ResizeToContents)
         h.setSectionResizeMode(self.C_OLD,  QHeaderView.ResizeMode.ResizeToContents)
         h.setSectionResizeMode(self.C_NEW,  QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(self.C_DATE, QHeaderView.ResizeMode.ResizeToContents)
         h.setSectionResizeMode(self.C_DESC, QHeaderView.ResizeMode.Stretch)
         h.setSectionResizeMode(self.C_NEWS, QHeaderView.ResizeMode.Stretch)
         lay.addWidget(self.table)
@@ -541,9 +548,10 @@ class UpdateWindow(QMainWindow):
             item.setForeground(QColor("#888888"))
         self.table.setItem(row, col, item)
 
-    def _on_row_ready(self, row, desc, whats_new):
+    def _on_row_ready(self, row, desc, whats_new, date):
         self._cell(row, self.C_DESC, desc)
         self._cell(row, self.C_NEWS, whats_new)
+        self._cell(row, self.C_DATE, date if date else "–", muted=not date)
         self.table.resizeRowToContents(row)
         self.progress.setValue(self.progress.value() + 1)
 
