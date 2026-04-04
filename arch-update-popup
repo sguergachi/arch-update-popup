@@ -607,7 +607,6 @@ class UpdateWindow(QMainWindow):
                 self._cell(i, self.C_DATE, date or "–", muted=not date)
                 self._cell(i, self.C_DESC, desc)
                 self._cell(i, self.C_NEWS, notes)
-                self.table.resizeRowToContents(i)
             else:
                 self._cell(i, self.C_DATE, "–",                       muted=True)
                 self._cell(i, self.C_DESC, "Loading…",                 muted=True)
@@ -743,6 +742,16 @@ class UpdateWindow(QMainWindow):
             self._status.setText(f"Update failed: {hint}")
             self._update_btn.setEnabled(True)
             self._skip_btn.setEnabled(True)
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        # Resize rows after the window is laid out so stretch columns have
+        # their final widths — avoids over-tall rows from premature wrapping.
+        QTimer.singleShot(0, self._resize_all_rows)
+
+    def _resize_all_rows(self) -> None:
+        for i in range(len(self._updates)):
+            self.table.resizeRowToContents(i)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         super().closeEvent(event)
