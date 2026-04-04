@@ -16,10 +16,14 @@ Changelog sources tried in order per package:
 
 import json
 import os
+import pty
 import re
+import select
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -64,6 +68,7 @@ _ICON_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
 _INSTALL_RE = re.compile(
     r"\((\d+)/(\d+)\)\s+(?:installing|upgrading|reinstalling)\s+(\S+)"
 )
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 # ── Network helpers ────────────────────────────────────────────────────────────
 
@@ -451,33 +456,94 @@ class UpdateRunner(QThread):
 
     def __init__(self, aur_helper: str | None) -> None:
         super().__init__()
+        self._askpass: str | None = None
+
         if aur_helper:
-            # Tell paru/yay to use pkexec instead of sudo so KDE's polkit
-            # agent handles authentication (sudo needs a TTY; pkexec does not).
-            self._cmd = [aur_helper, "--sudo", "/usr/bin/pkexec", "-Syu", "--noconfirm"]
+            # Write a temporary kdialog-based askpass script so sudo can show
+            # a graphical password dialog and cache the credential for the
+            # full update session (avoiding one polkit prompt per package).
+            fd, path = tempfile.mkstemp(suffix=".sh", prefix="arch-update-askpass-")
+            with os.fdopen(fd, "w") as f:
+                f.write(
+                    '#!/bin/bash\n'
+                    'kdialog --title "Arch Update" --password '
+                    '"${1:-Enter sudo password to install updates:}" 2>/dev/null\n'
+                )
+            os.chmod(path, stat.S_IRWXU)
+            self._askpass = path
+            # --sudoflags "-A" tells paru to pass -A to every sudo call,
+            # which makes sudo use SUDO_ASKPASS instead of a TTY prompt.
+            self._cmd = [aur_helper, "--sudoflags", "-A", "-Syu", "--noconfirm"]
         else:
             self._cmd = ["pkexec", "pacman", "-Syu", "--noconfirm"]
 
     def run(self) -> None:
+        env = os.environ.copy()
+        if self._askpass:
+            env["SUDO_ASKPASS"] = self._askpass
+
+        # Use a pty so paru/pacman think they're writing to a terminal and
+        # flush output per line rather than buffering to the pipe.
+        master_fd, slave_fd = pty.openpty()
         try:
             proc = subprocess.Popen(
                 self._cmd,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
+                stdout=slave_fd, stderr=slave_fd,
+                stdin=subprocess.DEVNULL,
+                env=env, close_fds=True,
             )
         except FileNotFoundError as e:
+            os.close(master_fd)
+            os.close(slave_fd)
+            self._cleanup()
             self.done.emit(False, str(e))
             return
 
+        os.close(slave_fd)  # parent doesn't need the slave end
+
         lines: list[str] = []
-        for raw in proc.stdout:
-            line = raw.rstrip()
-            lines.append(line)
-            m = _INSTALL_RE.match(line)
-            if m:
-                self.install_progress.emit(int(m.group(1)), int(m.group(2)), m.group(3))
+        buf = ""
+        while True:
+            try:
+                ready, _, _ = select.select([master_fd], [], [], 0.05)
+            except (OSError, ValueError):
+                break
+            if ready:
+                try:
+                    buf += os.read(master_fd, 4096).decode(errors="replace")
+                except OSError:
+                    break
+                while "\n" in buf:
+                    raw, buf = buf.split("\n", 1)
+                    for fragment in raw.split("\r"):
+                        fragment = _ANSI_RE.sub("", fragment).strip()
+                        if not fragment:
+                            continue
+                        lines.append(fragment)
+                        m = _INSTALL_RE.match(fragment)
+                        if m:
+                            self.install_progress.emit(
+                                int(m.group(1)), int(m.group(2)), m.group(3)
+                            )
+            elif proc.poll() is not None:
+                break
+
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
         proc.wait()
+        self._cleanup()
         self.done.emit(proc.returncode == 0, "\n".join(lines[-20:]))
+
+    def _cleanup(self) -> None:
+        if self._askpass:
+            try:
+                os.unlink(self._askpass)
+            except OSError:
+                pass
+            self._askpass = None
 
 
 # ── Update window ──────────────────────────────────────────────────────────────
@@ -637,7 +703,7 @@ class UpdateWindow(QMainWindow):
         self._skip_btn.setEnabled(False)
         n = len(self._updates)
         self._hdr.setText(f"<b>0</b> installed &nbsp;·&nbsp; <b>{n}</b> remaining")
-        self._status.setText("Waiting for authentication — check for polkit popup…")
+        self._status.setText("Waiting for authentication — a password dialog should appear…")
         self._progress.setRange(0, 0)   # indeterminate spinner until first package installs
         self._progress.setFormat("")
 
