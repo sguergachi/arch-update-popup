@@ -1,34 +1,38 @@
 #!/usr/bin/env python3
 """
-arch-update-popup: Background Arch Linux updater with rich update popup.
+arch-update-popup: System tray updater for Arch Linux.
+
+Runs persistently in the system tray. Checks for updates every 30 minutes
+(official repos via checkupdates, AUR via paru/yay) and pre-fetches release
+notes in the background before the update window is opened.
 
 Changelog sources tried in order per package:
-  1. GitHub Releases API (if GitHub repo found)
+  1. GitHub Releases API (date + notes)
   2. CHANGELOG.md / NEWS.md from GitHub default branch
   3. GitLab Releases API (gnome/kde/freedesktop/gitlab.com)
-  4. Arch packaging GitLab commit message (official repos)
+  4. Arch packaging GitLab commit message (official repos only)
   5. Version-bump string (final fallback)
 """
 
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, QByteArray, QObject, QRectF, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
-    QApplication, QHeaderView, QHBoxLayout, QLabel, QMainWindow,
-    QProgressBar, QPushButton, QTableWidget, QTableWidgetItem,
+    QApplication, QHeaderView, QHBoxLayout, QLabel, QMainWindow, QMenu,
+    QProgressBar, QPushButton, QSystemTrayIcon, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Constants ──────────────────────────────────────────────────────────────────
 
 OFFICIAL_REPOS = {"core", "extra", "multilib", "core-testing", "extra-testing"}
 
@@ -45,14 +49,26 @@ CHANGELOG_FILENAMES = [
     "ReleaseNotes.md", "releasenotes.md",
 ]
 
-UA = {"User-Agent": "arch-update-popup/1.0"}
+_UA = {"User-Agent": "arch-update-popup/1.0"}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Low-level helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# Material Design refresh icon centred on a blue circle
+_ICON_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <circle cx="24" cy="24" r="22" fill="#3584e4"/>
+  <g transform="translate(12,12)" fill="white">
+    <path d="M17.65 6.35C16.2 4.9 14.21 4 12 4 7.58 4 4 7.58 4 12s3.58 8 8 8
+             c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6
+             s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
+  </g>
+</svg>"""
+
+_INSTALL_RE = re.compile(
+    r"\((\d+)/(\d+)\)\s+(?:installing|upgrading|reinstalling)\s+(\S+)"
+)
+
+# ── Network helpers ────────────────────────────────────────────────────────────
 
 def _get(url: str, accept: str = "application/json", timeout: int = 6) -> bytes:
-    req = urllib.request.Request(url, headers={**UA, "Accept": accept})
+    req = urllib.request.Request(url, headers={**_UA, "Accept": accept})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
@@ -64,14 +80,12 @@ def strip_version(ver: str) -> str:
     return ver
 
 
-# Headers that indicate the end of useful content in GitHub release bodies
 _STOP_HEADER_RE = re.compile(
     r"^##\s*(Install|Download|Assets|Windows|macOS|Linux|Building|Usage"
     r"|Note[s]?|Other|Requirements|Checksums|SHA|Verify)",
     re.IGNORECASE | re.MULTILINE,
 )
 
-# Lines that are noise — "See full changelog at …", "For a full list…", etc.
 _BOILERPLATE_RE = re.compile(
     r"(?:^for a full|^see (?:the |full )|full changelog|release notes at\b"
     r"|^compare.*https?://)",
@@ -86,33 +100,21 @@ def _truncate_github_body(body: str) -> str:
 
 
 def summarize_notes(text: str, max_len: int = 300) -> str:
-    """
-    Clean markdown, extract key bullet points, return a one-liner ≤ max_len chars.
-    """
+    """Clean markdown, extract key bullet points, return a one-liner ≤ max_len chars."""
     if not text or not text.strip():
         return ""
 
-    # Drop code fences entirely
     text = re.sub(r"```[\s\S]*?```", " ", text)
     text = re.sub(r"`([^`\n]+)`", r"\1", text)
-
-    # Remove whole lines that are just "See CHANGELOG" / "N.N.N CHANGELOG" links
-    # (do this BEFORE link removal so the bare label doesn't bleed through)
     text = re.sub(
         r"^\[.*?(?:changelog|release notes?|changes|history)\].*$",
         "",
         text,
         flags=re.IGNORECASE | re.MULTILINE,
     )
-
-    # Flatten markdown links → just the label
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-
-    # Drop PR / commit / issue refs:  (#1234)  (abc1234)  ([#12])
     text = re.sub(r"\s*\(\[?#\d+\]?\)", "", text)
     text = re.sub(r"\s*\([0-9a-f]{7,40}\)", "", text)
-
-    # Bare URLs
     text = re.sub(r"\s*https?://\S+", "", text)
 
     lines = text.strip().splitlines()
@@ -123,16 +125,12 @@ def summarize_notes(text: str, max_len: int = 300) -> str:
         line = line.strip()
         if not line:
             continue
-        # Skip markdown section headers (## Features, ### Fixes, etc.)
         if re.match(r"^#{1,4}\s", line):
             continue
-        # Skip category label lines like "Fixes:", "Usability improvements:", "Themes:"
         if re.match(r"^[A-Za-z][^.!?\n]{0,45}:$", line) and len(line.split()) <= 5:
             continue
-        # Skip boilerplate "see full changelog" lines
         if _BOILERPLATE_RE.match(line):
             continue
-        # Bullet points (- / * / •)
         if re.match(r"^[-*•]\s+", line):
             item = re.sub(r"^[-*•]\s+", "", line).strip()
             if len(item) > 12:
@@ -140,7 +138,6 @@ def summarize_notes(text: str, max_len: int = 300) -> str:
         elif not bullets and len(line) > 12:
             intro_parts.append(line)
 
-    # Compose: optional intro sentence, then up to 5 bullets
     parts: list[str] = []
     intro = " ".join(intro_parts)
     if intro and len(intro) < 160:
@@ -149,7 +146,7 @@ def summarize_notes(text: str, max_len: int = 300) -> str:
 
     result = " · ".join(p for p in parts if p).strip(" ·")
     if not result:
-        result = " ".join(text.split())   # fallback: raw cleaned text
+        result = " ".join(text.split())
 
     if len(result) > max_len:
         result = result[: max_len - 1] + "…"
@@ -158,19 +155,11 @@ def summarize_notes(text: str, max_len: int = 300) -> str:
 
 def extract_version_section(content: str, ver: str) -> str | None:
     """
-    Pull out the CHANGELOG.md section that covers `ver`.
-    Handles formats:
-      ## 1.2.3          ## [1.2.3] - 2024-01-01
-      ## v1.2.3         ### Version 1.2.3
-
-    Uses a negative lookahead (?![\\d.]) so that searching for "25.01"
-    does NOT accidentally match the "25.01.1" section header.
+    Pull the CHANGELOG section for `ver`, handling common header formats.
+    Uses a negative lookahead so "25.01" won't match a "25.01.1" header.
     """
     lines = content.splitlines()
     ver_esc = re.escape(ver)
-
-    # Match header lines that contain exactly this version (not a sub-version).
-    # (?![\d.]) prevents "1.2" from matching "1.2.3".
     header_re = re.compile(
         rf"^#{{1,4}}\s.*?[Vv]?{ver_esc}(?![\d.])",
         re.IGNORECASE,
@@ -181,11 +170,9 @@ def extract_version_section(content: str, ver: str) -> str | None:
         if header_re.search(line):
             start = i + 1
             break
-
     if start is None:
         return None
 
-    # Collect until the next same-level or higher header
     section: list[str] = []
     for line in lines[start:]:
         if re.match(r"^#{1,4}\s", line) and section:
@@ -197,15 +184,11 @@ def extract_version_section(content: str, ver: str) -> str | None:
     return "\n".join(section).strip() or None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GitHub
-# ──────────────────────────────────────────────────────────────────────────────
+# ── GitHub ─────────────────────────────────────────────────────────────────────
 
 def _parse_github_url(url: str) -> tuple[str, str] | None:
     m = re.match(r"https?://github\.com/([^/\s#?]+)/([^/\s#?.]+)", url)
-    if m:
-        return m.group(1), m.group(2).rstrip("/")
-    return None
+    return (m.group(1), m.group(2).rstrip("/")) if m else None
 
 
 def _pkgbuild_github_repo(pkg: str) -> tuple[str, str] | None:
@@ -216,26 +199,21 @@ def _pkgbuild_github_repo(pkg: str) -> tuple[str, str] | None:
             accept="text/plain",
             timeout=5,
         ).decode(errors="replace")
-        # Look for a non-patch, non-asset GitHub URL
         for m in re.finditer(
             r"https://github\.com/([^/\s#?\"'\\)]+)/([^/\s#?.\"'\\)]+?)(?:\.git)?(?:#tag=|/(?:archive|releases)|$|\s)",
             raw,
         ):
             owner, repo = m.group(1), m.group(2)
-            # Skip orgs that are just forks / mirrors
-            if owner.lower() in ("archlinux",):
-                continue
-            return owner, repo
+            if owner.lower() not in ("archlinux",):
+                return owner, repo
     except Exception:
         pass
     return None
 
 
 def _version_matches_release(ver: str, release: dict) -> bool:
-    """Does an Arch version string correspond to this GitHub release?"""
     tag = release.get("tag_name", "").lstrip("vV")
     name = (release.get("name") or "").lstrip("vV")
-    # Numeric component match (most reliable across tag conventions)
     v_nums = re.findall(r"\d+", ver)
     for cand in (tag, name):
         c_nums = re.findall(r"\d+", cand)
@@ -245,11 +223,13 @@ def _version_matches_release(ver: str, release: dict) -> bool:
 
 
 def fetch_github_release_notes(owner: str, repo: str, ver: str) -> tuple[str | None, str]:
-    """List recent GitHub releases and return (summarized notes, release date) for `ver`."""
+    """Return (summarized notes, release date YYYY-MM-DD) for `ver`."""
     try:
         data = json.loads(
-            _get(f"https://api.github.com/repos/{owner}/{repo}/releases?per_page=10",
-                 accept="application/vnd.github+json")
+            _get(
+                f"https://api.github.com/repos/{owner}/{repo}/releases?per_page=10",
+                accept="application/vnd.github+json",
+            )
         )
     except Exception:
         return None, ""
@@ -259,20 +239,16 @@ def fetch_github_release_notes(owner: str, repo: str, ver: str) -> tuple[str | N
             date_str = (rel.get("published_at") or "")[:10]
             body = rel.get("body") or ""
             if body.strip():
-                body = _truncate_github_body(body)
-                cleaned = summarize_notes(body)
-                if len(cleaned) > 25:   # not just a link dump
+                cleaned = summarize_notes(_truncate_github_body(body))
+                if len(cleaned) > 25:
                     return cleaned, date_str
-            return None, date_str  # matched but no useful body
+            return None, date_str
 
     return None, ""
 
 
 def fetch_github_changelog_file(owner: str, repo: str, ver: str) -> str | None:
-    """
-    Fetch CHANGELOG.md (or similar) from the GitHub repo and extract
-    the section relevant to `ver`.
-    """
+    """Fetch CHANGELOG.md (or similar) and extract the section for `ver`."""
     for branch in ("main", "master", "HEAD"):
         for fname in CHANGELOG_FILENAMES:
             url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{fname}"
@@ -290,9 +266,7 @@ def fetch_github_changelog_file(owner: str, repo: str, ver: str) -> str | None:
     return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GitLab (generic: gnome / kde / freedesktop / gitlab.com)
-# ──────────────────────────────────────────────────────────────────────────────
+# ── GitLab ─────────────────────────────────────────────────────────────────────
 
 def fetch_gitlab_release_notes(upstream_url: str, ver: str) -> tuple[str | None, str]:
     for host in GITLAB_HOSTS:
@@ -316,9 +290,7 @@ def fetch_gitlab_release_notes(upstream_url: str, ver: str) -> tuple[str | None,
     return None, ""
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Arch GitLab commit message (fallback for official packages)
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Arch GitLab ────────────────────────────────────────────────────────────────
 
 def fetch_arch_commit_msg(pkg: str) -> tuple[str | None, str]:
     try:
@@ -334,7 +306,7 @@ def fetch_arch_commit_msg(pkg: str) -> tuple[str | None, str]:
         date_str = (commits[0].get("committed_date") or "")[:10]
         title = commits[0].get("title", "")
         body_lines = commits[0].get("message", "").strip().splitlines()
-        extras = [l.strip() for l in body_lines[1:] if l.strip()]
+        extras = [ln.strip() for ln in body_lines[1:] if ln.strip()]
         if extras:
             return (title + " — " + " ".join(extras[:3]))[:200], date_str
         return (title[:120] if title else None), date_str
@@ -342,36 +314,32 @@ def fetch_arch_commit_msg(pkg: str) -> tuple[str | None, str]:
         return None, ""
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main orchestrator
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Orchestrator ───────────────────────────────────────────────────────────────
 
-def get_whats_new(pkg_name: str, new_ver: str, upstream_url: str, pacman_repo: str) -> tuple[str, str]:
+def get_whats_new(
+    pkg_name: str, new_ver: str, upstream_url: str, pacman_repo: str
+) -> tuple[str, str]:
     """Return (release notes, release date YYYY-MM-DD)."""
     ver = strip_version(new_ver)
 
-    # ── 1. Find GitHub owner/repo ──────────────────────────────────────────
     gh = _parse_github_url(upstream_url)
     if not gh and pacman_repo in OFFICIAL_REPOS:
         gh = _pkgbuild_github_repo(pkg_name)
 
     if gh:
         owner, repo = gh
-        # Always hit the releases API so we get the release date.
+        # Always fetch releases for the date; prefer CHANGELOG notes when available.
         rel_notes, date = fetch_github_release_notes(owner, repo, ver)
-        # Prefer CHANGELOG.md/NEWS (more detailed) when available.
         changelog_notes = fetch_github_changelog_file(owner, repo, ver)
         notes = changelog_notes or rel_notes
         if notes:
             return notes, date
 
-    # ── 2. GitLab (GNOME, KDE, freedesktop, gitlab.com) ───────────────────
     if any(host in upstream_url for host in GITLAB_HOSTS):
         notes, date = fetch_gitlab_release_notes(upstream_url, ver)
         if notes:
             return notes, date
 
-    # ── 3. Arch GitLab commit message ──────────────────────────────────────
     if pacman_repo in OFFICIAL_REPOS:
         notes, date = fetch_arch_commit_msg(pkg_name)
         if notes:
@@ -380,71 +348,145 @@ def get_whats_new(pkg_name: str, new_ver: str, upstream_url: str, pacman_repo: s
     return f"Version bump: {new_ver}", ""
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Pacman helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Pacman / AUR helpers ───────────────────────────────────────────────────────
 
-def get_pending_updates() -> list[dict]:
-    result = subprocess.run(["checkupdates"], capture_output=True, text=True)
-    updates = []
-    if result.returncode == 0:
-        for line in result.stdout.strip().splitlines():
+def _find_aur_helper() -> str | None:
+    """Return the first available AUR helper (paru or yay), or None."""
+    for h in ("paru", "yay"):
+        if shutil.which(h):
+            return h
+    return None
+
+
+def get_pending_updates(aur_helper: str | None) -> list[dict]:
+    updates: list[dict] = []
+
+    # Official repo updates
+    r = subprocess.run(["checkupdates"], capture_output=True, text=True)
+    if r.returncode == 0:
+        for line in r.stdout.strip().splitlines():
             parts = line.split()
             if len(parts) >= 4:
                 updates.append({"name": parts[0], "old": parts[1], "new": parts[3]})
+
+    # AUR updates
+    if aur_helper:
+        r = subprocess.run([aur_helper, "-Qua"], capture_output=True, text=True)
+        if r.returncode == 0:
+            for line in r.stdout.strip().splitlines():
+                parts = line.split()
+                if len(parts) >= 4:
+                    updates.append({"name": parts[0], "old": parts[1], "new": parts[3]})
+
     return updates
 
 
 def fetch_pacman_info(pkg: str) -> dict:
-    result = subprocess.run(["pacman", "-Si", pkg], capture_output=True, text=True)
-    info = {"desc": "", "repo": "", "url": ""}
-    for line in result.stdout.splitlines():
+    """Fetch package info; falls back to local DB for AUR packages."""
+    info: dict = {"desc": "", "repo": "", "url": ""}
+
+    r = subprocess.run(["pacman", "-Si", pkg], capture_output=True, text=True)
+    src = r.stdout if r.returncode == 0 else ""
+
+    if not src:
+        # AUR / manually-installed package — use local database
+        r = subprocess.run(["pacman", "-Qi", pkg], capture_output=True, text=True)
+        src = r.stdout
+        info["repo"] = "aur"
+
+    for line in src.splitlines():
         if line.startswith("Description"):
             info["desc"] = line.split(":", 1)[1].strip()
         elif line.startswith("Repository"):
             info["repo"] = line.split(":", 1)[1].strip()
         elif line.startswith("URL "):
             info["url"] = line.split(":", 1)[1].strip()
+
     return info
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Background threads
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Background threads ─────────────────────────────────────────────────────────
+
+class UpdateChecker(QThread):
+    """Checks for pending updates off the main thread."""
+    updates_found = pyqtSignal(list)
+    no_updates    = pyqtSignal()
+
+    def __init__(self, aur_helper: str | None) -> None:
+        super().__init__()
+        self._aur_helper = aur_helper
+
+    def run(self) -> None:
+        updates = get_pending_updates(self._aur_helper)
+        if updates:
+            self.updates_found.emit(updates)
+        else:
+            self.no_updates.emit()
+
 
 class InfoFetcher(QThread):
-    row_ready = pyqtSignal(int, str, str, str)   # row, description, whats_new, date
+    """Fetches description and release notes for each pending update."""
+    row_ready = pyqtSignal(int, str, str, str)  # row, desc, notes, date
 
-    def __init__(self, updates: list[dict]):
+    def __init__(self, updates: list[dict]) -> None:
         super().__init__()
-        self.updates = updates
+        self._updates = updates
 
-    def run(self):
-        for i, pkg in enumerate(self.updates):
+    def run(self) -> None:
+        for i, pkg in enumerate(self._updates):
+            if self.isInterruptionRequested():
+                return
             info = fetch_pacman_info(pkg["name"])
             desc = info["desc"] or "No description available"
-            whats_new, date = get_whats_new(
+            notes, date = get_whats_new(
                 pkg["name"], pkg["new"], info["url"], info["repo"]
             )
-            self.row_ready.emit(i, desc, whats_new, date)
+            self.row_ready.emit(i, desc, notes, date)
 
 
 class UpdateRunner(QThread):
-    done = pyqtSignal(bool, str)
+    """Runs the package update and streams per-package install progress."""
+    install_progress = pyqtSignal(int, int, str)  # current, total, pkg_name
+    done             = pyqtSignal(bool, str)       # success, last output lines
 
-    def run(self):
-        result = subprocess.run(
-            ["pkexec", "pacman", "-Syu", "--noconfirm"],
-            capture_output=True, text=True,
+    def __init__(self, aur_helper: str | None) -> None:
+        super().__init__()
+        # AUR helpers run as the current user and handle auth internally.
+        # Without one, use pkexec to elevate pacman.
+        self._cmd = (
+            [aur_helper, "-Syu", "--noconfirm"]
+            if aur_helper
+            else ["pkexec", "pacman", "-Syu", "--noconfirm"]
         )
-        self.done.emit(result.returncode == 0, result.stdout + result.stderr)
+
+    def run(self) -> None:
+        try:
+            proc = subprocess.Popen(
+                self._cmd,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+        except FileNotFoundError as e:
+            self.done.emit(False, str(e))
+            return
+
+        lines: list[str] = []
+        for raw in proc.stdout:
+            line = raw.rstrip()
+            lines.append(line)
+            m = _INSTALL_RE.match(line)
+            if m:
+                self.install_progress.emit(int(m.group(1)), int(m.group(2)), m.group(3))
+        proc.wait()
+        self.done.emit(proc.returncode == 0, "\n".join(lines[-20:]))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main window
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Update window ──────────────────────────────────────────────────────────────
 
 class UpdateWindow(QMainWindow):
+    closed           = pyqtSignal()
+    update_succeeded = pyqtSignal()
+
     C_PKG  = 0
     C_OLD  = 1
     C_NEW  = 2
@@ -452,11 +494,20 @@ class UpdateWindow(QMainWindow):
     C_DESC = 4
     C_NEWS = 5
 
-    def __init__(self, updates: list[dict]):
+    def __init__(
+        self,
+        updates:     list[dict],
+        cached_info: dict[int, tuple[str, str, str]],
+        aur_helper:  str | None,
+    ) -> None:
         super().__init__()
-        self.updates = updates
+        self._updates    = updates
+        self._aur_helper = aur_helper
+        self._runner:    UpdateRunner | None = None
+        self._updating   = False
         n = len(updates)
-        self.setWindowTitle(f"Arch Linux — {n} Update{'s' if n != 1 else ''} Available")
+
+        self.setWindowTitle(f"Arch Update  —  {n} package{'s' if n != 1 else ''} available")
         self.setMinimumSize(1300, 640)
 
         root = QWidget()
@@ -465,13 +516,13 @@ class UpdateWindow(QMainWindow):
         lay.setContentsMargins(14, 14, 14, 14)
         lay.setSpacing(10)
 
-        hdr = QLabel(
-            f"<b>{n} package{'s' if n != 1 else ''}</b> ready to install"
-            f" &nbsp;·&nbsp; fetching release notes in background…"
-        )
-        hdr.setStyleSheet("font-size: 13px;")
-        lay.addWidget(hdr)
+        n_cached = sum(1 for i in range(n) if i in cached_info)
+        self._hdr = QLabel()
+        self._hdr.setStyleSheet("font-size: 13px;")
+        self._set_idle_header(n_cached)
+        lay.addWidget(self._hdr)
 
+        # ── Table ──────────────────────────────────────────────────────────────
         self.table = QTableWidget(n, 6)
         self.table.setHorizontalHeaderLabels(
             ["Package", "Installed", "New Version", "Release Date", "Description", "What's New"]
@@ -483,12 +534,19 @@ class UpdateWindow(QMainWindow):
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
 
         for i, pkg in enumerate(updates):
-            self._cell(i, self.C_PKG,  pkg["name"], bold=True)
-            self._cell(i, self.C_OLD,  pkg["old"],  muted=True)
-            self._cell(i, self.C_NEW,  pkg["new"],  color="#2ecc71")
-            self._cell(i, self.C_DATE, "–",          muted=True)
-            self._cell(i, self.C_DESC, "Loading…",  muted=True)
-            self._cell(i, self.C_NEWS, "Fetching release notes…", muted=True)
+            self._cell(i, self.C_PKG, pkg["name"], bold=True)
+            self._cell(i, self.C_OLD, pkg["old"],  muted=True)
+            self._cell(i, self.C_NEW, pkg["new"],  color="#2ecc71")
+            if i in cached_info:
+                desc, notes, date = cached_info[i]
+                self._cell(i, self.C_DATE, date or "–", muted=not date)
+                self._cell(i, self.C_DESC, desc)
+                self._cell(i, self.C_NEWS, notes)
+                self.table.resizeRowToContents(i)
+            else:
+                self._cell(i, self.C_DATE, "–",                       muted=True)
+                self._cell(i, self.C_DESC, "Loading…",                 muted=True)
+                self._cell(i, self.C_NEWS, "Fetching release notes…",  muted=True)
 
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(self.C_PKG,  QHeaderView.ResizeMode.ResizeToContents)
@@ -499,45 +557,53 @@ class UpdateWindow(QMainWindow):
         h.setSectionResizeMode(self.C_NEWS, QHeaderView.ResizeMode.Stretch)
         lay.addWidget(self.table)
 
-        self.progress = QProgressBar()
-        self.progress.setRange(0, n)
-        self.progress.setValue(0)
-        self.progress.setFormat("Loading package info…  %v / %m")
-        lay.addWidget(self.progress)
+        # ── Progress / status ──────────────────────────────────────────────────
+        self._progress = QProgressBar()
+        self._progress.setRange(0, n)
+        self._progress.setValue(n_cached)
+        self._progress.setFormat(
+            "Release notes loaded  ✓" if n_cached >= n else "Loading…  %v / %m"
+        )
+        lay.addWidget(self._progress)
 
-        self.status = QLabel("")
-        self.status.setStyleSheet("font-style: italic; color: gray; font-size: 12px;")
-        lay.addWidget(self.status)
+        self._status = QLabel("")
+        self._status.setStyleSheet("font-style: italic; color: gray; font-size: 12px;")
+        lay.addWidget(self._status)
 
+        # ── Buttons ────────────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
         btn_row.addStretch()
 
-        self.skip_btn = QPushButton("Skip for Now")
-        self.skip_btn.setFixedHeight(38)
-        self.skip_btn.setMinimumWidth(110)
-        self.skip_btn.clicked.connect(self.close)
-        btn_row.addWidget(self.skip_btn)
+        self._skip_btn = QPushButton("Skip for Now")
+        self._skip_btn.setFixedHeight(38)
+        self._skip_btn.setMinimumWidth(110)
+        self._skip_btn.clicked.connect(self.close)
+        btn_row.addWidget(self._skip_btn)
 
-        self.update_btn = QPushButton("  Update All  ")
-        self.update_btn.setFixedHeight(38)
-        self.update_btn.setMinimumWidth(130)
-        self.update_btn.setStyleSheet(
+        self._update_btn = QPushButton("  Update All  ")
+        self._update_btn.setFixedHeight(38)
+        self._update_btn.setMinimumWidth(130)
+        self._update_btn.setStyleSheet(
             "QPushButton { background-color:#3584e4; color:white; border-radius:5px;"
             " font-weight:bold; font-size:13px; padding:0 18px; }"
             "QPushButton:hover { background-color:#1c71d8; }"
             "QPushButton:disabled { background-color:#888; color:#ccc; }"
         )
-        self.update_btn.clicked.connect(self.start_update)
-        btn_row.addWidget(self.update_btn)
+        self._update_btn.clicked.connect(self.start_update)
+        btn_row.addWidget(self._update_btn)
         lay.addLayout(btn_row)
 
-        self.fetcher = InfoFetcher(updates)
-        self.fetcher.row_ready.connect(self._on_row_ready)
-        self.fetcher.finished.connect(self._on_fetch_done)
-        self.fetcher.start()
-        self.runner = None
+    # ── Helpers ────────────────────────────────────────────────────────────────
 
-    def _cell(self, row, col, text, bold=False, color="", muted=False):
+    def _set_idle_header(self, n_cached: int) -> None:
+        n = len(self._updates)
+        suffix = " &nbsp;·&nbsp; fetching release notes…" if n_cached < n else ""
+        self._hdr.setText(
+            f"<b>{n} package{'s' if n != 1 else ''}</b> ready to install{suffix}"
+        )
+
+    def _cell(self, row: int, col: int, text: str,
+              bold: bool = False, color: str = "", muted: bool = False) -> None:
         item = QTableWidgetItem(text)
         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         if bold:
@@ -548,69 +614,258 @@ class UpdateWindow(QMainWindow):
             item.setForeground(QColor("#888888"))
         self.table.setItem(row, col, item)
 
-    def _on_row_ready(self, row, desc, whats_new, date):
+    # ── Called by TrayApp as background data arrives ───────────────────────────
+
+    def on_info_ready(self, row: int, desc: str, notes: str, date: str) -> None:
         self._cell(row, self.C_DESC, desc)
-        self._cell(row, self.C_NEWS, whats_new)
-        self._cell(row, self.C_DATE, date if date else "–", muted=not date)
+        self._cell(row, self.C_NEWS, notes)
+        self._cell(row, self.C_DATE, date or "–", muted=not date)
         self.table.resizeRowToContents(row)
-        self.progress.setValue(self.progress.value() + 1)
+        if not self._updating:
+            self._progress.setValue(self._progress.value() + 1)
 
-    def _on_fetch_done(self):
-        self.progress.setFormat("Release notes loaded  ✓")
+    def on_fetch_done(self) -> None:
+        if not self._updating:
+            self._set_idle_header(len(self._updates))
+            self._progress.setFormat("Release notes loaded  ✓")
 
-    def start_update(self):
-        self.update_btn.setEnabled(False)
-        self.skip_btn.setEnabled(False)
-        self.status.setText("Waiting for authentication — check for polkit popup…")
-        self.progress.setRange(0, 0)
-        self.progress.setFormat("Running update…")
+    # ── Update flow ────────────────────────────────────────────────────────────
 
-        self.runner = UpdateRunner()
-        self.runner.done.connect(self._on_update_done)
-        self.runner.start()
+    def start_update(self) -> None:
+        self._updating = True
+        self._update_btn.setEnabled(False)
+        self._skip_btn.setEnabled(False)
+        n = len(self._updates)
+        self._hdr.setText(f"<b>0</b> installed &nbsp;·&nbsp; <b>{n}</b> remaining")
+        self._status.setText("Waiting for authentication — check for polkit popup…")
+        self._progress.setRange(0, 0)   # indeterminate spinner until first package installs
+        self._progress.setFormat("")
 
-    def _on_update_done(self, success, _output):
-        n = len(self.updates)
+        self._runner = UpdateRunner(self._aur_helper)
+        self._runner.install_progress.connect(self._on_install_progress)
+        self._runner.done.connect(self._on_update_done)
+        self._runner.start()
+
+    def _on_install_progress(self, current: int, total: int, pkg: str) -> None:
+        if self._progress.maximum() == 0:
+            self._progress.setRange(0, total)   # switch away from indeterminate
+        self._progress.setValue(current)
+        remaining = total - current
+        self._hdr.setText(
+            f"<b>{current}</b> installed &nbsp;·&nbsp; <b>{remaining}</b> remaining"
+        )
+        self._status.setText(f"Installing {pkg}…")
+
+    def _on_update_done(self, success: bool, _output: str) -> None:
+        n = len(self._updates)
         if success:
             subprocess.Popen([
                 "notify-send", "Arch Update Complete",
                 f"Successfully updated {n} package{'s' if n != 1 else ''}.",
                 "-i", "system-software-update", "-t", "9000",
             ])
+            self.update_succeeded.emit()
             self.close()
         else:
-            self.progress.setRange(0, 1); self.progress.setValue(0)
-            self.progress.setFormat("Update failed or was cancelled")
-            self.status.setText("Update failed. Check 'journalctl -xe' for details.")
-            self.update_btn.setEnabled(True)
-            self.skip_btn.setEnabled(True)
+            self._updating = False
+            self._progress.setRange(0, 1)
+            self._progress.setValue(0)
+            self._progress.setFormat("Update failed or was cancelled")
+            self._status.setText("Update failed — check 'journalctl -xe' for details.")
+            self._update_btn.setEnabled(True)
+            self._skip_btn.setEnabled(True)
 
-    def closeEvent(self, event):
-        if self.fetcher.isRunning():
-            self.fetcher.terminate()
-            self.fetcher.wait(2000)
+    def closeEvent(self, event) -> None:  # type: ignore[override]
         super().closeEvent(event)
+        self.closed.emit()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ──────────────────────────────────────────────────────────────────────────────
+# ── System tray application ────────────────────────────────────────────────────
 
-def main():
-    updates = get_pending_updates()
-    if not updates:
-        sys.exit(0)
+class TrayApp(QObject):
+    _CHECK_INTERVAL_MS = 30 * 60 * 1000   # 30 minutes
 
+    def __init__(self, app: QApplication, icon: QIcon) -> None:
+        super().__init__()
+        self._app        = app
+        self._aur_helper = _find_aur_helper()
+        self._updates:     list[dict]                      = []
+        self._cached_info: dict[int, tuple[str, str, str]] = {}
+        self._window:      UpdateWindow | None             = None
+        self._checker:     UpdateChecker | None            = None
+        self._fetcher:     InfoFetcher | None              = None
+
+        # ── Tray icon ──────────────────────────────────────────────────────────
+        self._tray = QSystemTrayIcon(icon, self)
+        self._tray.setToolTip("Arch Update")
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.messageClicked.connect(self._open_window)
+
+        # ── Context menu ───────────────────────────────────────────────────────
+        menu = QMenu()
+        self._status_act = menu.addAction("Checking for updates…")
+        self._status_act.setEnabled(False)
+        menu.addSeparator()
+        self._show_act = menu.addAction("Show Updates…")
+        self._show_act.triggered.connect(self._open_window)
+        self._show_act.setEnabled(False)
+        self._check_act = menu.addAction("Check Now")
+        self._check_act.triggered.connect(self.check_now)
+        menu.addSeparator()
+        quit_act = menu.addAction("Quit")
+        quit_act.triggered.connect(app.quit)
+        self._tray.setContextMenu(menu)
+        self._tray.show()
+
+        # ── Periodic check timer ───────────────────────────────────────────────
+        timer = QTimer(self)
+        timer.timeout.connect(self.check_now)
+        timer.start(self._CHECK_INTERVAL_MS)
+
+        # Initial check after a short delay (let the desktop settle)
+        QTimer.singleShot(2000, self.check_now)
+
+    # ── Check cycle ────────────────────────────────────────────────────────────
+
+    def check_now(self) -> None:
+        if self._checker and self._checker.isRunning():
+            return
+        self._status_act.setText("Checking for updates…")
+        self._check_act.setEnabled(False)
+        self._checker = UpdateChecker(self._aur_helper)
+        self._checker.updates_found.connect(self._on_updates_found)
+        self._checker.no_updates.connect(self._on_no_updates)
+        self._checker.finished.connect(lambda: self._check_act.setEnabled(True))
+        self._checker.start()
+
+    def _on_updates_found(self, updates: list[dict]) -> None:
+        self._stop_fetcher()
+        self._updates = updates
+        self._cached_info = {}
+        n = len(updates)
+
+        self._tray.setToolTip(f"Arch Update  —  {n} update{'s' if n != 1 else ''} available")
+        self._status_act.setText(f"{n} update{'s' if n != 1 else ''} available")
+        self._show_act.setEnabled(True)
+
+        self._tray.showMessage(
+            "Arch Update",
+            f"{n} package{'s' if n != 1 else ''} available — click to update",
+            QSystemTrayIcon.MessageIcon.Information,
+            6000,
+        )
+
+        self._fetcher = InfoFetcher(updates)
+        self._fetcher.row_ready.connect(self._on_row_cached)
+        self._fetcher.finished.connect(self._on_fetch_done)
+        self._fetcher.start()
+
+    def _on_no_updates(self) -> None:
+        self._stop_fetcher()
+        self._updates = []
+        self._cached_info = {}
+        self._tray.setToolTip("Arch Update  —  system up to date")
+        self._status_act.setText("System is up to date")
+        self._show_act.setEnabled(False)
+
+    # ── Fetcher lifecycle ──────────────────────────────────────────────────────
+
+    def _stop_fetcher(self) -> None:
+        if self._fetcher is None:
+            return
+        # Disconnect before interrupting to prevent stale callbacks on cleared data.
+        try:
+            self._fetcher.row_ready.disconnect(self._on_row_cached)
+            self._fetcher.finished.disconnect(self._on_fetch_done)
+        except TypeError:
+            pass
+        if self._fetcher.isRunning():
+            self._fetcher.requestInterruption()
+            self._fetcher.wait(3000)
+        self._fetcher = None
+
+    def _on_row_cached(self, row: int, desc: str, notes: str, date: str) -> None:
+        self._cached_info[row] = (desc, notes, date)
+        if self._window is not None:
+            self._window.on_info_ready(row, desc, notes, date)
+
+    def _on_fetch_done(self) -> None:
+        if self._window is not None:
+            self._window.on_fetch_done()
+        self._fetcher = None
+
+    # ── Tray interaction ───────────────────────────────────────────────────────
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._open_window()
+
+    def _open_window(self) -> None:
+        if not self._updates:
+            self._tray.showMessage(
+                "Arch Update", "System is up to date.",
+                QSystemTrayIcon.MessageIcon.Information, 3000,
+            )
+            return
+        if self._window is not None:
+            self._window.raise_()
+            self._window.activateWindow()
+            return
+        self._window = UpdateWindow(self._updates, self._cached_info, self._aur_helper)
+        self._window.closed.connect(self._on_window_closed)
+        self._window.update_succeeded.connect(self._on_update_succeeded)
+        self._window.show()
+        self._window.raise_()
+        self._window.activateWindow()
+
+    def _on_window_closed(self) -> None:
+        self._window = None
+
+    def _on_update_succeeded(self) -> None:
+        self._updates = []
+        self._cached_info = {}
+        self._stop_fetcher()
+        self._tray.setToolTip("Arch Update  —  system up to date")
+        self._status_act.setText("System is up to date")
+        self._show_act.setEnabled(False)
+        QTimer.singleShot(5000, self.check_now)
+
+
+# ── Icon ───────────────────────────────────────────────────────────────────────
+
+def _app_icon() -> QIcon:
+    """Render the embedded SVG into a QIcon via QSvgRenderer."""
+    renderer = QSvgRenderer(QByteArray(_ICON_SVG))
+    pm = QPixmap(64, 64)
+    pm.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pm)
+    renderer.render(painter, QRectF(0, 0, 64, 64))
+    painter.end()
+    return QIcon(pm)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main() -> None:
     os.environ.setdefault("WAYLAND_DISPLAY", "wayland-0")
     os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
 
     app = QApplication(sys.argv)
     app.setApplicationName("arch-update-popup")
+    app.setApplicationDisplayName("Arch Update")
+    app.setQuitOnLastWindowClosed(False)   # keep alive in tray after window closes
 
-    win = UpdateWindow(updates)
-    win.show()
-    win.raise_()
-    win.activateWindow()
+    icon = _app_icon()
+    app.setWindowIcon(icon)
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        print("No system tray available.", file=sys.stderr)
+        sys.exit(1)
+
+    _tray_app = TrayApp(app, icon)  # noqa: F841 — keep reference alive
     sys.exit(app.exec())
 
 
