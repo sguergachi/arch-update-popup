@@ -748,15 +748,21 @@ class UpdateWindow(QMainWindow):
     def _on_update_done(self, success: bool, output: str) -> None:
         n = len(self._updates)
         if success:
-            if self._installing_row is not None:
-                self._set_row_install_state(self._installing_row, "done")
+            # Mark every row green and show a summary header
+            for row in range(n):
+                self._set_row_install_state(row, "done")
+            self._installing_row = None
+            self._progress.setValue(n)
+            self._progress.setFormat("All packages updated  ✓")
+            self._hdr.setText(f"<b>{n} package{'s' if n != 1 else ''}</b> updated successfully")
+            self._status.setText("Closing in a moment…")
             subprocess.Popen([
                 "notify-send", "Arch Update Complete",
                 f"Successfully updated {n} package{'s' if n != 1 else ''}.",
                 "-i", "system-software-update", "-t", "9000",
             ])
             self.update_succeeded.emit()
-            self.close()
+            QTimer.singleShot(2000, self.close)
         else:
             self._updating = False
             self._progress.setRange(0, 1)
