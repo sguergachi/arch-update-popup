@@ -570,6 +570,8 @@ class UpdateWindow(QMainWindow):
         self._aur_helper = aur_helper
         self._runner:    UpdateRunner | None = None
         self._updating   = False
+        self._pkg_row: dict[str, int] = {pkg["name"]: i for i, pkg in enumerate(updates)}
+        self._installing_row: int | None = None
         n = len(updates)
 
         self.setWindowTitle(f"Arch Update  —  {n} package{'s' if n != 1 else ''} available")
@@ -679,6 +681,22 @@ class UpdateWindow(QMainWindow):
             item.setForeground(QColor("#888888"))
         self.table.setItem(row, col, item)
 
+    def _set_row_install_state(self, row: int, state: str) -> None:
+        if state == "installing":
+            bg = QColor("#2a5f9e")
+        elif state == "done":
+            bg = QColor("#27622a")
+        else:
+            for col in range(self.table.columnCount()):
+                item = self.table.item(row, col)
+                if item:
+                    item.setData(Qt.ItemDataRole.BackgroundRole, None)
+            return
+        for col in range(self.table.columnCount()):
+            item = self.table.item(row, col)
+            if item:
+                item.setBackground(bg)
+
     # ── Called by TrayApp as background data arrives ───────────────────────────
 
     def on_info_ready(self, row: int, desc: str, notes: str, date: str) -> None:
@@ -720,10 +738,18 @@ class UpdateWindow(QMainWindow):
             f"<b>{current}</b> installed &nbsp;·&nbsp; <b>{remaining}</b> remaining"
         )
         self._status.setText(f"Installing {pkg}…")
+        if self._installing_row is not None:
+            self._set_row_install_state(self._installing_row, "done")
+        self._installing_row = self._pkg_row.get(pkg)
+        if self._installing_row is not None:
+            self._set_row_install_state(self._installing_row, "installing")
+            self.table.scrollToItem(self.table.item(self._installing_row, self.C_PKG))
 
     def _on_update_done(self, success: bool, output: str) -> None:
         n = len(self._updates)
         if success:
+            if self._installing_row is not None:
+                self._set_row_install_state(self._installing_row, "done")
             subprocess.Popen([
                 "notify-send", "Arch Update Complete",
                 f"Successfully updated {n} package{'s' if n != 1 else ''}.",
