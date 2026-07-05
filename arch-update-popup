@@ -14,7 +14,11 @@ Changelog sources tried in order per package:
   5. Version-bump string (final fallback)
 """
 
+import bz2
+import glob
+import gzip
 import json
+import lzma
 import os
 import pty
 import re
@@ -47,103 +51,43 @@ GITLAB_HOSTS = [
     "gitlab.com",
 ]
 
-AUR_COMPROMISED_PACKAGES = {
-    "3mux", "aergia", "amfora", "anki-qt5", "argocd", "aria2-rpc", "asdf-vm",
-    "auracle-git", "aurutils", "bandwhich", "bat-extras", "beremiz", "bibata-cursor-theme",
-    "biblatex-ext", "blueprint-compiler-heuristics", "brave-beta-bin", "broot-bin",
-    "buildah", "byobu", "caddyserver", "caprine", "cargo-audit", "cargo-binstall",
-    "cargo-cache", "cargo-crev", "cargo-deb", "cargo-deny", "cargo-edit", "cargo-expand",
-    "cargo-fuzz", "cargo-hack", "cargo-llvm-cov", "cargo-make", "cargo-nextest",
-    "cargo-outdated", "cargo-pgrx", "cargo-release", "cargo-scan", "cargo-spellcheck",
-    "cargo-tarpaulin", "cargo-update", "cargo-vet", "cargo-watch", "ccat", "chezmoi",
-    "chia-blockchain-gui", "cloudflared", "cloudflare-warp-bin", "cmake-language-server",
-    "code-minimap", "commitizen", "cosmic-applet-git", "cosmic-comp-git",
-    "cosmic-dock-git", "cosmic-greeter-git", "cosmic-launcher-git", "cosmic-osd-git",
-    "cosmic-panel-git", "cosmic-randr-git", "cosmic-session-git", "cosmic-settings-git",
-    "cosmic-store-git", "cosmic-term-git", "cosmic-workspace-git", "cpufetch",
-    "ctop", "dalmatian", "dash-to-dock", "diff-so-fancy", "direnv", "docker-buildx",
-    "docker-compose-git", "docker-credential-pass", "dragon-drop", "dust", "dua-cli",
-    "dua-bin", "easy-effects", "eid-mw", "element-desktop", "entr", "erd", "espanso",
-    "exa", "fd", "festival", "ffmpegthumbnailer-caja", "firedragon", "firefox-appmenu",
-    "firefox-esr-bin", "firefox-hg", "firefox-kde-opensuse", "firefox-nightly",
-    "firefox-ublock-origin", "fish", "flameshot", "flatpak-builder", "fluent-reader",
-    "fontconfig-ultimate", "freetype2-cleartype", "fselect", "fzf", "gdu", "genact",
-    "gh", "ghidra", "git-delta", "git-extras", "git-flow-avh", "git-lfs", "gitui",
-    "glab", "glow", "go-task-bin", "googler", "gping", "gpu-screen-recorder-gtk",
-    "gping-bin", "grex", "grip", "gtd", "gufw", "gum", "habits", "hadolint",
-    "hardcode-tray", "harfbuzz-git", "hblock", "helm", "hey", "hiperc", "himalaya",
-    "homebank", "htop-vim", "httpie", "hugo", "hyperfine", "i3-gaps-next-git",
-    "i3lock-color", "inxi", "jless", "jq", "just", "k9s", "kaku", "karn", "kdl",
-    "kube-capacity", "kube-score", "kubectl", "kubectx", "lazydocker", "lazygit",
-    "lf", "librewolf", "lnav", "localsend-bin", "lolcat", "lsd", "lua-language-server",
-    "luarocks", "luarocks-lua51", "lvim", "lynx", "macchina", "mandoc", "marktext",
-    "mas", "mdcat", "mellow-player", "micro", "microbin", "mise", "mold", "mono",
-    "mongo-tools", "mullvad-vpn", "navi", "ncdu", "neofetch", "neovim-git", "neovim-nightly",
-    "neovim-remote", "nushell", "nvtop", "obsidian", "ochafa", "ollama", "onefetch",
-    "onlyoffice-bin", "opencode-bin", "opentofu", "pam-u2f", "paru", "pass", "pass-otp",
-    "pfetch", "pipx", "pkgfile", "podman-compose", "podman-docker", "pop-launcher",
-    "postgresql", "pre-commit", "procs", "proton-ge-custom", "protonup-qt", "pueue",
-    "pulsar-bin", "pypy3", "python-black", "python-isort", "python-mypy", "python-poetry",
-    "python-pytest", "python-rich", "python-ruff", "qalculate-gtk", "qbittorrent-enhanced",
-    "qrencode", "ranger", "ranker", "rclone", "rcm", "reposurgeon", "ripgrep", "ripgrep-all",
-    "rk-hunter", "rlwrap", "rsync", "rust-analyzer", "rustdesk", "rustup", "scc",
-    "sd", "shellcheck", "shellharden", "shotgun", "signal-desktop", "skaffold",
-    "skopeo", "slack-desktop", "slides", "sober", "speedtest-cli", "sqlitebrowser",
-    "sshuttle", "starship", "stow", "sublime-text-4", "superfile", "svt-av1", "syncthing",
-    "systemd-swap", "tailscale", "taplo", "taskell", "tealdeer", "telegram-desktop",
-    "termdown", "terminus", "terragrunt", "texlab", "thefuck", "thinlinc-client",
-    "tldr", "tmux", "tmuxp", "tofuenv", "topgrade", "tor-browser", "trash-cli",
-    "tree-sitter", "trizen", "trurl", "tty-clock", "typst", "uBlock-origin",
-    "ueberzugpp", "universal-ctags", "up", "urlview", "usbutils", "uv", "v2ray",
-    "v2raya", "valgrind", "vim", "vim-git", "vivid", "vscode", "vscodium", "vulkan-sdk",
-    "waffle", "wakapi", "wallust", "watchexec", "waybar", "wget2", "whalebird",
-    "wireshark-cli", "wofi", "wtf", "xclip", "xdg-desktop-portal-hyprland",
-    "xdg-desktop-portal-wlr", "xdg-ninja", "xh", "xplr", "xsv", "yadm", "yazi",
-    "yq", "yt-dlp", "zellij", "zen-browser", "zoxide", "zsh", "zsh-autosuggestions",
-    "zsh-syntax-highlighting"
-}
+AUR_INFECTED_WINDOW_START = "2026-06-09"
+AUR_INFECTED_WINDOW_END   = "2026-06-14"
 
-_SUSPICIOUS_PKGBUILD_PATTERNS = [
-    (r"(?i)(wget|curl)\s+.*(raw\.githubusercontent\.com|pastebin\.com|gist\.githubusercontent\.com|transfer\.sh|ix\.io|clbin\.com|sprunge\.us|termbin\.com)", "downloads from suspicious file-sharing sites"),
-    (r"(?i)(wget|curl)\s+.*(bash|sh)\s*\|", "pipes downloaded script directly to shell"),
-    (r"(?i)(curl|wget)\s+.*\|\s*(bash|sh|python|perl|ruby|node)", "pipes to interpreter"),
-    (r"(?i)(eval|exec)\s+.*\$(curl|wget)", "evals downloaded content"),
-    (r"(?i)base64\s+-d\s*\|\s*(bash|sh)", "base64 decoded piped to shell"),
-    (r"(?i)xxd\s+-r\s*\|\s*(bash|sh)", "xxd decoded piped to shell"),
-    (r"(?i)(gpg|gpg2)\s+.*--import\s+.*(curl|wget)", "imports GPG key from download"),
-    (r"(?i)(rustc|cargo)\s+.*--target\s+.*bpf", "compiles eBPF code"),
-    (r"(?i)bpf\s+(prog|map|link)", "uses eBPF program/map/link"),
-    (r"(?i)libbpf|ebpf|bcc|bpftrace", "uses eBPF libraries"),
-    (r"(?i)(ssh|id_rsa|id_ed25519|authorized_keys|known_hosts)", "accesses SSH keys"),
-    (r"(?i)(\.ssh|\.gnupg|\.config/gh|\.config/git|\.aws/credentials|\.docker/config\.json)", "accesses credential directories"),
-    (r"(?i)(keyring|secret-service|gnome-keyring|kwallet)", "accesses system keyring"),
-    (r"(?i)(session|cookie|token)\s*[:=]", "extracts session tokens/cookies"),
-    (r"(?i)(firefox|chrome|chromium).*(sqlite|places\.sqlite|cookies\.sqlite|login\.json)", "accesses browser databases"),
-    (r"(?i)(steam|discord|signal|telegram).*(config|local|data)", "accesses app data directories"),
-    (r"(?i)(cargo|rustc).*(--target|build\.rs|build-script)", "Rust build script"),
-    (r"(?i)(procfs|proc_mounts|/proc/)\s*[<|]", "reads /proc filesystem"),
-    (r"(?i)(ptrace|process_vm_readv|/proc/.*/mem)", "memory inspection"),
-    (r"(?i)LD_PRELOAD|LD_LIBRARY_PATH", "environment variable injection"),
-    (r"(?i)systemd.*(service|socket|timer).*--user", "creates user systemd units"),
-    (r"(?i)cron|at\s+", "creates scheduled tasks"),
-    (r"(?i)chmod\s+\+x\s+/tmp/", "makes temp files executable"),
-    (r"(?i)mktemp|tempfile", "creates temporary files"),
-    (r"(?i)dd\s+if=.*of=/dev/", "writes to block devices"),
-    (r"(?i)mkfs|fdisk|parted|sfdisk", "disk partitioning"),
-    (r"(?i)iptables|nft|firewall-cmd|ufw", "modifies firewall"),
-    (r"(?i)modprobe|insmod|rmmod", "loads kernel modules"),
-    (r"(?i)capsh|setcap|getcap", "manipulates capabilities"),
-    (r"(?i)nsenter|unshare", "namespace manipulation"),
+_CAMPAIGN_META = [
+    {
+        "id": "aur-infected",
+        "display": "AUR malware packages (June 2026)",
+        "data_rel": "data/campaigns/aur-infected",
+        "lists": ["packages.txt", "packages-extra.txt"],
+        "date_window": (AUR_INFECTED_WINDOW_START, AUR_INFECTED_WINDOW_END),
+        "refresh_url": "https://md.archlinux.org/s/SxbqukK6IA/download",
+        "refresh_target": "packages.txt",
+        "sources": [
+            "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/FGXPCB3ZVCJIV7FX323SBAX2JHYB7ZS4/",
+            "https://ioctl.fail/preliminary-analysis-of-aur-malware/",
+            "https://archlinux.org/news/active-aur-malicious-packages-incident/",
+        ],
+    },
+    {
+        "id": "chaos-rat",
+        "display": "CHAOS RAT (July 2025)",
+        "data_rel": "data/campaigns/chaos-rat",
+        "lists": ["packages.txt"],
+        "date_window": ("2025-07-16", "2025-07-19"),
+        "refresh_url": None,
+        "refresh_target": None,
+        "sources": [],
+    },
 ]
 
 _AUR_COMPROMISED_NOTICE = (
     "⚠️  AUR SUPPLY-CHAIN ATTACK DETECTED ⚠️\n\n"
-    "A 2024 supply-chain attack compromised ~1,500 AUR packages.\n"
-    "Attackers hijacked abandoned/weakly maintained packages to inject\n"
-    "malicious build scripts deploying Rust-based infostealers and eBPF\n"
-    "rootkits that steal credentials, SSH keys, and session data.\n\n"
-    "The following packages in your updates match known compromised packages\n"
-    "or show suspicious PKGBUILD patterns:\n\n{packages}\n\n"
+    "A June 2026 supply-chain attack compromised ~1,600 AUR packages\n"
+    "by injecting malicious build scripts that deployed Rust-based\n"
+    "infostealers and eBPF rootkits via npm/bun packages.\n\n"
+    "The following packages in your updates match the canonical\n"
+    "compromised package list:\n\n{packages}\n\n"
     "These packages will be SKIPPED during update.\n"
     "Safe packages can still be installed.\n"
     "Do NOT proceed with updating the flagged packages until verified safe.\n"
@@ -485,7 +429,7 @@ def get_pending_updates(aur_helper: str | None) -> list[dict]:
                 parts = line.split()
                 if len(parts) >= 4:
                     # Check for supply-chain attack on AUR packages
-                    compromised, reasons = check_aur_supply_chain_attack(parts[0])
+                    compromised, reasons, _camp = check_aur_supply_chain_attack(parts[0])
                     updates.append({
                         "name": parts[0], 
                         "old": parts[1], 
@@ -525,7 +469,6 @@ def fetch_pacman_info(pkg: str) -> dict:
 def fetch_aur_pkgbuild(pkg: str) -> str | None:
     """Fetch PKGBUILD from AUR for a package."""
     try:
-        # Try AUR GitLab first
         data = _get(f"https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h={pkg}", accept="text/plain", timeout=5)
         return data.decode(errors="replace")
     except Exception:
@@ -533,34 +476,154 @@ def fetch_aur_pkgbuild(pkg: str) -> str | None:
     return None
 
 
-def scan_pkgbuild_for_threats(pkgbuild: str) -> list[str]:
-    """Scan PKGBUILD for suspicious patterns indicating supply-chain attack."""
-    threats = []
-    for pattern, desc in _SUSPICIOUS_PKGBUILD_PATTERNS:
-        if re.search(pattern, pkgbuild):
-            threats.append(desc)
-    return threats
+def _find_data_dirs() -> list[str]:
+    """Return candidate campaign data directories, most-specific first."""
+    dirs: list[str] = []
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    neighbor = os.path.join(script_dir, "..", "aur-malware-check", "data", "campaigns")
+    if os.path.isdir(neighbor):
+        dirs.append(os.path.normpath(neighbor))
+
+    local_share = os.path.expanduser("~/.local/share/arch-update-popup/campaigns")
+    if os.path.isdir(local_share):
+        dirs.append(local_share)
+
+    bundled = os.path.join(script_dir, "campaigns")
+    if os.path.isdir(bundled):
+        dirs.append(bundled)
+
+    return dirs
 
 
-def check_aur_supply_chain_attack(pkg_name: str) -> tuple[bool, list[str]]:
+def _load_package_list(campaign_id: str, list_name: str) -> set[str]:
+    """Load a package list from the first data dir that has it."""
+    for data_dir in _find_data_dirs():
+        path = os.path.join(data_dir, campaign_id, list_name)
+        try:
+            with open(path) as f:
+                return {
+                    line.strip() for line in f
+                    if line.strip() and not line.startswith("#")
+                }
+        except FileNotFoundError:
+            continue
+    return set()
+
+
+def _load_all_compromised_packages() -> dict[str, dict]:
     """
-    Check if an AUR package is compromised in the 2024 supply-chain attack.
-    Returns (is_compromised, list_of_reasons).
+    Load all compromised package names with campaign metadata.
+    Returns {pkg_name: {campaign_id, display, date_window}}.
     """
-    reasons = []
-    
-    # Check known compromised package list
-    if pkg_name in AUR_COMPROMISED_PACKAGES:
-        reasons.append(f"Package '{pkg_name}' is in the known compromised package list (~1,500 packages affected in 2024 AUR supply-chain attack)")
-    
-    # Scan PKGBUILD for suspicious patterns
-    pkgbuild = fetch_aur_pkgbuild(pkg_name)
-    if pkgbuild:
-        threats = scan_pkgbuild_for_threats(pkgbuild)
-        if threats:
-            reasons.extend([f"PKGBUILD contains suspicious pattern: {t}" for t in threats])
-    
-    return (len(reasons) > 0, reasons)
+    pkgs: dict[str, dict] = {}
+    for camp in _CAMPAIGN_META:
+        for list_name in camp["lists"]:
+            names = _load_package_list(camp["id"], list_name)
+            for name in names:
+                pkgs.setdefault(name, {
+                    "campaign_id": camp["id"],
+                    "display": camp["display"],
+                    "date_window": camp["date_window"],
+                })
+    return pkgs
+
+
+_PACMAN_LOG_GLOB = "/var/log/pacman.log*"
+
+
+def _get_package_install_dates(pkg_name: str) -> list[str]:
+    """Scan pacman.log for install/upgrade events for a package, return dates."""
+    dates: list[str] = []
+    log_files = sorted(glob.glob(_PACMAN_LOG_GLOB))
+    if not log_files:
+        return dates
+
+    _OPENERS = {
+        ".gz": gzip.open,
+        ".xz": lzma.open,
+        ".zst": lzma.open,
+        ".bz2": bz2.open,
+    }
+
+    for log_path in log_files:
+        opener = None
+        for ext, fn in _OPENERS.items():
+            if log_path.endswith(ext):
+                opener = fn
+                break
+        if opener is None:
+            opener = open
+        try:
+            f = opener(log_path, "rt")
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                m = re.match(
+                    r"\[(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2}[+-]\d{4}\]\s+"
+                    r"(installed|upgraded)\s+" + re.escape(pkg_name),
+                    line,
+                )
+                if m:
+                    dates.append(m.group(1))
+    return dates
+
+
+def _in_date_window(date_str: str, window: tuple[str, str] | None) -> bool:
+    if not window:
+        return True
+    start, end = window
+    return start <= date_str <= end
+
+
+def _refresh_campaign_list(campaign: dict) -> None:
+    """Fetch the latest package list from upstream for a campaign."""
+    url = campaign.get("refresh_url")
+    target = campaign.get("refresh_target")
+    if not url or not target:
+        return
+    try:
+        data = _get(url, accept="text/plain", timeout=10).decode(errors="replace")
+        for data_dir in _find_data_dirs():
+            target_dir = os.path.join(data_dir, campaign["id"])
+            target_path = os.path.join(target_dir, target)
+            os.makedirs(target_dir, exist_ok=True)
+            with open(target_path, "w") as f:
+                f.write(data)
+            return
+    except Exception:
+        pass
+
+
+def check_aur_supply_chain_attack(pkg_name: str) -> tuple[bool, list[str], dict | None]:
+    """
+    Check if an AUR package is known compromised.
+    Returns (is_compromised, list_of_reasons, campaign_meta_or_None).
+    """
+    comp_pkgs = _load_all_compromised_packages()
+    if pkg_name not in comp_pkgs:
+        return False, [], None
+
+    meta = comp_pkgs[pkg_name]
+    window = meta["date_window"]
+
+    # Check install dates against campaign window
+    install_dates = _get_package_install_dates(pkg_name)
+    if install_dates:
+        in_window = any(_in_date_window(d, window) for d in install_dates)
+        if not in_window:
+            # Package is on the list but installed outside the window — safer to
+            # flag it anyway with a note since the list is the authoritative source
+            reasons = [
+                f"Package '{pkg_name}' is on the known compromised list "
+                f"({meta['display']}). Installed {install_dates[-1]}, "
+                f"campaign window: {window[0]}..{window[1]}."
+            ]
+            return True, reasons, meta
+
+    reasons = [f"Package '{pkg_name}' is on the known compromised list ({meta['display']})."]
+    return True, reasons, meta
 
 
 def get_installed_packages() -> list[dict]:
@@ -573,7 +636,6 @@ def get_installed_packages() -> list[dict]:
             if len(parts) >= 2:
                 pkgs.append({"name": parts[0], "version": parts[1]})
 
-    # Tag each package with its repo (official or aur)
     r2 = subprocess.run(["pacman", "-Qm"], capture_output=True, text=True)
     foreign = set()
     if r2.returncode == 0:
@@ -597,34 +659,25 @@ def scan_installed_for_compromise(
     """
     installed = get_installed_packages()
     results: list[dict] = []
+    comp_pkgs = _load_all_compromised_packages()
 
     for i, pkg in enumerate(installed):
-        compromised = pkg["name"] in AUR_COMPROMISED_PACKAGES
-        reasons: list[str] = []
-        if compromised:
-            reasons.append(
-                f"Package '{pkg['name']}' is in the known compromised AUR list "
-                f"(~1,500 packages affected in 2024 supply-chain attack)"
-            )
-
-        # For AUR packages not in the known list, scan PKGBUILD
-        if pkg["repo"] == "aur" and not compromised:
-            pkgbuild = fetch_aur_pkgbuild(pkg["name"])
-            if pkgbuild:
-                threats = scan_pkgbuild_for_threats(pkgbuild)
-                if threats:
-                    compromised = True
-                    reasons.extend(
-                        [f"PKGBUILD contains suspicious pattern: {t}" for t in threats]
-                    )
-
-        results.append({
-            "name": pkg["name"],
-            "version": pkg["version"],
-            "repo": pkg["repo"],
-            "compromised": compromised,
-            "reasons": reasons,
-        })
+        if pkg["name"] in comp_pkgs:
+            meta = comp_pkgs[pkg["name"]]
+            install_dates = _get_package_install_dates(pkg["name"])
+            reasons = [
+                f"Package '{pkg['name']}' is on the known compromised list "
+                f"({meta['display']})."
+            ]
+            if install_dates:
+                reasons[0] += f" Installed: {install_dates[-1]}"
+            results.append({
+                "name": pkg["name"],
+                "version": pkg["version"],
+                "repo": pkg["repo"],
+                "compromised": True,
+                "reasons": reasons,
+            })
 
         if on_progress:
             on_progress(i + 1, len(installed), pkg["name"])
