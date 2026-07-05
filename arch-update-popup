@@ -144,8 +144,9 @@ _AUR_COMPROMISED_NOTICE = (
     "rootkits that steal credentials, SSH keys, and session data.\n\n"
     "The following packages in your updates match known compromised packages\n"
     "or show suspicious PKGBUILD patterns:\n\n{packages}\n\n"
-    "These packages have been DISABLED from installation.\n"
-    "Do NOT proceed with updating them until verified safe.\n"
+    "These packages will be SKIPPED during update.\n"
+    "Safe packages can still be installed.\n"
+    "Do NOT proceed with updating the flagged packages until verified safe.\n"
     "Check https://wiki.archlinux.org/title/AUR#Security for guidance."
 )
 
@@ -606,14 +607,11 @@ class UpdateRunner(QThread):
     install_progress = pyqtSignal(int, int, str)  # current, total, pkg_name
     done             = pyqtSignal(bool, str)       # success, last output lines
 
-    def __init__(self, aur_helper: str | None) -> None:
+    def __init__(self, aur_helper: str | None, packages: list[str] | None = None) -> None:
         super().__init__()
         self._askpass: str | None = None
 
         if aur_helper:
-            # Write a temporary kdialog-based askpass script so sudo can show
-            # a graphical password dialog and cache the credential for the
-            # full update session (avoiding one polkit prompt per package).
             fd, path = tempfile.mkstemp(suffix=".sh", prefix="arch-update-askpass-")
             with os.fdopen(fd, "w") as f:
                 f.write(
@@ -623,11 +621,15 @@ class UpdateRunner(QThread):
                 )
             os.chmod(path, stat.S_IRWXU)
             self._askpass = path
-            # --sudoflags "-A" tells paru to pass -A to every sudo call,
-            # which makes sudo use SUDO_ASKPASS instead of a TTY prompt.
-            self._cmd = [aur_helper, "--sudoflags", "-A", "-Syu", "--noconfirm"]
+            if packages:
+                self._cmd = [aur_helper, "--sudoflags", "-A", "-S", *packages, "--noconfirm"]
+            else:
+                self._cmd = [aur_helper, "--sudoflags", "-A", "-Syu", "--noconfirm"]
         else:
-            self._cmd = ["pkexec", "pacman", "-Syu", "--noconfirm"]
+            if packages:
+                self._cmd = ["pkexec", "pacman", "-S", *packages, "--noconfirm"]
+            else:
+                self._cmd = ["pkexec", "pacman", "-Syu", "--noconfirm"]
 
     def run(self) -> None:
         env = os.environ.copy()
@@ -831,8 +833,8 @@ class UpdateWindow(QMainWindow):
             "QPushButton:disabled { background-color:#888; color:#ccc; }"
         )
         if self._compromised:
-            self._update_btn.setEnabled(False)
-            self._update_btn.setText("  Compromised — Update Disabled  ")
+            safe_n = sum(1 for p in updates if not p.get("compromised"))
+            self._update_btn.setText(f"  Update {safe_n} Safe Package{'s' if safe_n != 1 else ''}  ")
         self._update_btn.clicked.connect(self.start_update)
         btn_row.addWidget(self._update_btn)
         lay.addLayout(btn_row)
@@ -841,10 +843,18 @@ class UpdateWindow(QMainWindow):
 
     def _set_idle_header(self, n_cached: int) -> None:
         n = len(self._updates)
+        n_safe = sum(1 for p in self._updates if not p.get("compromised"))
+        n_comp = n - n_safe
         suffix = " &nbsp;·&nbsp; fetching release notes…" if n_cached < n else ""
-        self._hdr.setText(
-            f"<b>{n} package{'s' if n != 1 else ''}</b> ready to install{suffix}"
-        )
+        if n_comp:
+            self._hdr.setText(
+                f"<b>{n_safe} safe</b> ready to install &nbsp;·&nbsp; "
+                f"<b>{n_comp} compromised</b> — skipped{suffix}"
+            )
+        else:
+            self._hdr.setText(
+                f"<b>{n} package{'s' if n != 1 else ''}</b> ready to install{suffix}"
+            )
 
     def _cell(self, row: int, col: int, text: str,
               bold: bool = False, color: str = "", muted: bool = False) -> None:
@@ -895,13 +905,22 @@ class UpdateWindow(QMainWindow):
         self._updating = True
         self._update_btn.setEnabled(False)
         self._skip_btn.setEnabled(False)
-        n = len(self._updates)
+
+        safe_pkgs = [p for p in self._updates if not p.get("compromised")]
+        comp_pkgs = [p for p in self._updates if p.get("compromised")]
+        safe_names = [p["name"] for p in safe_pkgs]
+
+        n = len(safe_pkgs)
         self._hdr.setText(f"<b>0</b> installed &nbsp;·&nbsp; <b>{n}</b> remaining")
-        self._status.setText("Waiting for authentication — a password dialog should appear…")
-        self._progress.setRange(0, 0)   # indeterminate spinner until first package installs
+        msg = "Waiting for authentication — a password dialog should appear…"
+        if comp_pkgs:
+            skipped = ", ".join(p["name"] for p in comp_pkgs)
+            msg = f"Skipping compromised: {skipped}. {msg}"
+        self._status.setText(msg)
+        self._progress.setRange(0, 0)
         self._progress.setFormat("")
 
-        self._runner = UpdateRunner(self._aur_helper)
+        self._runner = UpdateRunner(self._aur_helper, safe_names if self._compromised else None)
         self._runner.install_progress.connect(self._on_install_progress)
         self._runner.done.connect(self._on_update_done)
         self._runner.start()
@@ -923,19 +942,24 @@ class UpdateWindow(QMainWindow):
             self.table.scrollToItem(self.table.item(self._installing_row, self.C_PKG))
 
     def _on_update_done(self, success: bool, output: str) -> None:
-        n = len(self._updates)
+        n_total = len(self._updates)
+        n_updated = sum(1 for p in self._updates if not p.get("compromised"))
+        n_skipped = n_total - n_updated
         if success:
-            # Mark every row green and show a summary header
-            for row in range(n):
+            for row in range(n_total):
                 self._set_row_install_state(row, "done")
             self._installing_row = None
-            self._progress.setValue(n)
+            self._progress.setValue(n_total)
             self._progress.setFormat("All packages updated  ✓")
-            self._hdr.setText(f"<b>{n} package{'s' if n != 1 else ''}</b> updated successfully")
+            msg = f"<b>{n_updated} package{'s' if n_updated != 1 else ''}</b> updated successfully"
+            if n_skipped:
+                msg += f" &nbsp;·&nbsp; <b>{n_skipped}</b> compromised — skipped"
+            self._hdr.setText(msg)
             self._status.setText("Closing in a moment…")
             subprocess.Popen([
                 "notify-send", "Arch Update Complete",
-                f"Successfully updated {n} package{'s' if n != 1 else ''}.",
+                f"Successfully updated {n_updated} package{'s' if n_updated != 1 else ''}."
+                + (f" {n_skipped} compromised skipped." if n_skipped else ""),
                 "-i", "system-software-update", "-t", "9000",
             ])
             self.update_succeeded.emit()
@@ -1045,8 +1069,8 @@ class TrayApp(QObject):
             self._tray.showMessage(
                 "⚠️ AUR Supply-Chain Attack Detected",
                 f"{len(compromised)} package{'s' if len(compromised) != 1 else ''} "
-                f"({names}) flagged as compromised. Update has been disabled.\n"
-                f"See window for details.",
+                f"({names}) flagged as compromised. They will be skipped during update.\n"
+                f"Safe packages can still be installed.",
                 QSystemTrayIcon.MessageIcon.Critical,
                 12000,
             )
