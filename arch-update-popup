@@ -563,6 +563,75 @@ def check_aur_supply_chain_attack(pkg_name: str) -> tuple[bool, list[str]]:
     return (len(reasons) > 0, reasons)
 
 
+def get_installed_packages() -> list[dict]:
+    """Get list of all explicitly installed packages with their repos."""
+    pkgs: list[dict] = []
+    r = subprocess.run(["pacman", "-Qe"], capture_output=True, text=True)
+    if r.returncode == 0:
+        for line in r.stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                pkgs.append({"name": parts[0], "version": parts[1]})
+
+    # Tag each package with its repo (official or aur)
+    r2 = subprocess.run(["pacman", "-Qm"], capture_output=True, text=True)
+    foreign = set()
+    if r2.returncode == 0:
+        for line in r2.stdout.strip().splitlines():
+            parts = line.split()
+            if parts:
+                foreign.add(parts[0])
+
+    for pkg in pkgs:
+        pkg["repo"] = "aur" if pkg["name"] in foreign else "official"
+
+    return pkgs
+
+
+def scan_installed_for_compromise(
+    on_progress: None | (callable[[int, int, str], None]) = None,
+) -> list[dict]:
+    """Scan all explicitly installed packages for supply-chain compromise.
+
+    Returns list of dicts with keys: name, version, repo, compromised, reasons.
+    """
+    installed = get_installed_packages()
+    results: list[dict] = []
+
+    for i, pkg in enumerate(installed):
+        compromised = pkg["name"] in AUR_COMPROMISED_PACKAGES
+        reasons: list[str] = []
+        if compromised:
+            reasons.append(
+                f"Package '{pkg['name']}' is in the known compromised AUR list "
+                f"(~1,500 packages affected in 2024 supply-chain attack)"
+            )
+
+        # For AUR packages not in the known list, scan PKGBUILD
+        if pkg["repo"] == "aur" and not compromised:
+            pkgbuild = fetch_aur_pkgbuild(pkg["name"])
+            if pkgbuild:
+                threats = scan_pkgbuild_for_threats(pkgbuild)
+                if threats:
+                    compromised = True
+                    reasons.extend(
+                        [f"PKGBUILD contains suspicious pattern: {t}" for t in threats]
+                    )
+
+        results.append({
+            "name": pkg["name"],
+            "version": pkg["version"],
+            "repo": pkg["repo"],
+            "compromised": compromised,
+            "reasons": reasons,
+        })
+
+        if on_progress:
+            on_progress(i + 1, len(installed), pkg["name"])
+
+    return results
+
+
 # ── Background threads ─────────────────────────────────────────────────────────
 
 class UpdateChecker(QThread):
@@ -600,6 +669,18 @@ class InfoFetcher(QThread):
                 pkg["name"], pkg["new"], info["url"], info["repo"]
             )
             self.row_ready.emit(i, desc, notes, date)
+
+
+class SystemScanner(QThread):
+    """Scans all installed packages for compromise off the main thread."""
+    progress   = pyqtSignal(int, int, str)  # current, total, pkg_name
+    done       = pyqtSignal(list)            # list[dict] — scan results
+
+    def run(self) -> None:
+        results = scan_installed_for_compromise(
+            on_progress=lambda cur, tot, name: self.progress.emit(cur, tot, name)
+        )
+        self.done.emit(results)
 
 
 class UpdateRunner(QThread):
@@ -991,6 +1072,103 @@ class UpdateWindow(QMainWindow):
         self.closed.emit()
 
 
+# ── Scan dialog ─────────────────────────────────────────────────────────────────
+
+class ScanDialog(QMainWindow):
+    closed = pyqtSignal()
+
+    def __init__(self, results: list[dict]) -> None:
+        super().__init__()
+        self._results = results
+        n = len(results)
+        n_comp = sum(1 for r in results if r["compromised"])
+        safe = n - n_comp
+
+        self.setWindowTitle(f"System Compromise Scan  —  {n} packages checked")
+        self.setMinimumSize(1100, 600)
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        lay = QVBoxLayout(root)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+
+        # Summary header
+        if n_comp:
+            hdr = QLabel(
+                f"<b>⚠️  {n_comp} compromised package{'s' if n_comp != 1 else ''} found</b>"
+                f" &nbsp;·&nbsp; {safe} safe"
+            )
+            hdr.setStyleSheet("font-size:15px; font-weight:bold; color:#ff9999;")
+        else:
+            hdr = QLabel(f"<b>✓  System looks clean</b> &nbsp;·&nbsp; {n} packages checked, none compromised")
+            hdr.setStyleSheet("font-size:15px; font-weight:bold; color:#2ecc71;")
+        lay.addWidget(hdr)
+
+        # Table
+        self.table = QTableWidget(n, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["Package", "Version", "Repo", "Status"]
+        )
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+
+        comp_color = QColor("#4a1515")
+        safe_color = QColor("#153d1a")
+
+        for i, pkg in enumerate(results):
+            is_comp = pkg["compromised"]
+            self._cell(i, 0, pkg["name"], bold=True)
+            self._cell(i, 1, pkg["version"], muted=True)
+            self._cell(i, 2, pkg["repo"])
+            if is_comp:
+                reasons = "; ".join(pkg["reasons"])
+                self._cell(i, 3, f"⚠️ COMPROMISED — {reasons}", color="#ff6666")
+            else:
+                self._cell(i, 3, "✓ Clean", color="#2ecc71")
+
+            bg = comp_color if is_comp else (safe_color if pkg["repo"] == "aur" else None)
+            if bg:
+                for col in range(4):
+                    item = self.table.item(i, col)
+                    if item:
+                        item.setBackground(bg)
+
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(self.table)
+
+        # Close button
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton("  Close  ")
+        close_btn.setFixedHeight(36)
+        close_btn.clicked.connect(self.close)
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+
+    def _cell(self, row: int, col: int, text: str,
+              bold: bool = False, color: str = "", muted: bool = False) -> None:
+        item = QTableWidgetItem(text)
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        if bold:
+            f = item.font(); f.setBold(True); item.setFont(f)
+        if color:
+            item.setForeground(QColor(color))
+        elif muted:
+            item.setForeground(QColor("#888888"))
+        self.table.setItem(row, col, item)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        super().closeEvent(event)
+        self.closed.emit()
+
+
 # ── System tray application ────────────────────────────────────────────────────
 
 class TrayApp(QObject):
@@ -1005,6 +1183,8 @@ class TrayApp(QObject):
         self._window:      UpdateWindow | None             = None
         self._checker:     UpdateChecker | None            = None
         self._fetcher:     InfoFetcher | None              = None
+        self._scanner:     SystemScanner | None            = None
+        self._scan_window: ScanDialog | None               = None
 
         # ── Tray icon ──────────────────────────────────────────────────────────
         self._tray = QSystemTrayIcon(icon, self)
@@ -1022,6 +1202,9 @@ class TrayApp(QObject):
         self._show_act.setEnabled(False)
         self._check_act = menu.addAction("Check Now")
         self._check_act.triggered.connect(self.check_now)
+        menu.addSeparator()
+        self._scan_act = menu.addAction("Scan System for Compromise…")
+        self._scan_act.triggered.connect(self.start_scan)
         menu.addSeparator()
         quit_act = menu.addAction("Quit")
         quit_act.triggered.connect(app.quit)
@@ -1163,6 +1346,56 @@ class TrayApp(QObject):
         self._status_act.setText("System is up to date")
         self._show_act.setEnabled(False)
         QTimer.singleShot(5000, self.check_now)
+
+    # ── System scan ──────────────────────────────────────────────────────────────
+
+    def start_scan(self) -> None:
+        if self._scanner and self._scanner.isRunning():
+            return
+        self._scan_act.setEnabled(False)
+        self._status_act.setText("Scanning installed packages…")
+        self._scanner = SystemScanner()
+        self._scanner.progress.connect(self._on_scan_progress)
+        self._scanner.done.connect(self._on_scan_done)
+        self._scanner.start()
+
+    def _on_scan_progress(self, current: int, total: int, pkg: str) -> None:
+        self._status_act.setText(
+            f"Scanning… {current}/{total}  ({pkg})"
+        )
+
+    def _on_scan_done(self, results: list[dict]) -> None:
+        self._scanner = None
+        self._scan_act.setEnabled(True)
+        n_comp = sum(1 for r in results if r["compromised"])
+        n = len(results)
+        if n_comp:
+            self._tray.showMessage(
+                "⚠️ Compromise Scan Complete",
+                f"{n_comp} compromised package{'s' if n_comp != 1 else ''} found "
+                f"out of {n} installed. Check the scan window for details.",
+                QSystemTrayIcon.MessageIcon.Critical,
+                12000,
+            )
+        else:
+            self._tray.showMessage(
+                "✓ Compromise Scan Complete",
+                f"All {n} installed packages are clean.",
+                QSystemTrayIcon.MessageIcon.Information,
+                6000,
+            )
+
+        self._scan_window = ScanDialog(results)
+        self._scan_window.closed.connect(self._on_scan_window_closed)
+        self._scan_window.show()
+        self._scan_window.raise_()
+        self._scan_window.activateWindow()
+        self._status_act.setText(
+            f"Scan complete — {n_comp} compromised" if n_comp else "System is clean"
+        )
+
+    def _on_scan_window_closed(self) -> None:
+        self._scan_window = None
 
 
 # ── Icon ───────────────────────────────────────────────────────────────────────
