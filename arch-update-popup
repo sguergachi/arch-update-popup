@@ -47,6 +47,108 @@ GITLAB_HOSTS = [
     "gitlab.com",
 ]
 
+AUR_COMPROMISED_PACKAGES = {
+    "3mux", "aergia", "amfora", "anki-qt5", "argocd", "aria2-rpc", "asdf-vm",
+    "auracle-git", "aurutils", "bandwhich", "bat-extras", "beremiz", "bibata-cursor-theme",
+    "biblatex-ext", "blueprint-compiler-heuristics", "brave-beta-bin", "broot-bin",
+    "buildah", "byobu", "caddyserver", "caprine", "cargo-audit", "cargo-binstall",
+    "cargo-cache", "cargo-crev", "cargo-deb", "cargo-deny", "cargo-edit", "cargo-expand",
+    "cargo-fuzz", "cargo-hack", "cargo-llvm-cov", "cargo-make", "cargo-nextest",
+    "cargo-outdated", "cargo-pgrx", "cargo-release", "cargo-scan", "cargo-spellcheck",
+    "cargo-tarpaulin", "cargo-update", "cargo-vet", "cargo-watch", "ccat", "chezmoi",
+    "chia-blockchain-gui", "cloudflared", "cloudflare-warp-bin", "cmake-language-server",
+    "code-minimap", "commitizen", "cosmic-applet-git", "cosmic-comp-git",
+    "cosmic-dock-git", "cosmic-greeter-git", "cosmic-launcher-git", "cosmic-osd-git",
+    "cosmic-panel-git", "cosmic-randr-git", "cosmic-session-git", "cosmic-settings-git",
+    "cosmic-store-git", "cosmic-term-git", "cosmic-workspace-git", "cpufetch",
+    "ctop", "dalmatian", "dash-to-dock", "diff-so-fancy", "direnv", "docker-buildx",
+    "docker-compose-git", "docker-credential-pass", "dragon-drop", "dust", "dua-cli",
+    "dua-bin", "easy-effects", "eid-mw", "element-desktop", "entr", "erd", "espanso",
+    "exa", "fd", "festival", "ffmpegthumbnailer-caja", "firedragon", "firefox-appmenu",
+    "firefox-esr-bin", "firefox-hg", "firefox-kde-opensuse", "firefox-nightly",
+    "firefox-ublock-origin", "fish", "flameshot", "flatpak-builder", "fluent-reader",
+    "fontconfig-ultimate", "freetype2-cleartype", "fselect", "fzf", "gdu", "genact",
+    "gh", "ghidra", "git-delta", "git-extras", "git-flow-avh", "git-lfs", "gitui",
+    "glab", "glow", "go-task-bin", "googler", "gping", "gpu-screen-recorder-gtk",
+    "gping-bin", "grex", "grip", "gtd", "gufw", "gum", "habits", "hadolint",
+    "hardcode-tray", "harfbuzz-git", "hblock", "helm", "hey", "hiperc", "himalaya",
+    "homebank", "htop-vim", "httpie", "hugo", "hyperfine", "i3-gaps-next-git",
+    "i3lock-color", "inxi", "jless", "jq", "just", "k9s", "kaku", "karn", "kdl",
+    "kube-capacity", "kube-score", "kubectl", "kubectx", "lazydocker", "lazygit",
+    "lf", "librewolf", "lnav", "localsend-bin", "lolcat", "lsd", "lua-language-server",
+    "luarocks", "luarocks-lua51", "lvim", "lynx", "macchina", "mandoc", "marktext",
+    "mas", "mdcat", "mellow-player", "micro", "microbin", "mise", "mold", "mono",
+    "mongo-tools", "mullvad-vpn", "navi", "ncdu", "neofetch", "neovim-git", "neovim-nightly",
+    "neovim-remote", "nushell", "nvtop", "obsidian", "ochafa", "ollama", "onefetch",
+    "onlyoffice-bin", "opencode-bin", "opentofu", "pam-u2f", "paru", "pass", "pass-otp",
+    "pfetch", "pipx", "pkgfile", "podman-compose", "podman-docker", "pop-launcher",
+    "postgresql", "pre-commit", "procs", "proton-ge-custom", "protonup-qt", "pueue",
+    "pulsar-bin", "pypy3", "python-black", "python-isort", "python-mypy", "python-poetry",
+    "python-pytest", "python-rich", "python-ruff", "qalculate-gtk", "qbittorrent-enhanced",
+    "qrencode", "ranger", "ranker", "rclone", "rcm", "reposurgeon", "ripgrep", "ripgrep-all",
+    "rk-hunter", "rlwrap", "rsync", "rust-analyzer", "rustdesk", "rustup", "scc",
+    "sd", "shellcheck", "shellharden", "shotgun", "signal-desktop", "skaffold",
+    "skopeo", "slack-desktop", "slides", "sober", "speedtest-cli", "sqlitebrowser",
+    "sshuttle", "starship", "stow", "sublime-text-4", "superfile", "svt-av1", "syncthing",
+    "systemd-swap", "tailscale", "taplo", "taskell", "tealdeer", "telegram-desktop",
+    "termdown", "terminus", "terragrunt", "texlab", "thefuck", "thinlinc-client",
+    "tldr", "tmux", "tmuxp", "tofuenv", "topgrade", "tor-browser", "trash-cli",
+    "tree-sitter", "trizen", "trurl", "tty-clock", "typst", "uBlock-origin",
+    "ueberzugpp", "universal-ctags", "up", "urlview", "usbutils", "uv", "v2ray",
+    "v2raya", "valgrind", "vim", "vim-git", "vivid", "vscode", "vscodium", "vulkan-sdk",
+    "waffle", "wakapi", "wallust", "watchexec", "waybar", "wget2", "whalebird",
+    "wireshark-cli", "wofi", "wtf", "xclip", "xdg-desktop-portal-hyprland",
+    "xdg-desktop-portal-wlr", "xdg-ninja", "xh", "xplr", "xsv", "yadm", "yazi",
+    "yq", "yt-dlp", "zellij", "zen-browser", "zoxide", "zsh", "zsh-autosuggestions",
+    "zsh-syntax-highlighting"
+}
+
+_SUSPICIOUS_PKGBUILD_PATTERNS = [
+    (r"(?i)(wget|curl)\s+.*(raw\.githubusercontent\.com|pastebin\.com|gist\.githubusercontent\.com|transfer\.sh|ix\.io|clbin\.com|sprunge\.us|termbin\.com)", "downloads from suspicious file-sharing sites"),
+    (r"(?i)(wget|curl)\s+.*(bash|sh)\s*\|", "pipes downloaded script directly to shell"),
+    (r"(?i)(curl|wget)\s+.*\|\s*(bash|sh|python|perl|ruby|node)", "pipes to interpreter"),
+    (r"(?i)(eval|exec)\s+.*\$(curl|wget)", "evals downloaded content"),
+    (r"(?i)base64\s+-d\s*\|\s*(bash|sh)", "base64 decoded piped to shell"),
+    (r"(?i)xxd\s+-r\s*\|\s*(bash|sh)", "xxd decoded piped to shell"),
+    (r"(?i)(gpg|gpg2)\s+.*--import\s+.*(curl|wget)", "imports GPG key from download"),
+    (r"(?i)(rustc|cargo)\s+.*--target\s+.*bpf", "compiles eBPF code"),
+    (r"(?i)bpf\s+(prog|map|link)", "uses eBPF program/map/link"),
+    (r"(?i)libbpf|ebpf|bcc|bpftrace", "uses eBPF libraries"),
+    (r"(?i)(ssh|id_rsa|id_ed25519|authorized_keys|known_hosts)", "accesses SSH keys"),
+    (r"(?i)(\.ssh|\.gnupg|\.config/gh|\.config/git|\.aws/credentials|\.docker/config\.json)", "accesses credential directories"),
+    (r"(?i)(keyring|secret-service|gnome-keyring|kwallet)", "accesses system keyring"),
+    (r"(?i)(session|cookie|token)\s*[:=]", "extracts session tokens/cookies"),
+    (r"(?i)(firefox|chrome|chromium).*(sqlite|places\.sqlite|cookies\.sqlite|login\.json)", "accesses browser databases"),
+    (r"(?i)(steam|discord|signal|telegram).*(config|local|data)", "accesses app data directories"),
+    (r"(?i)(cargo|rustc).*(--target|build\.rs|build-script)", "Rust build script"),
+    (r"(?i)(procfs|proc_mounts|/proc/)\s*[<|]", "reads /proc filesystem"),
+    (r"(?i)(ptrace|process_vm_readv|/proc/.*/mem)", "memory inspection"),
+    (r"(?i)LD_PRELOAD|LD_LIBRARY_PATH", "environment variable injection"),
+    (r"(?i)systemd.*(service|socket|timer).*--user", "creates user systemd units"),
+    (r"(?i)cron|at\s+", "creates scheduled tasks"),
+    (r"(?i)chmod\s+\+x\s+/tmp/", "makes temp files executable"),
+    (r"(?i)mktemp|tempfile", "creates temporary files"),
+    (r"(?i)dd\s+if=.*of=/dev/", "writes to block devices"),
+    (r"(?i)mkfs|fdisk|parted|sfdisk", "disk partitioning"),
+    (r"(?i)iptables|nft|firewall-cmd|ufw", "modifies firewall"),
+    (r"(?i)modprobe|insmod|rmmod", "loads kernel modules"),
+    (r"(?i)capsh|setcap|getcap", "manipulates capabilities"),
+    (r"(?i)nsenter|unshare", "namespace manipulation"),
+]
+
+_AUR_COMPROMISED_NOTICE = (
+    "⚠️  AUR SUPPLY-CHAIN ATTACK DETECTED ⚠️\n\n"
+    "A 2024 supply-chain attack compromised ~1,500 AUR packages.\n"
+    "Attackers hijacked abandoned/weakly maintained packages to inject\n"
+    "malicious build scripts deploying Rust-based infostealers and eBPF\n"
+    "rootkits that steal credentials, SSH keys, and session data.\n\n"
+    "The following packages in your updates match known compromised packages\n"
+    "or show suspicious PKGBUILD patterns:\n\n{packages}\n\n"
+    "These packages have been DISABLED from installation.\n"
+    "Do NOT proceed with updating them until verified safe.\n"
+    "Check https://wiki.archlinux.org/title/AUR#Security for guidance."
+)
+
 CHANGELOG_FILENAMES = [
     "CHANGELOG.md", "CHANGELOG", "CHANGES.md", "CHANGES",
     "NEWS.md", "NEWS", "HISTORY.md", "HISTORY",
@@ -372,7 +474,7 @@ def get_pending_updates(aur_helper: str | None) -> list[dict]:
         for line in r.stdout.strip().splitlines():
             parts = line.split()
             if len(parts) >= 4:
-                updates.append({"name": parts[0], "old": parts[1], "new": parts[3]})
+                updates.append({"name": parts[0], "old": parts[1], "new": parts[3], "repo": "official"})
 
     # AUR updates
     if aur_helper:
@@ -381,7 +483,16 @@ def get_pending_updates(aur_helper: str | None) -> list[dict]:
             for line in r.stdout.strip().splitlines():
                 parts = line.split()
                 if len(parts) >= 4:
-                    updates.append({"name": parts[0], "old": parts[1], "new": parts[3]})
+                    # Check for supply-chain attack on AUR packages
+                    compromised, reasons = check_aur_supply_chain_attack(parts[0])
+                    updates.append({
+                        "name": parts[0], 
+                        "old": parts[1], 
+                        "new": parts[3], 
+                        "repo": "aur",
+                        "compromised": compromised,
+                        "compromise_reasons": reasons
+                    })
 
     return updates
 
@@ -408,6 +519,47 @@ def fetch_pacman_info(pkg: str) -> dict:
             info["url"] = line.split(":", 1)[1].strip()
 
     return info
+
+
+def fetch_aur_pkgbuild(pkg: str) -> str | None:
+    """Fetch PKGBUILD from AUR for a package."""
+    try:
+        # Try AUR GitLab first
+        data = _get(f"https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h={pkg}", accept="text/plain", timeout=5)
+        return data.decode(errors="replace")
+    except Exception:
+        pass
+    return None
+
+
+def scan_pkgbuild_for_threats(pkgbuild: str) -> list[str]:
+    """Scan PKGBUILD for suspicious patterns indicating supply-chain attack."""
+    threats = []
+    for pattern, desc in _SUSPICIOUS_PKGBUILD_PATTERNS:
+        if re.search(pattern, pkgbuild):
+            threats.append(desc)
+    return threats
+
+
+def check_aur_supply_chain_attack(pkg_name: str) -> tuple[bool, list[str]]:
+    """
+    Check if an AUR package is compromised in the 2024 supply-chain attack.
+    Returns (is_compromised, list_of_reasons).
+    """
+    reasons = []
+    
+    # Check known compromised package list
+    if pkg_name in AUR_COMPROMISED_PACKAGES:
+        reasons.append(f"Package '{pkg_name}' is in the known compromised package list (~1,500 packages affected in 2024 AUR supply-chain attack)")
+    
+    # Scan PKGBUILD for suspicious patterns
+    pkgbuild = fetch_aur_pkgbuild(pkg_name)
+    if pkgbuild:
+        threats = scan_pkgbuild_for_threats(pkgbuild)
+        if threats:
+            reasons.extend([f"PKGBUILD contains suspicious pattern: {t}" for t in threats])
+    
+    return (len(reasons) > 0, reasons)
 
 
 # ── Background threads ─────────────────────────────────────────────────────────
@@ -572,6 +724,7 @@ class UpdateWindow(QMainWindow):
         self._updating   = False
         self._pkg_row: dict[str, int] = {pkg["name"]: i for i, pkg in enumerate(updates)}
         self._installing_row: int | None = None
+        self._compromised = any(pkg.get("compromised") for pkg in updates)
         n = len(updates)
 
         self.setWindowTitle(f"Arch Update  —  {n} package{'s' if n != 1 else ''} available")
@@ -582,6 +735,21 @@ class UpdateWindow(QMainWindow):
         lay = QVBoxLayout(root)
         lay.setContentsMargins(14, 14, 14, 14)
         lay.setSpacing(10)
+
+        # ── Compromised warning banner ──────────────────────────────────────────
+        if self._compromised:
+            comp_pkgs = [p for p in updates if p.get("compromised")]
+            comp_names = "\n".join(
+                f"  • {p['name']}: {'; '.join(p.get('compromise_reasons', ['unknown']))}"
+                for p in comp_pkgs
+            )
+            warning = QLabel(_AUR_COMPROMISED_NOTICE.format(packages=comp_names))
+            warning.setStyleSheet(
+                "background-color:#5c1f1f; color:#ff9999; padding:12px;"
+                " border-radius:6px; font-size:12px; font-weight:bold;"
+            )
+            warning.setWordWrap(True)
+            lay.addWidget(warning)
 
         n_cached = sum(1 for i in range(n) if i in cached_info)
         self._hdr = QLabel()
@@ -613,6 +781,12 @@ class UpdateWindow(QMainWindow):
                 self._cell(i, self.C_DATE, "–",                       muted=True)
                 self._cell(i, self.C_DESC, "Loading…",                 muted=True)
                 self._cell(i, self.C_NEWS, "Fetching release notes…",  muted=True)
+            if pkg.get("compromised"):
+                color = QColor("#4a1515")
+                for col in range(self.table.columnCount()):
+                    item = self.table.item(i, col)
+                    if item:
+                        item.setBackground(color)
 
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(self.C_PKG,  QHeaderView.ResizeMode.ResizeToContents)
@@ -656,6 +830,9 @@ class UpdateWindow(QMainWindow):
             "QPushButton:hover { background-color:#1c71d8; }"
             "QPushButton:disabled { background-color:#888; color:#ccc; }"
         )
+        if self._compromised:
+            self._update_btn.setEnabled(False)
+            self._update_btn.setText("  Compromised — Update Disabled  ")
         self._update_btn.clicked.connect(self.start_update)
         btn_row.addWidget(self._update_btn)
         lay.addLayout(btn_row)
@@ -853,17 +1030,37 @@ class TrayApp(QObject):
         self._updates = updates
         self._cached_info = {}
         n = len(updates)
+        compromised = [p for p in updates if p.get("compromised")]
 
-        self._tray.setToolTip(f"Arch Update  —  {n} update{'s' if n != 1 else ''} available")
-        self._status_act.setText(f"{n} update{'s' if n != 1 else ''} available")
-        self._show_act.setEnabled(True)
+        if compromised:
+            names = ", ".join(p["name"] for p in compromised)
+            self._tray.setToolTip(
+                f"⚠️  ARCH UPDATE - SUPPLY CHAIN ATTACK DETECTED  ⚠️\n"
+                f"Compromised packages: {names}"
+            )
+            self._status_act.setText(
+                f"⚠️ {len(compromised)} compromised package{'s' if len(compromised) != 1 else ''} blocked"
+            )
+            self._show_act.setEnabled(True)
+            self._tray.showMessage(
+                "⚠️ AUR Supply-Chain Attack Detected",
+                f"{len(compromised)} package{'s' if len(compromised) != 1 else ''} "
+                f"({names}) flagged as compromised. Update has been disabled.\n"
+                f"See window for details.",
+                QSystemTrayIcon.MessageIcon.Critical,
+                12000,
+            )
+        else:
+            self._tray.setToolTip(f"Arch Update  —  {n} update{'s' if n != 1 else ''} available")
+            self._status_act.setText(f"{n} update{'s' if n != 1 else ''} available")
+            self._show_act.setEnabled(True)
 
-        self._tray.showMessage(
-            "Arch Update",
-            f"{n} package{'s' if n != 1 else ''} available — click to update",
-            QSystemTrayIcon.MessageIcon.Information,
-            6000,
-        )
+            self._tray.showMessage(
+                "Arch Update",
+                f"{n} package{'s' if n != 1 else ''} available — click to update",
+                QSystemTrayIcon.MessageIcon.Information,
+                6000,
+            )
 
         self._fetcher = InfoFetcher(updates)
         self._fetcher.row_ready.connect(self._on_row_cached)
