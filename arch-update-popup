@@ -36,8 +36,8 @@ from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication, QHeaderView, QHBoxLayout, QLabel, QMainWindow, QMenu,
-    QProgressBar, QPushButton, QSystemTrayIcon, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QMessageBox, QProgressBar, QPushButton, QSystemTrayIcon, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -650,6 +650,72 @@ def get_installed_packages() -> list[dict]:
     return pkgs
 
 
+def get_obsolete_packages() -> list[str]:
+    """Return installed packages no longer provided by any configured repository.
+
+    Only dependency-installed packages are considered (i.e. split packages
+    dropped upstream, like 'qemu-block-gluster' when QEMU removed glusterfs
+    support) so AUR / explicitly installed packages are never suggested.
+
+    These packages can block a full system upgrade (their exact-version pins
+    are no longer satisfiable), so they are generally safe to remove.
+    """
+    r = subprocess.run(["pacman", "-Qq"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    installed = set(r.stdout.split())
+
+    r = subprocess.run(["pacman", "-Slq"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    in_repos = set(r.stdout.split())
+
+    env_c = {**os.environ, "LC_ALL": "C"}  # keep pacman -Qi output parseable
+    obsolete: list[str] = []
+    for pkg in sorted(installed - in_repos):
+        r = subprocess.run(
+            ["pacman", "-Qi", pkg], capture_output=True, text=True, env=env_c
+        )
+        if "Installed as a dependency" in r.stdout:
+            obsolete.append(pkg)
+    return obsolete
+
+
+def find_blocked_obsolete_packages(packages: list[str]) -> list[str]:
+    """Return the subset of `packages` still required by other installed packages.
+
+    Such packages cannot be removed with a plain `pacman -R` (the dependents
+    are usually being upgraded to versions that drop the requirement).
+    """
+    blocked: list[str] = []
+    for pkg in packages:
+        r = subprocess.run(
+            ["pacman", "-R", "--print", pkg], capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            blocked.append(pkg)
+    return blocked
+
+
+def obsolete_conflict_culprits(output: str, obsolete: list[str]) -> list[str]:
+    """Intersect a failed update's conflict culprits with the obsolete set.
+
+    Parses pacman lines like:
+        ":: installing qemu-common (11.1.0-1) breaks dependency
+         'qemu-common=11.0.3-1' required by qemu-block-gluster"
+    Falls back to all obsolete packages when a dependency conflict is present
+    but the culprit cannot be parsed (e.g. localized pacman output).
+    """
+    if not obsolete:
+        return []
+    culprits = set(re.findall(r"required by\s+(\S+)", output))
+    if culprits:
+        return [p for p in obsolete if p in culprits]
+    if re.search(r"could not satisfy dependencies|breaks dependency", output):
+        return list(obsolete)
+    return []
+
+
 def scan_installed_for_compromise(
     on_progress: None | (callable[[int, int, str], None]) = None,
 ) -> list[dict]:
@@ -834,6 +900,63 @@ class UpdateRunner(QThread):
             self._askpass = None
 
 
+class ObsoleteRemover(QThread):
+    """Removes obsolete packages (privileged) and streams the output."""
+
+    done = pyqtSignal(bool, str)  # success, last output lines
+
+    def __init__(self, packages: list[str], force: bool = False) -> None:
+        super().__init__()
+        op = "-Rdd" if force else "-Rns"
+        self._cmd = ["pkexec", "pacman", op, *packages, "--noconfirm"]
+
+    def run(self) -> None:
+        master_fd, slave_fd = pty.openpty()
+        try:
+            proc = subprocess.Popen(
+                self._cmd,
+                stdout=slave_fd, stderr=slave_fd,
+                stdin=subprocess.DEVNULL,
+                close_fds=True,
+            )
+        except FileNotFoundError as e:
+            os.close(master_fd)
+            os.close(slave_fd)
+            self.done.emit(False, str(e))
+            return
+
+        os.close(slave_fd)
+
+        lines: list[str] = []
+        buf = ""
+        while True:
+            try:
+                ready, _, _ = select.select([master_fd], [], [], 0.05)
+            except (OSError, ValueError):
+                break
+            if ready:
+                try:
+                    buf += os.read(master_fd, 4096).decode(errors="replace")
+                except OSError:
+                    break
+                while "\n" in buf:
+                    raw, buf = buf.split("\n", 1)
+                    for fragment in raw.split("\r"):
+                        fragment = _ANSI_RE.sub("", fragment).strip()
+                        if fragment:
+                            lines.append(fragment)
+            elif proc.poll() is not None:
+                break
+
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+        proc.wait()
+        self.done.emit(proc.returncode == 0, "\n".join(lines[-8:]))
+
+
 # ── Update window ──────────────────────────────────────────────────────────────
 
 class UpdateWindow(QMainWindow):
@@ -857,6 +980,8 @@ class UpdateWindow(QMainWindow):
         self._updates    = updates
         self._aur_helper = aur_helper
         self._runner:    UpdateRunner | None = None
+        self._remover:   ObsoleteRemover | None = None
+        self._safe_names: list[str] = []
         self._updating   = False
         self._pkg_row: dict[str, int] = {pkg["name"]: i for i, pkg in enumerate(updates)}
         self._installing_row: int | None = None
@@ -1043,6 +1168,7 @@ class UpdateWindow(QMainWindow):
         safe_pkgs = [p for p in self._updates if not p.get("compromised")]
         comp_pkgs = [p for p in self._updates if p.get("compromised")]
         safe_names = [p["name"] for p in safe_pkgs]
+        self._safe_names = safe_names
 
         n = len(safe_pkgs)
         self._hdr.setText(f"<b>0</b> installed &nbsp;·&nbsp; <b>{n}</b> remaining")
@@ -1109,6 +1235,77 @@ class UpdateWindow(QMainWindow):
             self._status.setText(f"Update failed: {hint}")
             self._update_btn.setEnabled(True)
             self._skip_btn.setEnabled(True)
+            self._maybe_offer_obsolete_cleanup(output)
+
+    def _maybe_offer_obsolete_cleanup(self, output: str) -> None:
+        """If the failed update looks blocked by dropped packages, offer to remove them."""
+        try:
+            obsolete = get_obsolete_packages()
+        except Exception:
+            obsolete = []
+        culprits = obsolete_conflict_culprits(output, obsolete)
+        if not culprits:
+            return
+
+        names = "\n".join(f"  • {pkg}" for pkg in culprits)
+        box = QMessageBox(self)
+        box.setWindowTitle("Obsolete packages blocking the update")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(
+            "The update failed, possibly because these packages are no longer\n"
+            "provided by any repository and are blocking the upgrade:\n\n"
+            f"{names}\n\n"
+            "They are usually split packages dropped upstream and are safe to remove.\n"
+            "Remove them now and retry the update?"
+        )
+        remove_btn = box.addButton("Remove & Retry", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is remove_btn:
+            self._start_obsolete_removal(culprits)
+
+    def _start_obsolete_removal(self, packages: list[str]) -> None:
+        force = False
+        blocked = find_blocked_obsolete_packages(packages)
+        if blocked:
+            names = ", ".join(blocked)
+            box = QMessageBox(self)
+            box.setWindowTitle("Obsolete packages still required")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(
+                f"{names} is/are still required by other installed packages.\n\n"
+                "Removing them requires ignoring dependencies (-Rdd).\n"
+                "Only do this if the packages requiring them are being upgraded\n"
+                "to versions that no longer depend on them."
+            )
+            force_btn = box.addButton("Force Removal", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is not force_btn:
+                return
+            force = True
+
+        self._update_btn.setEnabled(False)
+        self._skip_btn.setEnabled(False)
+        self._progress.setRange(0, 0)
+        self._progress.setFormat("")
+        self._status.setText("Removing obsolete packages… (a password dialog may appear)")
+
+        self._remover = ObsoleteRemover(packages, force=force)
+        self._remover.done.connect(self._on_obsolete_removal_done)
+        self._remover.start()
+
+    def _on_obsolete_removal_done(self, success: bool, output: str) -> None:
+        self._remover = None
+        if not success:
+            last = [l for l in output.splitlines() if l.strip()][-2:]
+            hint = " · ".join(last) if last else "No output captured"
+            self._status.setText(f"Obsolete removal failed: {hint}")
+            self._update_btn.setEnabled(True)
+            self._skip_btn.setEnabled(True)
+            return
+        self._status.setText("Obsolete packages removed — retrying update…")
+        self.start_update()
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
@@ -1238,6 +1435,7 @@ class TrayApp(QObject):
         self._fetcher:     InfoFetcher | None              = None
         self._scanner:     SystemScanner | None            = None
         self._scan_window: ScanDialog | None               = None
+        self._obsolete_remover: ObsoleteRemover | None     = None
 
         # ── Tray icon ──────────────────────────────────────────────────────────
         self._tray = QSystemTrayIcon(icon, self)
@@ -1258,6 +1456,9 @@ class TrayApp(QObject):
         menu.addSeparator()
         self._scan_act = menu.addAction("Scan System for Compromise…")
         self._scan_act.triggered.connect(self.start_scan)
+        menu.addSeparator()
+        self._obsolete_act = menu.addAction("Remove Obsolete Packages…")
+        self._obsolete_act.triggered.connect(self.remove_obsolete)
         menu.addSeparator()
         quit_act = menu.addAction("Quit")
         quit_act.triggered.connect(app.quit)
@@ -1449,6 +1650,87 @@ class TrayApp(QObject):
 
     def _on_scan_window_closed(self) -> None:
         self._scan_window = None
+
+    # ── Obsolete packages cleanup ────────────────────────────────────────────────
+
+    def remove_obsolete(self) -> None:
+        """Proactively offer to remove packages dropped from the repositories."""
+        try:
+            obsolete = get_obsolete_packages()
+        except Exception:
+            obsolete = []
+        if not obsolete:
+            self._tray.showMessage(
+                "Arch Update",
+                "No obsolete packages found (everything is provided by a repository).",
+                QSystemTrayIcon.MessageIcon.Information, 5000,
+            )
+            return
+
+        names = "\n".join(f"  • {pkg}" for pkg in obsolete)
+        box = QMessageBox()
+        box.setWindowTitle("Obsolete packages")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(
+            "These installed packages are no longer provided by any enabled\n"
+            "repository (e.g. split packages dropped upstream). They can block\n"
+            "future updates and are generally safe to remove:\n\n"
+            f"{names}\n\n"
+            "Remove them now?"
+        )
+        remove_btn = box.addButton("Remove", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is not remove_btn:
+            return
+
+        self._status_act.setText("Removing obsolete packages…")
+        self._obsolete_act.setEnabled(False)
+
+        blocked = find_blocked_obsolete_packages(obsolete)
+        force = False
+        if blocked:
+            box2 = QMessageBox()
+            box2.setWindowTitle("Obsolete packages still required")
+            box2.setIcon(QMessageBox.Icon.Warning)
+            box2.setText(
+                f"{', '.join(blocked)} is/are still required by other installed packages.\n\n"
+                "Removing them requires ignoring dependencies (-Rdd).\n"
+                "Only do this if the packages requiring them are being upgraded\n"
+                "to versions that no longer depend on them."
+            )
+            force_btn = box2.addButton("Force Removal", QMessageBox.ButtonRole.AcceptRole)
+            box2.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box2.exec()
+            if box2.clickedButton() is not force_btn:
+                self._status_act.setText("System is up to date")
+                self._obsolete_act.setEnabled(True)
+                return
+            force = True
+
+        self._obsolete_remover = ObsoleteRemover(obsolete, force=force)
+        self._obsolete_remover.done.connect(self._on_obsolete_removal_done)
+        self._obsolete_remover.start()
+
+    def _on_obsolete_removal_done(self, success: bool, output: str) -> None:
+        self._obsolete_remover = None
+        self._obsolete_act.setEnabled(True)
+        if success:
+            self._tray.showMessage(
+                "Arch Update",
+                "Obsolete packages removed.",
+                QSystemTrayIcon.MessageIcon.Information, 5000,
+            )
+            self.check_now()
+        else:
+            last = [l for l in output.splitlines() if l.strip()][-2:]
+            hint = " · ".join(last) if last else "No output captured"
+            self._status_act.setText("Obsolete removal failed")
+            self._tray.showMessage(
+                "Arch Update",
+                f"Obsolete removal failed: {hint}",
+                QSystemTrayIcon.MessageIcon.Critical, 8000,
+            )
 
 
 # ── Icon ───────────────────────────────────────────────────────────────────────
