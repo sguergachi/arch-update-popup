@@ -199,27 +199,6 @@ class TestWindow:
         assert closed == [42]
         assert window._fail_notif_id == 0
 
-
-class TestNotifyHelper:
-    def test_parses_gdbus_id(self, monkeypatch):
-        import subprocess as sp
-
-        class R:
-            returncode = 0
-            stdout = "(uint32 7,)\n"
-
-        monkeypatch.setattr(app.shutil, "which", lambda *a: "/usr/bin/gdbus")
-        monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: R())
-        assert app._notify_update("t", "b") == 7
-
-    def test_fallback_without_gdbus(self, monkeypatch):
-        seen = []
-        monkeypatch.setattr(app.shutil, "which", lambda *a: None)
-        monkeypatch.setattr(app.subprocess, "run",
-                            lambda *a, **k: seen.append(a[0]))
-        assert app._notify_update("t", "b") == 0
-        assert seen and seen[0][0] == "notify-send"
-
     def test_pending_never_negative(self, window):
         window._safe_names = []
         window._model.set_state("konsole", "done")
@@ -247,6 +226,51 @@ class TestNotifyHelper:
         window._on_log_toggled(True)
         assert window._log_view.isVisible()
         window._on_log_toggled(False)
+
+    def test_status_fits_content(self, window, qapp):
+        window._set_status("Cancelling the running install…", "info")
+        qapp.processEvents()
+        h1 = window._status.height()
+        assert 0 < h1 <= 80, h1  # one line: slim, never a big box
+        window._set_status("✕ " + "long failure explanation. " * 30, "error")
+        qapp.processEvents()
+        h2 = window._status.height()
+        assert h2 <= 150, h2  # capped, scrolls internally past that
+        assert h2 >= h1
+        window._set_status("", "info")
+        assert not window._status.isVisible()
+
+    def test_bottom_structure(self, window):
+        lay = window.centralWidget().layout()
+        content = lay.itemAt(2).layout()  # head, divider, content row
+        left = content.itemAt(0).layout()
+        widgets = [left.itemAt(i).widget() for i in range(left.count())]
+        # status + progress sit below the details, footer row is last
+        assert widgets.index(window._status) > widgets.index(window._details)
+        assert widgets.index(window._progress) > widgets.index(window._details)
+        assert left.itemAt(left.count() - 1).layout() is not None
+        # log toggle shares the header row with search
+        head = lay.itemAt(0).layout()
+        assert head.indexOf(window._search) >= 0
+        assert head.indexOf(window._log_btn) >= 0
+        # log panel is the content row's second child
+        assert content.itemAt(1).widget() is window._log_panel
+
+    def test_log_panel_squishes_list(self, window, qapp):
+        w_full = window._list.width()
+        assert not window._log_panel.isVisible()
+        window._log_btn.setChecked(True)
+        qapp.processEvents()
+        assert window._log_panel.isVisible()
+        assert window._list.width() < w_full  # list gives way to the panel
+        window._log_btn.setChecked(False)
+        qapp.processEvents()
+        assert not window._log_panel.isVisible()
+
+    def test_progress_relaxes_to_divider(self, window):
+        window.on_fetch_done()
+        assert window._progress.maximum() == 1
+        assert window._progress.value() == 0
 
     def test_popover_content(self, window, qapp):
         window._model.set_info(0, "d", "short", "2026-01-01",
@@ -278,6 +302,27 @@ class TestNotifyHelper:
         # instead verify routing calls _run_single for safe rows:
         window._on_row_action("aur-pkg")
         assert window._model.item(1)["state"] == "installing"
+
+
+class TestNotifyHelper:
+    def test_parses_gdbus_id(self, monkeypatch):
+        import subprocess as sp
+
+        class R:
+            returncode = 0
+            stdout = "(uint32 7,)\n"
+
+        monkeypatch.setattr(app.shutil, "which", lambda *a: "/usr/bin/gdbus")
+        monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: R())
+        assert app._notify_update("t", "b") == 7
+
+    def test_fallback_without_gdbus(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(app.shutil, "which", lambda *a: None)
+        monkeypatch.setattr(app.subprocess, "run",
+                            lambda *a, **k: seen.append(a[0]))
+        assert app._notify_update("t", "b") == 0
+        assert seen and seen[0][0] == "notify-send"
 
 
 class TestPerf:

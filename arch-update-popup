@@ -17,6 +17,7 @@ Changelog sources tried in order per package:
 import bz2
 import glob
 import gzip
+import html
 import json
 import lzma
 import os
@@ -1396,7 +1397,7 @@ QWidget#stat-card {
     border: 1px solid palette(midlight);
     border-radius: 10px;
 }
-QLabel#stat-value { font-size: 20px; font-weight: 700; }
+QLabel#stat-value { font-size: 15px; font-weight: 700; }
 QLabel#stat-caption { font-size: 11px; font-weight: 700; color: #757575; }
 
 /* — Search — */
@@ -1429,6 +1430,13 @@ QListView#package-list::item {
 }
 QListView#package-list::item:selected { background: transparent; }
 QListView#package-list::item:hover { background: transparent; }
+
+/* — Side log panel: fixed-width card beside the list — */
+QWidget#log-panel {
+    background: palette(window);
+    border: 1px solid palette(midlight);
+    border-radius: 10px;
+}
 QWidget#package-card {
     background: palette(window);
     border: 1px solid palette(midlight);
@@ -1443,12 +1451,13 @@ QWidget#package-card-blocked {
 QLabel#package-link { font-size: 12px; }
 QLabel#package-link a { color: #3584e4; text-decoration: none; }
 
-/* — Slim progress track (numbers live in the status line) — */
+/* — Slim progress track. Doubles as the divider before the footer:
+     an empty hairline when idle, filling only while work runs. — */
 QProgressBar {
-    border: none; background: palette(midlight); border-radius: 3px;
-    min-height: 6px; max-height: 6px; color: transparent;
+    border: none; background: palette(midlight); border-radius: 2px;
+    min-height: 3px; max-height: 3px; color: transparent;
 }
-QProgressBar::chunk { background: #2e9b57; border-radius: 3px; }
+QProgressBar::chunk { background: #2e9b57; border-radius: 2px; }
 
 /* — Status messages: plain when idle, boxed for states that matter.
      A read-only text box (not a QLabel) so wrapped text always gets its
@@ -1647,25 +1656,26 @@ def _divider() -> QFrame:
 
 
 class _StatCard(QWidget):
-    """One cell of the stat grid: big number over an uppercase caption."""
+    """One cell of the stat strip: number + caption side by side, compact."""
 
     def __init__(self, value: str, caption: str, accent: str) -> None:
         super().__init__()
         self.setObjectName("stat-card")
         # Plain QWidgets don't paint QSS backgrounds/borders without this.
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 10, 12, 10)
-        lay.setSpacing(2)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 6, 12, 6)
+        lay.setSpacing(6)
         self._value = QLabel(value)
         self._value.setObjectName("stat-value")
         self._value.setStyleSheet(f"color: {accent};")
-        self._value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._value.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self._value)
         self._caption = QLabel(caption.upper())
         self._caption.setObjectName("stat-caption")
-        self._caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._caption.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self._caption)
+        lay.addStretch()
 
     def set_value(self, text: str) -> None:
         self._value.setText(text)
@@ -1686,7 +1696,7 @@ class _StatCard(QWidget):
 # dataChanged. Hit-testing (checkbox / links / action pill) is computed
 # from the same layout the painter uses.
 
-_SNIPPET_LEN = 220
+_SNIPPET_LEN = 120
 
 
 class PackageModel(QAbstractListModel):
@@ -1781,7 +1791,7 @@ class PackageModel(QAbstractListModel):
         pacman/paru often install packages that were never in the update
         list (dependencies, build deps). Without a row they are invisible:
         progress names something the list doesn't show, and a failure in
-        oneosc them can't be highlighted. Auto rows start unchecked.
+        one of them can't be highlighted. Auto rows start unchecked.
         """
         r = self.row_of(name)
         if r is not None:
@@ -1836,12 +1846,12 @@ class PackageDelegate(QStyledItemDelegate):
     more_requested = pyqtSignal(int)    # show more / less
     action_requested = pyqtSignal(str)  # retry / install-anyway for pkg
 
-    RAIL = 30       # checkbox / status icon column
-    PAD = 14        # card inner padding (horizontal)
-    PTOP = 10       # card inner padding top
-    PBOT = 12       # card inner padding bottom
+    RAIL = 28       # checkbox / status icon column
+    PAD = 12        # card inner padding (horizontal)
+    PTOP = 8        # card inner padding top
+    PBOT = 8        # card inner padding bottom
     CDX = 8         # card inset inside the row (horizontal)
-    CDY = 4         # card inset inside the row (vertical)
+    CDY = 3         # card inset inside the row (vertical)
 
     def __init__(self, view: QListView) -> None:
         super().__init__(view)
@@ -1851,11 +1861,12 @@ class PackageDelegate(QStyledItemDelegate):
         self._hover: tuple[int, str] = (-1, "")
         self._phase = 0
         self._paint_failed = False
+        # Dense type scale: name at app default, everything else a notch
+        # smaller so more packages fit on screen.
         self._f_name = QFont()
         self._f_name.setBold(True)
-        self._f_name.setPointSize(self._f_name.pointSize() + 1)
-        self._f_small = QFont()
-        self._f_small.setPointSize(self._f_small.pointSize() - 1)
+        self._f_text = QFont()
+        self._f_text.setPointSize(self._f_text.pointSize() - 1)
         self._f_badge = QFont()
         self._f_badge.setBold(True)
         self._f_badge.setPointSize(self._f_badge.pointSize() - 2)
@@ -1897,14 +1908,14 @@ class PackageDelegate(QStyledItemDelegate):
         x0 = self.CDX + self.PAD + self.RAIL
         right = width - self.CDX - self.PAD
         y = self.CDY + self.PTOP
-        fm_name = self._view.fontMetrics()
-        fm_name_b = QFontMetrics(self._f_name)
+        fm = QFontMetrics(self._f_text)
+        fm_name = QFontMetrics(self._f_name)
 
-        name_w = fm_name_b.horizontalAdvance(item["name"])
+        name_w = fm_name.horizontalAdvance(item["name"])
         badge_txt = (item["repo"] or "").upper()
-        badge_w = (QFontMetrics(self._f_badge).horizontalAdvance(badge_txt) + 18
+        badge_w = (QFontMetrics(self._f_badge).horizontalAdvance(badge_txt) + 16
                    if badge_txt else 0)
-        date_w = fm_name.horizontalAdvance(item["date"]) if item["date"] else 0
+        date_w = fm.horizontalAdvance(item["date"]) if item["date"] else 0
 
         if item.get("auto"):
             ver_html = (
@@ -1914,48 +1925,56 @@ class PackageDelegate(QStyledItemDelegate):
             ver_html = (
                 f"<span style='color:#757575'><s>{item['old']}</s></span>"
                 f" &nbsp;→&nbsp; <b style='color:{_NEW_GREEN}'>{item['new']}</b>")
-        ver_doc = self._doc(row, "ver", ver_html, cw, None, True, rev)
-        desc_doc = self._doc(row, "desc", item["desc"], cw, None, False, rev)
+        ver_doc = self._doc(row, "ver", ver_html, cw, self._f_text, True, rev)
+        desc_doc = self._doc(row, "desc", item["desc"], cw,
+                             self._f_text, False, rev)
 
         full = (item["full"] or "").strip()
         notes = (item["notes"] or "").strip()
         has_more = bool(full) and full != notes
         shown = (notes[:_SNIPPET_LEN].rstrip() + "…"
                  if len(notes) > _SNIPPET_LEN else notes)
-        notes_doc = self._doc(row, "notes", shown, cw, None, False, rev)
+        # Kicker merged inline (no separate row): "What's new: <snippet>".
+        notes_html = ("<span style='color:#757575'><b>What's new: </b></span>"
+                      + html.escape(shown).replace("\n", "<br>"))
+        notes_doc = self._doc(row, "notes", notes_html, cw,
+                              self._f_text, True, rev)
 
         more_txt = "Show more  ↓" if has_more else ""
         link_txt = "View package  ↗"
-        more_w = fm_name.horizontalAdvance(more_txt) if more_txt else 0
-        link_w = fm_name.horizontalAdvance(link_txt)
+        more_w = fm.horizontalAdvance(more_txt) if more_txt else 0
+        link_w = fm.horizontalAdvance(link_txt)
 
-        h_name, h_ver = 24, int(ver_doc.size().height())
+        h_name = 20
+        h_ver = int(ver_doc.size().height())
         h_desc = int(desc_doc.size().height())
-        h_kick, h_notes = 18, int(notes_doc.size().height())
-        h_actions = 22
+        h_notes = int(notes_doc.size().height())
+        h_actions = 18
         lay = {
-            "check": QRect(x0 - self.RAIL + 4, y + 1, 20, 20),
-            "name": QRect(x0, y, name_w, h_name),
-            "badge": QRect(x0 + name_w + 8, y + 3, badge_w, 18),
-            "date": QRect(right - date_w, y + 3, date_w, 18),
-            "state_icon": QRect(right - date_w - 22, y + 1, 18, 18)
+            "check": QRect(x0 - self.RAIL + 5, y + 1, 18, 18),
+            # +14 slack: rendered text can exceed horizontalAdvance by a
+            # few px (hinting/glyph fallback); the badge must clear it.
+            "name": QRect(x0, y, name_w + 14, h_name),
+            "badge": QRect(x0 + name_w + 14, y + 2, badge_w, 16),
+            "date": QRect(right - date_w - 6, y + 2, date_w + 6, 16),
+            "state_icon": QRect(right - date_w - 20, y + 1, 16, 16)
             if (item["state"] != "idle" or item["compromised"]) else QRect(),
-            "ver": QRect(x0, y + h_name + 2, cw, h_ver),
-            "desc": QRect(x0, y + h_name + 2 + h_ver + 4, cw, h_desc),
-            "kick": QRect(x0, y + h_name + 2 + h_ver + 4 + h_desc + 6, cw, h_kick),
-            "notes": QRect(x0, y + h_name + 2 + h_ver + 4 + h_desc + 6 + h_kick, cw, h_notes),
-            "more": QRect(x0, 0, more_w + 18, h_actions),
-            "link": QRect(right - link_w - 18, 0, link_w + 18, h_actions),
+            "ver": QRect(x0, y + h_name + 1, cw, h_ver),
+            "desc": QRect(x0, y + h_name + 1 + h_ver + 2, cw, h_desc),
+            "notes": QRect(x0, y + h_name + 1 + h_ver + 2 + h_desc + 3,
+                           cw, h_notes),
+            "more": QRect(x0, 0, more_w + 16, h_actions),
+            "link": QRect(right - link_w - 16, 0, link_w + 16, h_actions),
             "card": QRect(self.CDX, self.CDY, width - 2 * self.CDX, 0),
         }
-        ycur = (y + h_name + 2 + h_ver + 4 + h_desc + 6 + h_kick + h_notes + 6)
+        ycur = (y + h_name + 1 + h_ver + 2 + h_desc + 3 + h_notes + 3)
         lay["more"].moveTop(ycur)
         lay["link"].moveTop(ycur)
-        ycur += h_actions + 4
+        ycur += h_actions + 3
 
         if item["state"] in ("installing", "done", "failed"):
             lay["progress"] = QRect(x0, ycur, cw, 4)
-            ycur += 4 + 8
+            ycur += 4 + 6
         else:
             lay["progress"] = QRect()
 
@@ -1965,10 +1984,10 @@ class PackageDelegate(QStyledItemDelegate):
         elif item["compromised"]:
             action_txt = "Install anyway"
         if action_txt:
-            aw = fm_name.horizontalAdvance(action_txt) + 28
-            lay["action"] = QRect(right - aw, ycur, aw, 28)
+            aw = fm.horizontalAdvance(action_txt) + 24
+            lay["action"] = QRect(right - aw, ycur, aw, 26)
             lay["action_txt"] = action_txt
-            ycur += 28 + 2
+            ycur += 26 + 2
         else:
             lay["action"] = QRect()
             lay["action_txt"] = ""
@@ -2064,7 +2083,7 @@ class PackageDelegate(QStyledItemDelegate):
             p.drawText(br, Qt.AlignmentFlag.AlignCenter, lay["badge_txt"])
 
         # Date + state icon (top right)
-        p.setFont(self.parent().font())
+        p.setFont(self._f_text)
         p.setPen(QPen(QColor("#757575")))
         p.drawText(move(lay["date"]),
                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
@@ -2084,25 +2103,18 @@ class PackageDelegate(QStyledItemDelegate):
             doc.drawContents(p, QRectF(0, 0, r.width(), r.height()))
             p.restore()
 
-        # Kicker
-        p.setFont(self._f_badge)
-        p.setPen(QPen(QColor("#757575")))
-        p.drawText(move(lay["kick"]),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                   "WHAT'S NEW")
-
         # Action links
         hover = self._hover if self._hover[0] == index.row() else (-1, "")
-        p.setFont(self.parent().font())
+        p.setFont(self._f_text)
         if lay["more_txt"]:
             mr = move(lay["more"])
-            app_icon("chevron-down", 14).paint(
-                p, QRect(mr.left(), mr.center().y() - 7, 14, 14))
+            app_icon("chevron-down", 12).paint(
+                p, QRect(mr.left(), mr.center().y() - 6, 12, 12))
             p.setPen(QPen(QColor("#3584e4")))
             f = p.font()
             f.setUnderline(hover[1] == "more")
             p.setFont(f)
-            p.drawText(QRect(mr.left() + 18, mr.top(), mr.width() - 18,
+            p.drawText(QRect(mr.left() + 16, mr.top(), mr.width() - 16,
                              mr.height()),
                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                        lay["more_txt"])
@@ -2372,11 +2384,32 @@ class UpdateWindow(QMainWindow):
         self._search.setFixedHeight(36)
         self._search.textChanged.connect(self._apply_filter)
         head.addWidget(self._search, 0, Qt.AlignmentFlag.AlignVCenter)
+        # Log toggle lives here, next to search: it governs the side
+        # panel, which spans the full content height below.
+        self._log_btn = QPushButton("Log")
+        self._log_btn.setObjectName("secondary-small")
+        self._log_btn.setFixedHeight(30)
+        self._log_btn.setCheckable(True)
+        self._log_btn.setIcon(app_icon("terminal", 14))
+        self._log_btn.setToolTip("Show the live installer log beside the list")
+        self._log_btn.toggled.connect(self._on_log_toggled)
+        head.addWidget(self._log_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._head_row = head
         lay.addLayout(head)
 
         lay.addWidget(_divider())
 
-        # ── Zone 2 · Stat grid: equal-width cards ───────────────────────────
+        # ── Zone 2 · Content row: list column left, log panel right ─────────
+        # Everything update-related packs into the left column so the log
+        # panel can span the full content height when opened.
+        content = QHBoxLayout()
+        content.setSpacing(12)
+        left = QVBoxLayout()
+        left.setSpacing(12)
+        content.addLayout(left, 1)
+        self._left_col = left
+
+        # ── Stats ───────────────────────────────────────────────────────────
         stats = QHBoxLayout()
         stats.setSpacing(12)
         n_aur = sum(1 for p in updates if p.get("repo") == "aur")
@@ -2392,7 +2425,7 @@ class UpdateWindow(QMainWindow):
         if n_comp:
             self._stat_blocked = _StatCard(str(n_comp), "blocked · skipped", "#e01b24")
             stats.addWidget(self._stat_blocked, 1)
-        lay.addLayout(stats)
+        left.addLayout(stats)
 
         # ── Failure banner slot ─────────────────────────────────────────────
         # NOTE: intentionally no top banner widget. A dynamically shown
@@ -2434,31 +2467,21 @@ class UpdateWindow(QMainWindow):
                 Qt.TextInteractionFlag.TextSelectableByMouse
             )
             blay.addWidget(bbody)
-            lay.addWidget(banner)
+            left.addWidget(banner)
 
         n_cached = sum(1 for i in range(n) if i in cached_info)
         self._set_idle_header(n_cached)
 
-        # ── Zone 3 · Toolbar + virtualized package list ─────────────────────
+        # ── List toolbar: filter result count only ──────────────────────────
+        # Selection controls live in the footer next to the count they
+        # affect; the Log toggle sits in the header next to search.
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
         self._meta = QLabel(f"{n} package{'s' if n != 1 else ''}")
         self._meta.setObjectName("meta")
         toolbar.addWidget(self._meta, 0, Qt.AlignmentFlag.AlignVCenter)
         toolbar.addStretch()
-        self._select_all_btn = QPushButton("Select all")
-        self._select_all_btn.setObjectName("secondary-small")
-        self._select_all_btn.setFixedHeight(30)
-        self._select_all_btn.setIcon(app_icon("select-all", 14))
-        self._select_all_btn.clicked.connect(lambda: self._select_all(True))
-        toolbar.addWidget(self._select_all_btn)
-        self._select_none_btn = QPushButton("Select none")
-        self._select_none_btn.setObjectName("secondary-small")
-        self._select_none_btn.setFixedHeight(30)
-        self._select_none_btn.setIcon(app_icon("select-none", 14))
-        self._select_none_btn.clicked.connect(lambda: self._select_all(False))
-        toolbar.addWidget(self._select_none_btn)
-        lay.addLayout(toolbar)
+        left.addLayout(toolbar)
 
         self._model = PackageModel(updates, cached_info)
         self._list = QListView()
@@ -2483,7 +2506,49 @@ class UpdateWindow(QMainWindow):
         self._delegate.more_requested.connect(self._on_more_requested)
         self._delegate.action_requested.connect(self._on_row_action)
         self._model.dataChanged.connect(self._on_model_changed)
-        lay.addWidget(self._list, 1)
+        left.addWidget(self._list, 1)
+
+        # Side log panel: fixed width, hidden until toggled or failure.
+        self._log_panel = QWidget()
+        self._log_panel.setObjectName("log-panel")
+        self._log_panel.setFixedWidth(384)
+        self._log_panel.setVisible(False)
+        log_lay = QVBoxLayout(self._log_panel)
+        log_lay.setContentsMargins(12, 10, 12, 12)
+        log_lay.setSpacing(8)
+        log_head = QHBoxLayout()
+        log_head.setSpacing(8)
+        self._log_label = QLabel("UPDATE LOG")
+        self._log_label.setObjectName("details-label")
+        log_head.addWidget(self._log_label)
+        log_head.addStretch()
+        self._log_clear_btn = QPushButton("Clear")
+        self._log_clear_btn.setObjectName("secondary-small")
+        self._log_clear_btn.setFixedHeight(30)
+        self._log_clear_btn.setToolTip("Clear the log view")
+        self._log_clear_btn.clicked.connect(lambda: self._log_view.clear())
+        log_head.addWidget(self._log_clear_btn)
+        self._log_copy_btn = QPushButton("Copy")
+        self._log_copy_btn.setObjectName("secondary-small")
+        self._log_copy_btn.setFixedHeight(30)
+        self._log_copy_btn.setIcon(app_icon("copy", 14))
+        self._log_copy_btn.setToolTip("Copy the log to the clipboard")
+        self._log_copy_btn.clicked.connect(self._copy_log)
+        log_head.addWidget(self._log_copy_btn)
+        self._log_hide_btn = QPushButton("Hide")
+        self._log_hide_btn.setObjectName("secondary-small")
+        self._log_hide_btn.setFixedHeight(30)
+        self._log_hide_btn.clicked.connect(
+            lambda: self._log_btn.setChecked(False))
+        log_head.addWidget(self._log_hide_btn)
+        log_lay.addLayout(log_head)
+        self._log_view = QPlainTextEdit()
+        self._log_view.setObjectName("details")
+        self._log_view.setReadOnly(True)
+        self._log_view.setMaximumBlockCount(400)
+        log_lay.addWidget(self._log_view, 1)
+        content.addWidget(self._log_panel, 0)
+        lay.addLayout(content, 1)
 
         # Indeterminate per-item animation ticks only repaint installing rows.
         self._anim = QTimer(self)
@@ -2491,12 +2556,14 @@ class UpdateWindow(QMainWindow):
         self._anim.timeout.connect(lambda: self._delegate.tick(self._model))
 
         # ── Zone 4 · Status: message + slim progress track ───────────────────
+        # Created here, added to the layout at the very bottom (above the
+        # footer) so the list always gets first claim on vertical space.
         self._status = QTextEdit()
         self._status.setObjectName("status")
         self._status.setReadOnly(True)
         self._status.setFrameShape(QFrame.Shape.NoFrame)
         self._status.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._status.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._status.setSizeAdjustPolicy(
@@ -2505,13 +2572,16 @@ class UpdateWindow(QMainWindow):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         self._status.setVisible(False)
-        lay.addWidget(self._status)
 
         self._progress = QProgressBar()
         self._progress.setRange(0, n)
         self._progress.setValue(n_cached)
         self._progress.setTextVisible(False)
-        lay.addWidget(self._progress)
+        if n_cached >= n:
+            # Everything already cached: plain hairline divider, no
+            # misleading full-green bar before anything runs.
+            self._progress.setRange(0, 1)
+            self._progress.setValue(0)
 
         # ── Failure details (hidden unless an update fails) ───────────────────
         fail_head = QHBoxLayout()
@@ -2529,7 +2599,7 @@ class UpdateWindow(QMainWindow):
         self._copy_btn.clicked.connect(self._copy_error)
         self._copy_btn.setVisible(False)
         fail_head.addWidget(self._copy_btn)
-        lay.addLayout(fail_head)
+        left.addLayout(fail_head)
 
         self._details = QPlainTextEdit()
         self._details.setObjectName("details")
@@ -2538,51 +2608,39 @@ class UpdateWindow(QMainWindow):
         self._details.setMinimumHeight(90)
         self._details.setMaximumHeight(130)
         self._details.setVisible(False)
-        lay.addWidget(self._details)
+        left.addWidget(self._details)
 
-        # ── Optional log window (live installer output) ───────────────────────
-        log_head = QHBoxLayout()
-        log_head.setSpacing(8)
-        self._log_label = QLabel("UPDATE LOG")
-        self._log_label.setObjectName("details-label")
-        self._log_label.setVisible(False)
-        log_head.addWidget(self._log_label)
-        log_head.addStretch()
-        self._log_clear_btn = QPushButton("Clear")
-        self._log_clear_btn.setObjectName("secondary-small")
-        self._log_clear_btn.setFixedHeight(30)
-        self._log_clear_btn.setVisible(False)
-        self._log_clear_btn.clicked.connect(lambda: self._log_view.clear())
-        log_head.addWidget(self._log_clear_btn)
-        lay.addLayout(log_head)
+        # Status + progress pinned at the bottom of the left column so the
+        # list above always gets first claim on vertical space. The slim
+        # progress bar doubles as the divider before the footer.
+        left.addWidget(self._status)
+        left.addWidget(self._progress)
 
-        self._log_view = QPlainTextEdit()
-        self._log_view.setObjectName("details")
-        self._log_view.setReadOnly(True)
-        self._log_view.setMaximumBlockCount(400)
-        self._log_view.setMinimumHeight(110)
-        self._log_view.setMaximumHeight(170)
-        self._log_view.setVisible(False)
-        lay.addWidget(self._log_view)
-
-        lay.addWidget(_divider())
-
-        # ── Zone 5 · Footer: selection summary left, actions right ──────────
+        # ── Zone 5 · Footer: selection cluster left, actions right ──────────
+        # Selection lives here, next to the count it controls: label +
+        # All / None. The primary Update action stays rightmost.
         footer = QHBoxLayout()
         footer.setSpacing(8)
         self._sel_label = QLabel("")
         self._sel_label.setObjectName("meta")
         footer.addWidget(self._sel_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._select_all_btn = QPushButton("All")
+        self._select_all_btn.setObjectName("secondary-small")
+        self._select_all_btn.setFixedHeight(30)
+        self._select_all_btn.setIcon(app_icon("select-all", 14))
+        self._select_all_btn.setToolTip("Select all packages")
+        self._select_all_btn.clicked.connect(lambda: self._select_all(True))
+        footer.addWidget(self._select_all_btn, 0,
+                         Qt.AlignmentFlag.AlignVCenter)
+        self._select_none_btn = QPushButton("None")
+        self._select_none_btn.setObjectName("secondary-small")
+        self._select_none_btn.setFixedHeight(30)
+        self._select_none_btn.setIcon(app_icon("select-none", 14))
+        self._select_none_btn.setToolTip("Select no packages")
+        self._select_none_btn.clicked.connect(lambda: self._select_all(False))
+        footer.addWidget(self._select_none_btn, 0,
+                         Qt.AlignmentFlag.AlignVCenter)
         footer.addStretch()
-
-        self._log_btn = QPushButton("Log")
-        self._log_btn.setObjectName("secondary")
-        self._log_btn.setFixedHeight(40)
-        self._log_btn.setCheckable(True)
-        self._log_btn.setIcon(app_icon("terminal", 15))
-        self._log_btn.setToolTip("Show the live installer log")
-        self._log_btn.toggled.connect(self._on_log_toggled)
-        footer.addWidget(self._log_btn)
 
         self._skip_btn = QPushButton("Skip for Now")
         self._skip_btn.setObjectName("secondary")
@@ -2599,7 +2657,7 @@ class UpdateWindow(QMainWindow):
         self._update_btn.setIcon(app_icon("download", 16))
         self._update_btn.clicked.connect(self.start_update)
         footer.addWidget(self._update_btn)
-        lay.addLayout(footer)
+        left.addLayout(footer)
         self._refresh_selection_ui()
 
     # ── Helpers ────────────────────────────────────────────────────────────────
@@ -2681,6 +2739,8 @@ class UpdateWindow(QMainWindow):
         """Show a status message; the box hides itself when empty.
 
         kind: "info" (plain text), "error" (white on red), "ok" (white on green).
+        Height is fitted deterministically to the document (capped), so the
+        box can neither balloon nor clip — no reliance on async layout.
         """
         self._status.setHtml(text)
         self._status.setVisible(bool(text))
@@ -2692,15 +2752,26 @@ class UpdateWindow(QMainWindow):
             self._status.setObjectName("status")
         self._status.style().unpolish(self._status)
         self._status.style().polish(self._status)
+        if text:
+            self._fit_status_height()
+
+    def _fit_status_height(self) -> None:
+        """Fix the status box height to its content (1 line … 140px max)."""
+        doc = self._status.document()
+        doc.setTextWidth(max(self._status.viewport().width(), 100))
+        doc.adjustSize()
+        line = self._status.fontMetrics().lineSpacing()
+        self._status.setFixedHeight(
+            max(line + 16, min(int(doc.size().height()) + 20, 140)))
 
     def _set_progress_state(self, state: str, text: str = "") -> None:
-        """Recolor the slim progress track: 'normal', 'error' (red), 'ok'."""
+        """Recolor the divider-track: 'normal', 'error' (red), 'ok'."""
         chunk = {"normal": "#2e9b57", "error": "#c01c28", "ok": "#1f7a3a"}[state]
         self._progress.setStyleSheet(
             "QProgressBar { border: none; background: palette(midlight);"
-            " border-radius: 3px; min-height: 6px; max-height: 6px;"
+            " border-radius: 2px; min-height: 3px; max-height: 3px;"
             " color: transparent; }"
-            "QProgressBar::chunk { background: %s; border-radius: 3px; }"
+            "QProgressBar::chunk { background: %s; border-radius: 2px; }"
             % chunk
         )
         if text:
@@ -2731,12 +2802,19 @@ class UpdateWindow(QMainWindow):
             self._model.set_info(row, desc, notes, date, full, source,
                                  source_url)
         if not self._updating:
-            self._progress.setValue(self._progress.value() + 1)
+            if self._progress.maximum() <= 1:
+                # Hairline → determinate on first fresh arrival.
+                self._progress.setRange(0, max(self._model.rowCount(), 1))
+            self._progress.setValue(
+                min(self._progress.value() + 1, self._progress.maximum()))
 
     def on_fetch_done(self) -> None:
         if not self._updating:
             self._set_idle_header(len(self._updates))
-            self._progress.setFormat("Release notes loaded  ✓")
+            # Release notes in: relax to an empty hairline divider.
+            self._set_progress_state("normal")
+            self._progress.setRange(0, 1)
+            self._progress.setValue(0)
 
     # ── Update flow ────────────────────────────────────────────────────────────
 
@@ -2859,8 +2937,7 @@ class UpdateWindow(QMainWindow):
         self._set_status("Cancelling the running install…", "info")
 
     def _on_log_toggled(self, checked: bool) -> None:
-        for w in (self._log_label, self._log_view, self._log_clear_btn):
-            w.setVisible(checked)
+        self._log_panel.setVisible(checked)
 
     def _show_log(self) -> None:
         if not self._log_btn.isChecked():
@@ -2873,6 +2950,14 @@ class UpdateWindow(QMainWindow):
             old = self._copy_btn.text()
             self._copy_btn.setText("Copied ✓")
             QTimer.singleShot(2000, lambda: self._copy_btn.setText(old))
+
+    def _copy_log(self) -> None:
+        text = self._log_view.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            old = self._log_copy_btn.text()
+            self._log_copy_btn.setText("Copied ✓")
+            QTimer.singleShot(2000, lambda: self._log_copy_btn.setText(old))
 
     def _on_update_done(self, success: bool, output: str) -> None:
         self._anim.stop()
@@ -3235,6 +3320,12 @@ class UpdateWindow(QMainWindow):
             self.start_update()
         else:
             super().keyPressEvent(event)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        # Wrapped height depends on width — refit the status box.
+        if self._status.isVisible():
+            self._fit_status_height()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         super().closeEvent(event)
