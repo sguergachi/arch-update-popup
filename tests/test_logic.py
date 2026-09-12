@@ -191,6 +191,56 @@ class TestLogNoise:
         assert not app.is_log_noise(":: installing konsole (1/2)")
 
 
+class TestVerifyUpgraded:
+    def _run(self, monkeypatch, stdout):
+        import subprocess as sp
+
+        class R:
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = stdout
+
+        monkeypatch.setattr(app.subprocess, "run",
+                            lambda *a, **k: R())
+        return app.verify_upgraded
+
+    def test_mismatch_detected(self, monkeypatch):
+        verify = self._run(monkeypatch, "fzf 0.74.3-1.1\n")
+        assert verify({"fzf": "0.74.4-1.1"}) == [
+            ("fzf", "0.74.3-1.1", "0.74.4-1.1")]
+
+    def test_match_clean(self, monkeypatch):
+        verify = self._run(monkeypatch, "fzf 0.74.4-1.1\n")
+        assert verify({"fzf": "0.74.4-1.1"}) == []
+
+    def test_empty_skipped(self, monkeypatch):
+        verify = self._run(monkeypatch, "")
+        assert verify({}) == []
+        assert verify({"": "1.0"}) == []
+
+    def test_stale_db_classified(self):
+        kind, title, advice = app.classify_update_failure(
+            "fzf: still 0.74.3, expected 0.74.4 — "
+            "was not upgraded (stale sync database)")
+        assert kind == "stale-db"
+        assert title and advice
+
+
+class TestRunnerCommands:
+    def test_explicit_names_refresh_sync_dbs(self):
+        r = app.UpdateRunner("paru", ["fzf", "konsole"])
+        assert "-Sy" in r._cmd and "-Syu" not in r._cmd
+        r = app.UpdateRunner(None, ["fzf"])
+        assert r._cmd[:3] == ["pkexec", "pacman", "-Sy"]
+
+    def test_full_upgrade_unchanged(self):
+        r = app.UpdateRunner("paru", None)
+        assert "-Syu" in r._cmd
+        r = app.UpdateRunner(None, None)
+        assert "-Syu" in r._cmd
+
+
 class TestIcons:
     def test_all_defined(self):
         for name in ("download", "refresh", "copy", "terminal", "chevron-down",

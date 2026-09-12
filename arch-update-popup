@@ -1015,6 +1015,11 @@ _FAILURE_HINTS: list[tuple[str, str, str]] = [
      "Not enough disk space",
      "Free up space (check `paccache -r` to clean the package cache, or "
      "`df -h /` to see what's full) and retry."),
+    ("stale-db",
+     "Packages reinstalled instead of upgraded",
+     "The package database was out of date, so the old versions were "
+     "reinstalled. Retry now — databases refresh automatically before "
+     "each install — or run a full system update."),
 ]
 
 
@@ -1030,6 +1035,8 @@ def classify_update_failure(output: str) -> tuple[str, str, str]:
             return _FAILURE_HINTS[0]
     if "exists in filesystem" in low:
         return _FAILURE_HINTS[1]
+    if "was not upgraded (stale sync database)" in low:
+        return _FAILURE_HINTS[6]
     for needle in ("signature", "invalid or corrupted", "pgp", "keyring"):
         if needle in low:
             return _FAILURE_HINTS[2]
@@ -1069,6 +1076,30 @@ def _failed_package_names(output: str, candidates: list[str]) -> list[str]:
         if p in cand and p not in found:
             found.append(p)
     return found
+
+
+def verify_upgraded(expected: dict[str, str]) -> list[tuple[str, str, str]]:
+    """Check installed versions against the versions we just installed.
+
+    Returns [(name, installed, expected)] for packages that did NOT reach
+    the expected version — e.g. a stale sync DB caused a same-version
+    reinstall that still exits 0. Empty dict/unknown packages are skipped.
+    """
+    pending = {n: v for n, v in (expected or {}).items() if n and v}
+    if not pending:
+        return []
+    try:
+        r = subprocess.run(["pacman", "-Q", *pending],
+                           capture_output=True, text=True, timeout=30)
+    except Exception:
+        return []
+    installed: dict[str, str] = {}
+    for line in (r.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            installed[parts[0]] = parts[1]
+    return [(n, installed.get(n, "(missing)"), v)
+            for n, v in pending.items() if installed.get(n) != v]
 
 
 def extract_file_conflicts(output: str) -> tuple[list[str], list[str]]:
@@ -1217,6 +1248,10 @@ class UpdateRunner(QThread):
         self._killed = False
 
         extra = ["--overwrite", overwrite] if overwrite else []
+        # Explicit package lists MUST refresh the sync DBs (-Sy): a bare
+        # `-S pkg` installs whatever version the on-disk DBs hold, which
+        # silently reinstalls the OLD version when the DBs are stale
+        # (exit code 0, nothing upgraded, packages reappear next open).
         if aur_helper:
             fd, path = tempfile.mkstemp(suffix=".sh", prefix="arch-update-askpass-")
             with os.fdopen(fd, "w") as f:
@@ -1228,12 +1263,12 @@ class UpdateRunner(QThread):
             os.chmod(path, stat.S_IRWXU)
             self._askpass = path
             if packages:
-                self._cmd = [aur_helper, "--sudoflags", "-A", "-S", *packages, "--noconfirm", *extra]
+                self._cmd = [aur_helper, "--sudoflags", "-A", "-Sy", *packages, "--noconfirm", *extra]
             else:
                 self._cmd = [aur_helper, "--sudoflags", "-A", "-Syu", "--noconfirm", *extra]
         else:
             if packages:
-                self._cmd = ["pkexec", "pacman", "-S", *packages, "--noconfirm", *extra]
+                self._cmd = ["pkexec", "pacman", "-Sy", *packages, "--noconfirm", *extra]
             else:
                 self._cmd = ["pkexec", "pacman", "-Syu", "--noconfirm", *extra]
 
@@ -3116,6 +3151,23 @@ class UpdateWindow(QMainWindow):
         n_selected = len(self._safe_names)
         n_comp = sum(1 for p in self._updates if p.get("compromised"))
         if success:
+            # Trust, but verify: a stale sync DB makes `-S` reinstall the
+            # OLD version with exit code 0. Never declare success while a
+            # selected package is still at its old version.
+            expected = {}
+            for r in range(self._model.rowCount()):
+                it = self._model.item(r)
+                if it["name"] in (self._safe_names or []) and it.get("new"):
+                    expected[it["name"]] = it["new"]
+            stale = verify_upgraded(expected)
+            if stale:
+                detail = "\n".join(
+                    f"{n}: still {have}, expected {want} — "
+                    "was not upgraded (stale sync database)"
+                    for n, have, want in stale)
+                output = ((output + "\n") if output else "") + detail
+                success = False
+        if success:
             self._overwrite = None
             self._fail_sig = None
             self._fail_streak = 0
@@ -3356,6 +3408,15 @@ class UpdateWindow(QMainWindow):
         r = self._model.row_of(name)
         if r is None:
             return
+        if success:
+            want = self._model.item(r).get("new", "")
+            stale = verify_upgraded({name: want}) if want else []
+            if stale:
+                have = stale[0][1]
+                output = ((output + "\n") if output else "") + (
+                    f"{name}: still {have}, expected {want} — "
+                    "was not upgraded (stale sync database)")
+                success = False
         if success:
             self._model.set_state(name, "done")
             _notify_close(self._fail_notif_id)

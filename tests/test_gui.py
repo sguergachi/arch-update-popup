@@ -92,7 +92,8 @@ class TestWindow:
         window._select_all(True)
         assert window._update_btn.isEnabled()
 
-    def test_bulk_flow(self, window, qapp):
+    def test_bulk_flow(self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
         window.start_update()
         assert window._updating is True
         assert window._safe_names == ["konsole", "aur-pkg", "kpackage"]
@@ -277,6 +278,7 @@ class TestWindow:
     def test_success_closes_slot(self, window, monkeypatch):
         closed = []
         monkeypatch.setattr(app, "_notify_close", lambda nid: closed.append(nid))
+        monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
         window._fail_notif_id = 42
         window._safe_names = ["konsole"]
         window._on_update_done(True, "")
@@ -358,6 +360,27 @@ class TestWindow:
         assert window._copy_btn.isVisible()
         assert "exists in filesystem" in window._details.toPlainText()
 
+    def test_success_with_stale_install_reroutes_to_failure(
+            self, window, monkeypatch):
+        # Exit code 0 but versions unchanged (stale sync DB reinstall):
+        # must NOT declare success.
+        monkeypatch.setattr(
+            app, "verify_upgraded",
+            lambda expected: [("konsole", "1-1", "2-1")])
+        window._safe_names = ["konsole"]
+        window._on_update_done(True, "reinstalled konsole")
+        assert window._model.item(0)["state"] == "failed"
+        assert "reinstalled instead of upgraded" in \
+            window._status.toPlainText()
+        assert window._update_btn.isEnabled()  # retry offered
+
+    def test_success_with_verified_install_stays_success(
+            self, window, monkeypatch):
+        monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
+        window._safe_names = ["konsole"]
+        window._on_update_done(True, "")
+        assert window._model.item(0)["state"] == "done"
+
     def test_log_panel_squishes_list(self, window, qapp):
         w_full = window._list.width()
         assert not window._log_panel.isVisible()
@@ -418,7 +441,8 @@ class TestWindow:
         assert browsers and "FULL BODY TEXT" in browsers[0].toPlainText()
         pop.close()
 
-    def test_single_run(self, window):
+    def test_single_run(self, window, monkeypatch):
+        monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
         window._run_single("aur-pkg")
         assert window._model.item(1)["state"] == "installing"
         window._on_single_done(True, "")
