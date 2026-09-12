@@ -1346,6 +1346,8 @@ class ObsoleteRemover(QThread):
 
     def __init__(self, packages: list[str], force: bool = False) -> None:
         super().__init__()
+        self._proc: subprocess.Popen | None = None
+        self._killed = False
         op = "-Rdd" if force else "-Rns"
         self._cmd = ["pkexec", "pacman", op, *packages, "--noconfirm"]
 
@@ -1365,6 +1367,13 @@ class ObsoleteRemover(QThread):
             return
 
         os.close(slave_fd)
+
+        self._proc = proc
+        if self._killed:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
 
         lines: list[str] = []
         buf = ""
@@ -1393,7 +1402,20 @@ class ObsoleteRemover(QThread):
             pass
 
         proc.wait()
-        self.done.emit(proc.returncode == 0, "\n".join(lines[-8:]))
+        if self._killed:
+            lines.append("Cancelled by user.")
+        self.done.emit(proc.returncode == 0 and not self._killed,
+                       "\n".join(lines[-8:]))
+
+    def terminate(self) -> None:  # type: ignore[override]
+        """Ask the remover to stop (window closed mid-removal)."""
+        self._killed = True
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
 
 
 # ── Design system ──────────────────────────────────────────────────────────
@@ -3460,8 +3482,26 @@ class UpdateWindow(QMainWindow):
             self._fit_status_height()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        # Never destroy a running QThread: sip turns that into a hard
+        # abort ("QThread: Destroyed while thread is still running").
+        # Stopping first also kills the child installer, so closing the
+        # window mid-update is an explicit cancel.
+        self._stop_runners()
         super().closeEvent(event)
         self.closed.emit()
+
+    def _stop_runners(self) -> None:
+        """Terminate any running workers and wait for them to finish."""
+        for attr in ("_runner", "_single", "_remover"):
+            thread = getattr(self, attr, None)
+            if thread is not None:
+                if thread.isRunning():
+                    try:
+                        thread.terminate()
+                    except Exception:
+                        pass
+                    thread.wait(8000)
+                setattr(self, attr, None)
 
 
 # ── Scan dialog ─────────────────────────────────────────────────────────────────
@@ -3583,6 +3623,8 @@ class TrayApp(QObject):
         self._scanner:     SystemScanner | None            = None
         self._scan_window: ScanDialog | None               = None
         self._obsolete_remover: ObsoleteRemover | None     = None
+        self._orphans: set = set()  # parked threads (see _park_thread)
+        app.aboutToQuit.connect(self._shutdown)
 
         # ── Tray icon ──────────────────────────────────────────────────────────
         self._tray = QSystemTrayIcon(icon, self)
@@ -3710,8 +3752,25 @@ class TrayApp(QObject):
             pass
         if self._fetcher.isRunning():
             self._fetcher.requestInterruption()
-            self._fetcher.wait(3000)
+            if not self._fetcher.wait(5000):
+                # Still blocked in network I/O — never destroy a running
+                # QThread (sip aborts the process). Park it instead: it
+                # exits on its own once the request finishes.
+                self._park_thread(self._fetcher)
         self._fetcher = None
+
+    def _park_thread(self, thread: QThread) -> None:
+        """Keep a still-running thread alive until it finishes itself.
+
+        The finished signal deletes it; the set holds the Python reference
+        so sip can't garbage-collect a live QThread (hard abort).
+        """
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: self._orphans.discard(thread))
+        self._orphans.add(thread)
+        if thread.isFinished():
+            thread.deleteLater()
+            self._orphans.discard(thread)
 
     def _on_row_cached(self, row: int, name: str, new_ver: str,
                        desc: str, notes: str, date: str,
@@ -3755,6 +3814,43 @@ class TrayApp(QObject):
 
     def _on_window_closed(self) -> None:
         self._window = None
+
+    def _shutdown(self) -> None:
+        """Stop every worker thread before Qt tears down.
+
+        Destroying a running QThread aborts the process, so: stop the
+        window's runners first, then park anything still running.
+        """
+        if self._window is not None:
+            try:
+                self._window._stop_runners()
+            except Exception:
+                pass
+        if self._checker is not None:
+            if self._checker.isRunning():
+                self._park_thread(self._checker)
+            self._checker = None
+        self._stop_fetcher()
+        if self._scanner is not None:
+            if self._scanner.isRunning():
+                try:
+                    self._scanner.done.disconnect(self._on_scan_done)
+                except TypeError:
+                    pass
+                try:
+                    self._scanner.progress.disconnect(self._on_scan_progress)
+                except TypeError:
+                    pass
+                self._park_thread(self._scanner)
+            self._scanner = None
+        if self._obsolete_remover is not None:
+            if self._obsolete_remover.isRunning():
+                try:
+                    self._obsolete_remover.terminate()
+                except Exception:
+                    pass
+                self._obsolete_remover.wait(8000)
+            self._obsolete_remover = None
 
     def _on_update_succeeded(self) -> None:
         self._updates = []

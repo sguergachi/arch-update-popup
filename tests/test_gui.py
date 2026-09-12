@@ -38,6 +38,18 @@ class FakeRunner(QObject):
         super().__init__()
         self.packages = args[1] if len(args) > 1 else None
         self.kwargs = kwargs
+        self.terminated = False
+        self._running = False
+
+    def isRunning(self):
+        return self._running
+
+    def terminate(self):
+        self.terminated = True
+        self._running = False
+
+    def wait(self, ms=0):
+        return True
 
     def start(self):
         pass
@@ -164,6 +176,76 @@ class TestWindow:
         window._single = None
         window._on_skip_or_cancel()
         assert closed == [1]
+
+    def test_close_mid_update_stops_runner(self, window, qapp):
+        # Regression: closing the window with a running installer
+        # destroyed the live QThread -> SIGABRT. closeEvent must stop
+        # the runner first.
+        r = FakeRunner()
+        r._running = True
+        window._runner = r
+        window._updating = True
+        closed = []
+        window.closed.connect(lambda: closed.append(1))
+        window.close()
+        qapp.processEvents()
+        assert r.terminated is True
+        assert window._runner is None
+        assert closed == [1]
+        window._updating = False
+
+    def test_close_mid_single_stops_runner(self, window, qapp):
+        r = FakeRunner()
+        r._running = True
+        window._single = r
+        window.close()
+        qapp.processEvents()
+        assert r.terminated is True
+        assert window._single is None
+
+    def test_obsolete_remover_graceful_terminate(self):
+        r = app.ObsoleteRemover(["some-pkg"])
+        assert r._proc is None
+        r.terminate()  # no process yet — must not raise
+        assert r._killed is True
+
+    def test_stop_fetcher_parks_stuck_thread(self, qapp, monkeypatch):
+        # A fetcher blocked in network I/O past the wait timeout must be
+        # parked (kept alive), never destroyed while running.
+        from PyQt6.QtGui import QIcon
+        # Patch before construction: __init__ schedules check_now via
+        # singleShot, which must never fire real subprocesses in tests.
+        monkeypatch.setattr(app.TrayApp, "check_now", lambda self: None)
+        tray = app.TrayApp(qapp, QIcon())
+
+        class StuckFetcher(app.InfoFetcher):
+            def run(self):
+                import time as _t
+                while not self._stop_now:
+                    _t.sleep(0.05)
+
+        f = StuckFetcher([])
+        f._stop_now = False
+        f.start()
+        for _ in range(100):
+            if f.isRunning():
+                break
+            qapp.processEvents()
+            import time as _t
+            _t.sleep(0.02)
+        assert f.isRunning()
+        tray._fetcher = f
+        tray._stop_fetcher()
+        assert tray._fetcher is None
+        assert f in tray._orphans and f.isRunning()
+        f._stop_now = True
+        assert f.wait(10000)
+        for _ in range(100):
+            qapp.processEvents()
+            if f not in tray._orphans:
+                break
+        assert f not in tray._orphans
+        tray._shutdown()
 
     def test_single_notification_slot_updates(self, window, monkeypatch):
         calls = []
