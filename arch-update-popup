@@ -123,6 +123,32 @@ _INSTALL_RE = re.compile(
 )
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
+# AUR build lines (paru/yay shell out to makepkg, which prints these).
+# paru splits mixed repo+AUR jobs into separate transactions and builds
+# AUR packages with no "(x/y) installing" lines at all — without these,
+# the UI sits at "3 of 3, 0 remaining" for an hour while AUR builds run.
+_BUILD_RES = (
+    re.compile(r"^==>\s+Making package:\s+(\S+)"),
+    re.compile(r"^::\s+[Bb]uilding\s+([A-Za-z0-9@_+.~-]+)"),
+)
+
+_CONFLICT_RE = re.compile(r"(\S+):\s+(\S+)\s+exists in filesystem")
+
+
+def match_build_line(line: str) -> str | None:
+    """Return the package name if `line` announces an AUR build."""
+    for rx in _BUILD_RES:
+        m = rx.search(line.strip())
+        if m:
+            return m.group(1)
+    return None
+
+
+def match_conflict_line(line: str) -> tuple[str, str] | None:
+    """Return (package, path) for 'exists in filesystem' error lines."""
+    m = _CONFLICT_RE.search(line.strip())
+    return (m.group(1), m.group(2)) if m else None
+
 # ── Network helpers ────────────────────────────────────────────────────────────
 
 def _get(url: str, accept: str = "application/json", timeout: int = 6) -> bytes:
@@ -1179,6 +1205,8 @@ class UpdateRunner(QThread):
     """Runs the package update and streams per-package install progress."""
     install_progress = pyqtSignal(int, int, str)  # current, total, pkg_name
     line             = pyqtSignal(str)             # every raw output line
+    build            = pyqtSignal(str)             # AUR package started building
+    conflict         = pyqtSignal(str, str)        # pkg, path: file conflict
     done             = pyqtSignal(bool, str)       # success, last output lines
 
     def __init__(self, aur_helper: str | None, packages: list[str] | None = None,
@@ -1262,6 +1290,12 @@ class UpdateRunner(QThread):
                         if len(lines) > 2000:
                             del lines[:500]
                         self.line.emit(fragment)
+                        b = match_build_line(fragment)
+                        if b:
+                            self.build.emit(b)
+                        c = match_conflict_line(fragment)
+                        if c:
+                            self.conflict.emit(c[0], c[1])
                         m = _INSTALL_RE.match(fragment)
                         if m:
                             self.install_progress.emit(
@@ -1280,7 +1314,7 @@ class UpdateRunner(QThread):
         if self._killed:
             lines.append("Cancelled by user.")
         self.done.emit(proc.returncode == 0 and not self._killed,
-                       "\n".join(lines[-20:]))
+                       "\n".join(lines[-80:]))
 
     def terminate(self) -> None:  # type: ignore[override]
         """Ask the installer to stop (Cancel button / watchdog).
@@ -1436,6 +1470,30 @@ QWidget#log-panel {
     background: palette(window);
     border: 1px solid palette(midlight);
     border-radius: 10px;
+}
+
+/* — Slim overlay-style scrollbars (list, log, details, popover) — */
+QScrollBar:vertical {
+    background: transparent; width: 8px; margin: 2px 1px 2px 0;
+}
+QScrollBar::handle:vertical {
+    background: palette(mid); border-radius: 3px; min-height: 24px;
+}
+QScrollBar::handle:vertical:hover { background: #3584e4; }
+QScrollBar::sub-line:vertical, QScrollBar::add-line:vertical { height: 0; }
+QScrollBar::sub-page:vertical, QScrollBar::add-page:vertical {
+    background: transparent;
+}
+QScrollBar:horizontal {
+    background: transparent; height: 8px; margin: 0 2px 1px 2px;
+}
+QScrollBar::handle:horizontal {
+    background: palette(mid); border-radius: 3px; min-width: 24px;
+}
+QScrollBar::handle:horizontal:hover { background: #3584e4; }
+QScrollBar::sub-line:horizontal, QScrollBar::add-line:horizontal { width: 0; }
+QScrollBar::sub-page:horizontal, QScrollBar::add-page:horizontal {
+    background: transparent;
 }
 QWidget#package-card {
     background: palette(window);
@@ -2322,6 +2380,9 @@ class UpdateWindow(QMainWindow):
         self._remover:   ObsoleteRemover | None = None
         self._safe_names: list[str] = []
         self._last_run_names: list[str] = []
+        self._done_names: set[str] = set()  # own honest completion tracking
+        self._live_conflicts: dict[str, list[str]] = {}
+        self._seen_building: set[str] = set()
         self._updating   = False
         self._retry_mode = False
         self._overwrite:  str | None = None
@@ -2473,12 +2534,13 @@ class UpdateWindow(QMainWindow):
         self._set_idle_header(n_cached)
 
         # ── List toolbar: filter result count only ──────────────────────────
-        # Selection controls live in the footer next to the count they
-        # affect; the Log toggle sits in the header next to search.
+        # No bare "N packages" label here — the stat strip above already
+        # says that. This label only appears while filtering.
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
-        self._meta = QLabel(f"{n} package{'s' if n != 1 else ''}")
+        self._meta = QLabel("")
         self._meta.setObjectName("meta")
+        self._meta.setVisible(False)
         toolbar.addWidget(self._meta, 0, Qt.AlignmentFlag.AlignVCenter)
         toolbar.addStretch()
         left.addLayout(toolbar)
@@ -2516,6 +2578,35 @@ class UpdateWindow(QMainWindow):
         log_lay = QVBoxLayout(self._log_panel)
         log_lay.setContentsMargins(12, 10, 12, 12)
         log_lay.setSpacing(8)
+        # Error details live at the top of the side area, above the log:
+        # one place for all failure inspection. Hidden unless an update
+        # fails (which also auto-opens the panel).
+        err_head = QHBoxLayout()
+        err_head.setSpacing(8)
+        self._details_label = QLabel("ERROR DETAILS")
+        self._details_label.setObjectName("details-label")
+        self._details_label.setVisible(False)
+        err_head.addWidget(self._details_label)
+        err_head.addStretch()
+        self._copy_btn = QPushButton("Copy error")
+        self._copy_btn.setObjectName("secondary-small")
+        self._copy_btn.setFixedHeight(30)
+        self._copy_btn.setIcon(app_icon("copy", 14))
+        self._copy_btn.setToolTip("Copy the error details to the clipboard")
+        self._copy_btn.clicked.connect(self._copy_error)
+        self._copy_btn.setVisible(False)
+        err_head.addWidget(self._copy_btn)
+        log_lay.addLayout(err_head)
+
+        self._details = QPlainTextEdit()
+        self._details.setObjectName("details")
+        self._details.setReadOnly(True)
+        self._details.setMaximumBlockCount(60)
+        self._details.setMinimumHeight(80)
+        self._details.setMaximumHeight(220)
+        self._details.setVisible(False)
+        log_lay.addWidget(self._details)
+
         log_head = QHBoxLayout()
         log_head.setSpacing(8)
         self._log_label = QLabel("UPDATE LOG")
@@ -2583,32 +2674,9 @@ class UpdateWindow(QMainWindow):
             self._progress.setRange(0, 1)
             self._progress.setValue(0)
 
-        # ── Failure details (hidden unless an update fails) ───────────────────
-        fail_head = QHBoxLayout()
-        fail_head.setSpacing(8)
-        self._details_label = QLabel("ERROR DETAILS")
-        self._details_label.setObjectName("details-label")
-        self._details_label.setVisible(False)
-        fail_head.addWidget(self._details_label)
-        fail_head.addStretch()
-        self._copy_btn = QPushButton("Copy error")
-        self._copy_btn.setObjectName("secondary-small")
-        self._copy_btn.setFixedHeight(30)
-        self._copy_btn.setIcon(app_icon("copy", 14))
-        self._copy_btn.setToolTip("Copy the error details to the clipboard")
-        self._copy_btn.clicked.connect(self._copy_error)
-        self._copy_btn.setVisible(False)
-        fail_head.addWidget(self._copy_btn)
-        left.addLayout(fail_head)
-
-        self._details = QPlainTextEdit()
-        self._details.setObjectName("details")
-        self._details.setReadOnly(True)
-        self._details.setMaximumBlockCount(60)
-        self._details.setMinimumHeight(90)
-        self._details.setMaximumHeight(130)
-        self._details.setVisible(False)
-        left.addWidget(self._details)
+        # ── Failure details live in the side panel, above the log ──────────
+        # (see panel construction above) — nothing here, so packages keep
+        # the vertical space.
 
         # Status + progress pinned at the bottom of the left column so the
         # list above always gets first claim on vertical space. The slim
@@ -2670,10 +2738,11 @@ class UpdateWindow(QMainWindow):
             self._list.setRowHidden(r, hidden)
             shown += not hidden
         n = self._model.rowCount()
-        self._meta.setText(
-            f"Showing {shown} of {n} package{'s' if n != 1 else ''}" if q
-            else f"{n} package{'s' if n != 1 else ''}"
-        )
+        # Redundant otherwise: the stat strip already shows the total.
+        self._meta.setVisible(bool(q))
+        if q:
+            self._meta.setText(f"Showing {shown} of {n}")
+
 
     def _set_idle_header(self, n_cached: int) -> None:
         n = len(self._updates)
@@ -2765,8 +2834,10 @@ class UpdateWindow(QMainWindow):
             max(line + 16, min(int(doc.size().height()) + 20, 140)))
 
     def _set_progress_state(self, state: str, text: str = "") -> None:
-        """Recolor the divider-track: 'normal', 'error' (red), 'ok'."""
-        chunk = {"normal": "#2e9b57", "error": "#c01c28", "ok": "#1f7a3a"}[state]
+        """Recolor the divider-track: 'normal' (idle green), 'active'
+        (working blue), 'error' (red), 'ok' (done green)."""
+        chunk = {"normal": "#2e9b57", "active": "#3584e4",
+                 "error": "#c01c28", "ok": "#1f7a3a"}[state]
         self._progress.setStyleSheet(
             "QProgressBar { border: none; background: palette(midlight);"
             " border-radius: 2px; min-height: 3px; max-height: 3px;"
@@ -2839,10 +2910,18 @@ class UpdateWindow(QMainWindow):
         self._skip_btn.setText("Cancel update")
         self._select_all_btn.setEnabled(False)
         self._select_none_btn.setEnabled(False)
+        # New run supersedes the old failure: dismiss its state and its
+        # notification slot bubble so nothing stale lingers.
+        _notify_close(self._fail_notif_id)
+        self._fail_notif_id = 0
         self._hide_failure_ui()
         self._set_status("", "info")
         self._model.reset_states()
-        self._log_view.clear()
+        self._done_names = set()
+        self._live_conflicts = {}
+        self._seen_building = set()
+        if self._log_view.toPlainText().strip():
+            self._log_view.appendPlainText("── New run ──")
         self._note_activity()
         self._stuck_warned = False
         self._watchdog.start()
@@ -2862,8 +2941,9 @@ class UpdateWindow(QMainWindow):
         if self._overwrite:
             msg += " (retrying with --overwrite)"
         self._set_status(msg, "info")
-        self._set_progress_state("normal")
-        self._progress.setRange(0, 0)
+        self._set_progress_state("active")
+        self._progress.setRange(0, max(n, 1))
+        self._progress.setValue(0)
         self._progress.setFormat("")
         self._anim.start()
 
@@ -2871,31 +2951,77 @@ class UpdateWindow(QMainWindow):
             self._aur_helper, safe_names, overwrite=self._overwrite)
         self._runner.install_progress.connect(self._on_install_progress)
         self._runner.line.connect(self._on_log_line)
+        self._runner.build.connect(self._on_build_started)
+        self._runner.conflict.connect(self._on_live_conflict)
         self._runner.done.connect(self._on_update_done)
         self._runner.start()
 
+    def _done_selected_count(self) -> int:
+        return sum(1 for name in (self._safe_names or [])
+                   if name in self._done_names)
+
     def _on_install_progress(self, current: int, total: int, pkg: str) -> None:
-        if self._progress.maximum() == 0:
-            self._progress.setRange(0, total)   # switch away from indeterminate
-            self._set_progress_state("normal")
-        self._progress.setValue(current)
+        # pacman's (current/total) counts its own transaction only — paru
+        # splits repo and AUR into separate transactions, so those numbers
+        # lie about the overall run. Our bar/counts use our own done set.
+        self._set_progress_state("active")
+        n = max(len(self._safe_names or []), 1)
+        if self._progress.maximum() != n:
+            self._progress.setRange(0, n)
         self._note_activity()
-        remaining = total - current
         r = self._model.ensure_row(pkg)
+        if self._installing_row is not None and self._installing_row != r:
+            prev = self._model.item(self._installing_row)["name"]
+            if prev not in self._done_names:
+                self._done_names.add(prev)
+            self._model.set_state(prev, "done")
+        done = self._done_selected_count()
+        self._progress.setValue(min(done, n))
+        self._stat_ready.set_value(str(max(n - done, 0)))
         if self._model.item(r).get("auto"):
             self._sub.setText(
-                f"Installing dependency <b>{pkg}</b> — {current} of {total} "
+                f"Installing dependency <b>{pkg}</b> — "
+                f"{done} of {n} selected done "
                 f"<span style='color:#757575'>(auto-added below)</span>")
         else:
             self._sub.setText(
-                f"Installing <b>{pkg}</b> — {current} of {total}")
-        self._stat_ready.set_value(str(remaining))
+                f"Installing <b>{pkg}</b> — {done} of {n} selected done")
         self._set_status("", "info")
-        if self._installing_row is not None and self._installing_row != r:
-            prev = self._model.item(self._installing_row)["name"]
-            self._model.set_state(prev, "done")
         self._installing_row = r
         self._model.set_state(pkg, "installing")
+        self._list.scrollTo(self._model.index(r),
+                            QAbstractItemView.ScrollHint.EnsureVisible)
+
+    def _on_build_started(self, pkg: str) -> None:
+        """An AUR package started building (no pacman count lines exist)."""
+        self._note_activity()
+        self._set_progress_state("active")
+        if pkg in self._seen_building:
+            return
+        self._seen_building.add(pkg)
+        r = self._model.ensure_row(pkg)
+        self._sub.setText(
+            f"Building AUR package <b>{pkg}</b> — "
+            f"{self._done_selected_count()} of "
+            f"{max(len(self._safe_names or []), 1)} selected done "
+            f"<span style='color:#757575'>(builds show no count)</span>")
+        self._model.set_state(pkg, "installing")
+        self._list.scrollTo(self._model.index(r),
+                            QAbstractItemView.ScrollHint.EnsureVisible)
+
+    def _on_live_conflict(self, pkg: str, path: str) -> None:
+        """A 'exists in filesystem' error appeared mid-run — surface it now."""
+        self._note_activity()
+        self._live_conflicts.setdefault(pkg, [])
+        if path not in self._live_conflicts[pkg]:
+            self._live_conflicts[pkg].append(path)
+        r = self._model.ensure_row(pkg)
+        self._model.set_state(pkg, "failed")
+        self._set_status(
+            f"✕ Files already exist on disk: {pkg} "
+            f"({path}). Finishing output — retry help will appear below.",
+            "error")
+        self._show_log()
         self._list.scrollTo(self._model.index(r),
                             QAbstractItemView.ScrollHint.EnsureVisible)
 
@@ -3003,31 +3129,37 @@ class UpdateWindow(QMainWindow):
         self._runner = None
         self._retry_mode = True
         self._watchdog.stop()
-        if self._installing_row is not None:
-            # The package being installed never finished — back to idle;
-            # the failed run is summarized below with per-row Retry pills.
-            prev = self._model.item(self._installing_row)["name"]
-            self._model.set_state(prev, "idle")
-            self._installing_row = None
 
         # Name the failing packages even when they were never in the list
         # (dependencies): give them rows + Retry pills so the failure has
-        # a visible owner instead of a mystery name in the log.
+        # a visible owner instead of a mystery name in the log. Live
+        # conflicts seen mid-run are authoritative — merge them first.
         all_names = self._model.names()
         failed_names = _failed_package_names(output, all_names)
         conflict_pkgs, _conflict_files = extract_file_conflicts(output or "")
+        for pkg in list(self._live_conflicts):
+            if pkg not in failed_names:
+                failed_names.append(pkg)
+            if pkg not in conflict_pkgs:
+                conflict_pkgs.append(pkg)
         for pkg in conflict_pkgs:
             if self._model.row_of(pkg) is None:
                 self._model.ensure_row(pkg)
                 all_names.append(pkg)
             if pkg not in failed_names:
                 failed_names.append(pkg)
+        if self._installing_row is not None:
+            prev = self._model.item(self._installing_row)["name"]
+            # Don't clobber a live-marked failure back to idle.
+            if prev not in failed_names:
+                self._model.set_state(prev, "idle")
+            self._installing_row = None
         for name in failed_names:
             self._model.set_state(name, "failed")
 
         kind, title, advice = classify_update_failure(output)
         lines = [l for l in output.splitlines() if l.strip()]
-        self._last_error = "\n".join(lines[-40:]) if lines else "(no output captured)"
+        self._last_error = "\n".join(lines[-60:]) if lines else "(no output captured)"
 
         # Repeat guard: same signature failing again means the auto-fix
         # isn't working — stop the dialog loop, show the manual command.
@@ -3048,8 +3180,7 @@ class UpdateWindow(QMainWindow):
         self._progress.setValue(1)
         self._set_progress_state("error")
 
-        n_done = sum(1 for r in range(self._model.rowCount())
-                     if self._model.item(r)["state"] == "done")
+        n_done = self._done_selected_count()
         n_pending = max(0, n_selected - n_done)
         self._stat_ready.set_value(str(n_pending))
         self._stat_ready.set_caption("pending — retry")
@@ -3188,6 +3319,7 @@ class UpdateWindow(QMainWindow):
         self._single = UpdateRunner(
             self._aur_helper, [name], overwrite=overwrite)
         self._single.line.connect(self._on_log_line)
+        self._single.conflict.connect(self._on_live_conflict)
         self._single.done.connect(self._on_single_done)
         self._single.start()
 

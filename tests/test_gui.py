@@ -30,6 +30,8 @@ def _updates(n=4):
 class FakeRunner(QObject):
     install_progress = pyqtSignal(int, int, str)
     line = pyqtSignal(str)
+    build = pyqtSignal(str)
+    conflict = pyqtSignal(str, str)
     done = pyqtSignal(bool, str)
 
     def __init__(self, *args, **kwargs):
@@ -245,16 +247,34 @@ class TestWindow:
         content = lay.itemAt(2).layout()  # head, divider, content row
         left = content.itemAt(0).layout()
         widgets = [left.itemAt(i).widget() for i in range(left.count())]
-        # status + progress sit below the details, footer row is last
-        assert widgets.index(window._status) > widgets.index(window._details)
-        assert widgets.index(window._progress) > widgets.index(window._details)
+        # status + slim progress pinned at the bottom of the column,
+        # footer row last
+        assert widgets.index(window._status) > left.indexOf(window._list)
+        assert widgets.index(window._progress) > left.indexOf(window._list)
         assert left.itemAt(left.count() - 1).layout() is not None
+        # errors live in the side panel, above the log
+        panel = content.itemAt(1).widget()
+        assert panel is window._log_panel
+        pwidgets = [panel.layout().itemAt(i).widget()
+                    for i in range(panel.layout().count())]
+        assert window._details in pwidgets
+        assert window._log_view in pwidgets
+        assert pwidgets.index(window._details) < pwidgets.index(window._log_view)
+        # error copy button sits next to the details, log copy in log header
+        assert window._copy_btn.isHidden()  # no failure yet
         # log toggle shares the header row with search
         head = lay.itemAt(0).layout()
         assert head.indexOf(window._search) >= 0
         assert head.indexOf(window._log_btn) >= 0
-        # log panel is the content row's second child
-        assert content.itemAt(1).widget() is window._log_panel
+
+    def test_failure_shows_error_in_panel(self, window):
+        window._safe_names = ["konsole"]
+        window._on_update_done(
+            False, "konsole: /x exists in filesystem\nErrors occurred")
+        assert window._log_panel.isVisible()  # auto-opened on failure
+        assert window._details.isVisible()
+        assert window._copy_btn.isVisible()
+        assert "exists in filesystem" in window._details.toPlainText()
 
     def test_log_panel_squishes_list(self, window, qapp):
         w_full = window._list.width()
@@ -271,6 +291,38 @@ class TestWindow:
         window.on_fetch_done()
         assert window._progress.maximum() == 1
         assert window._progress.value() == 0
+
+    def test_meta_hidden_unless_filtering(self, window, qapp):
+        assert not window._meta.isVisible()
+        window._apply_filter("kons")
+        qapp.processEvents()
+        assert window._meta.isVisible()
+        assert "Showing 1 of" in window._meta.text()
+        window._apply_filter("")
+        assert not window._meta.isVisible()
+
+    def test_honest_counts_ignore_pacman_total(self, window):
+        window._safe_names = ["konsole", "aur-pkg", "kpackage"]
+        window._done_names = set()
+        window._on_install_progress(3, 3, "konsole")
+        # pacman says 3/3 but only 1 of our 3 selected is done at most
+        assert window._progress.maximum() == 3
+        assert window._progress.value() <= 1
+        assert "3 of 3" not in window._sub.text()
+        assert "of 3 selected done" in window._sub.text()
+
+    def test_build_event_creates_row(self, window):
+        n0 = window._model.rowCount()
+        window._safe_names = ["konsole"]
+        window._on_build_started("mystery-aur-pkg")
+        assert window._model.rowCount() == n0 + 1
+        assert "Building AUR package" in window._sub.text()
+
+    def test_live_conflict_marks_row(self, window):
+        window._on_live_conflict("konsole", "/usr/lib/x")
+        assert window._model.item(0)["state"] == "failed"
+        assert "Files already exist" in window._status.toPlainText()
+        assert window._live_conflicts == {"konsole": ["/usr/lib/x"]}
 
     def test_popover_content(self, window, qapp):
         window._model.set_info(0, "d", "short", "2026-01-01",

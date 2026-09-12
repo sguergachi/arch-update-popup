@@ -173,6 +173,19 @@ class TestLogNoise:
         assert app.is_log_noise("[##################] 100%")
         assert app.is_log_noise("12.3 MiB/50.0 MiB")
 
+    def test_build_lines(self):
+        assert app.match_build_line("==> Making package: snapd 2.77-1") == \
+            "snapd"
+        assert app.match_build_line(":: Building python2 ...") == "python2"
+        assert app.match_build_line(":: installing foo (1/2)") is None
+        assert app.match_build_line("") is None
+
+    def test_conflict_lines(self):
+        assert app.match_conflict_line(
+            "python: /usr/lib/x exists in filesystem") == \
+            ("python", "/usr/lib/x")
+        assert app.match_conflict_line("all good") is None
+
     def test_signal_kept(self):
         assert not app.is_log_noise("error: target not found: foo")
         assert not app.is_log_noise(":: installing konsole (1/2)")
