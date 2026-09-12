@@ -2,7 +2,7 @@
 import pytest
 
 from PyQt6.QtCore import QEvent, QPointF, Qt
-from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtGui import QMouseEvent, QPainter, QPixmap
 from PyQt6.QtWidgets import QApplication, QListView, QStyleOptionViewItem
 
 from conftest import load_app
@@ -190,3 +190,33 @@ class TestDelegate:
         opt.rect = view.visualRect(idx)
         lay = d._layout(2, view.model().item(2), opt.rect.width())
         assert lay["action_txt"] == "Install anyway"
+
+    def test_hover_move_repaints_without_crash(self, view, qapp):
+        # Regression: QListView.update() takes QModelIndex, not QRect —
+        # passing a rect aborted the whole app (SIGABRT) on mouse move.
+        d = view.itemDelegate()
+        opt, idx = _option(view, 0)
+        lay = d._layout(0, view.model().item(0), opt.rect.width())
+        c = lay["check"].center() + opt.rect.topLeft()
+        ev = QMouseEvent(QEvent.Type.MouseMove, QPointF(c),
+                         Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                         Qt.KeyboardModifier.NoModifier)
+        assert d.editorEvent(ev, view.model(), opt, idx) is False
+        assert d._hover == (0, "check")
+        qapp.processEvents()
+
+    def test_paint_guard_degrades_row(self, view, monkeypatch, qapp):
+        d = view.itemDelegate()
+        monkeypatch.setattr(d, "_layout", lambda *a, **k: 1 / 0)
+        opt, idx = _option(view, 0)
+        pm = QPixmap(400, 200)
+        p = QPainter(pm)
+        d.paint(p, opt, idx)  # must not raise / abort
+        p.end()
+        qapp.processEvents()
+
+    def test_sizehint_fallback(self, view, monkeypatch):
+        d = view.itemDelegate()
+        monkeypatch.setattr(d, "_layout", lambda *a, **k: 1 / 0)
+        opt, idx = _option(view, 0)
+        assert d.sizeHint(opt, idx).height() == 120

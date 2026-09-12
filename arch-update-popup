@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.request
 
@@ -1849,6 +1850,7 @@ class PackageDelegate(QStyledItemDelegate):
         self._geo: dict = {}
         self._hover: tuple[int, str] = (-1, "")
         self._phase = 0
+        self._paint_failed = False
         self._f_name = QFont()
         self._f_name.setBold(True)
         self._f_name.setPointSize(self._f_name.pointSize() + 1)
@@ -1984,12 +1986,25 @@ class PackageDelegate(QStyledItemDelegate):
         return lay
 
     def sizeHint(self, option, index) -> QSize:
-        item = index.model().item(index.row())
-        w = option.rect.width() or self._view.viewport().width()
-        return QSize(w, self._layout(index.row(), item, w)["height"])
+        try:
+            item = index.model().item(index.row())
+            w = option.rect.width() or self._view.viewport().width()
+            return QSize(w, self._layout(index.row(), item, w)["height"])
+        except Exception:
+            traceback.print_exc()
+            return QSize(option.rect.width() or 400, 120)
 
-    # — Painting —
+    # — Painting — (guarded: an exception here must degrade one row, not
+    # abort the process)
     def paint(self, painter: QPainter, option, index) -> None:
+        try:
+            self._paint_inner(painter, option, index)
+        except Exception:
+            if not self._paint_failed:
+                self._paint_failed = True
+                traceback.print_exc()
+
+    def _paint_inner(self, painter: QPainter, option, index) -> None:
         model = index.model()
         item = model.item(index.row())
         w = option.rect.width()
@@ -2143,6 +2158,15 @@ class PackageDelegate(QStyledItemDelegate):
         return lay, option.rect.topLeft()
 
     def editorEvent(self, event, model, option, index) -> bool:
+        # Never let exceptions escape into Qt event dispatch (sip turns
+        # them into a hard abort). Log and ignore instead.
+        try:
+            return self._editor_event_inner(event, model, option, index)
+        except Exception:
+            traceback.print_exc()
+            return False
+
+    def _editor_event_inner(self, event, model, option, index) -> bool:
         if event.type() == QEvent.Type.MouseMove:
             lay, origin = self._hit(option, index)
             pos = event.position().toPoint() - origin
@@ -2157,11 +2181,13 @@ class PackageDelegate(QStyledItemDelegate):
             if (index.row(), kind) != self._hover:
                 old_row = self._hover[0]
                 self._hover = (index.row(), kind)
+                # NOTE: QListView.update() takes a QModelIndex, not a QRect
+                # (it shadows QWidget.update) — repaint via the viewport.
+                vp = self._view.viewport()
                 if old_row >= 0:
-                    self._view.update(self._view.visualRect(
-                        model.index(old_row, 0)))
-                self._view.update(option.rect)
-                self._view.viewport().setCursor(
+                    vp.update(self._view.visualRect(model.index(old_row)))
+                vp.update(option.rect)
+                vp.setCursor(
                     Qt.CursorShape.PointingHandCursor if kind
                     else Qt.CursorShape.ArrowCursor)
             return False
