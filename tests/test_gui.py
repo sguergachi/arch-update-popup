@@ -76,13 +76,20 @@ class TestWindow:
         assert window._model.rowCount() == 4
         assert window._update_btn.isEnabled()  # 3 of 3 checkable selected
 
-    def test_filter(self, window, qapp):
-        window._apply_filter("kons")
-        qapp.processEvents()
-        assert not window._list.isRowHidden(0)
-        assert window._list.isRowHidden(1)
-        assert "Showing 1 of 4" in window._meta.text()
-        window._apply_filter("")
+    def test_header_tabs(self, window, qapp):
+        # Tabs replaced the filter field: Updates | Obsolete |
+        # Security | Tracked.
+        assert not hasattr(window, "_search")
+        tabs = window._view_buttons
+        assert [b.text() for b in
+                (tabs["updates"], tabs["obsolete"], tabs["security"],
+                 tabs["tracked"])] == [
+            "Updates (4)", "Obsolete", "Security", "Tracked"]
+        assert tabs["updates"].isChecked()
+        head = window.centralWidget().layout().itemAt(0).layout()
+        for key in ("updates", "obsolete", "security", "tracked"):
+            assert head.indexOf(tabs[key]) >= 0
+        assert head.indexOf(window._log_btn) >= 0
 
     def test_select_none_disables_update(self, window):
         window._select_all(False)
@@ -129,7 +136,7 @@ class TestWindow:
         assert r is not None
         assert window._model.item(r)["state"] == "failed"
         # who/why lands in the status box and the list jumps to the row
-        assert "ghost-pkg" in window._status.toPlainText()
+        assert "ghost-pkg" in window._sub.text()
         assert window._fail_row == r
 
     def test_repeat_failure_pauses_dialogs(self, window, monkeypatch):
@@ -144,7 +151,7 @@ class TestWindow:
         window._on_update_done(False, out)
         assert len(calls) == first  # identical repeat: no new dialogs
         assert "Manual fix" in window._details.toPlainText()
-        assert "2 times in a row" in window._status.toPlainText()
+        assert "2 times in a row" in window._sub.text()
 
     def test_watchdog_warns_and_cancel(self, window):
         import time as _t
@@ -153,7 +160,7 @@ class TestWindow:
         assert window._stuck_warned is False
         window._watchdog_tick()
         assert window._stuck_warned is True
-        assert "2 minutes" in window._status.toPlainText()
+        assert "2 minutes" in window._sub.text()
         assert window._log_btn.isChecked()  # log auto-shown
 
         class RecRunner:
@@ -313,29 +320,35 @@ class TestWindow:
         assert window._log_view.isVisible()
         window._on_log_toggled(False)
 
-    def test_status_fits_content(self, window, qapp):
+    def test_status_unified_in_header(self, window, qapp):
+        idle = window._sub.text()
+        assert idle  # resting summary present
         window._set_status("Cancelling the running install…", "info")
         qapp.processEvents()
-        h1 = window._status.height()
-        assert 0 < h1 <= 80, h1  # one line: slim, never a big box
-        window._set_status("✕ " + "long failure explanation. " * 30, "error")
-        qapp.processEvents()
-        h2 = window._status.height()
-        assert h2 <= 150, h2  # capped, scrolls internally past that
-        assert h2 >= h1
+        assert "Cancelling" in window._sub.text()
+        assert "✕" not in window._sub.text()
+        window._set_status("Something broke badly", "error")
+        assert "✕" in window._sub.text()
+        assert "Something broke badly" in window._sub.text()
+        window._set_status("All good", "ok")
+        assert "✓" in window._sub.text()
         window._set_status("", "info")
-        assert not window._status.isVisible()
+        assert window._sub.text() == idle  # empty restores summary
 
     def test_bottom_structure(self, window):
         lay = window.centralWidget().layout()
         content = lay.itemAt(2).layout()  # head, divider, content row
         left = content.itemAt(0).layout()
-        widgets = [left.itemAt(i).widget() for i in range(left.count())]
-        # status + slim progress pinned at the bottom of the column,
-        # footer row last
-        assert widgets.index(window._status) > left.indexOf(window._list)
-        assert widgets.index(window._progress) > left.indexOf(window._list)
-        assert left.itemAt(left.count() - 1).layout() is not None
+        # view switcher + content stack + footer stack
+        assert window._content_stack.count() == 4
+        assert window._footer_stack.count() == 4
+        assert window._content_stack.currentIndex() == 0
+        assert window._footer_stack.currentIndex() == 0
+        tabs = window._view_buttons
+        assert set(tabs) == {"updates", "obsolete", "security", "tracked"}
+        assert tabs["updates"].isChecked()
+        # slim progress lives in the updates page above its footer
+        assert window._progress.parent() is not None
         # errors live in the side panel, above the log
         panel = content.itemAt(1).widget()
         assert panel is window._log_panel
@@ -346,9 +359,10 @@ class TestWindow:
         assert pwidgets.index(window._details) < pwidgets.index(window._log_view)
         # error copy button sits next to the details, log copy in log header
         assert window._copy_btn.isHidden()  # no failure yet
-        # log toggle shares the header row with search
+        # log toggle shares the header row with the view tabs
         head = lay.itemAt(0).layout()
-        assert head.indexOf(window._search) >= 0
+        for key in ("updates", "obsolete", "security"):
+            assert head.indexOf(window._view_buttons[key]) >= 0
         assert head.indexOf(window._log_btn) >= 0
 
     def test_failure_shows_error_in_panel(self, window):
@@ -371,7 +385,7 @@ class TestWindow:
         window._on_update_done(True, "reinstalled konsole")
         assert window._model.item(0)["state"] == "failed"
         assert "reinstalled instead of upgraded" in \
-            window._status.toPlainText()
+            window._sub.text()
         assert window._update_btn.isEnabled()  # retry offered
 
     def test_success_with_verified_install_stays_success(
@@ -380,6 +394,22 @@ class TestWindow:
         window._safe_names = ["konsole"]
         window._on_update_done(True, "")
         assert window._model.item(0)["state"] == "done"
+
+    def test_log_preview_opens_panel(self, window, qapp):
+        assert not window._log_preview.isVisible()
+        window._on_log_line(":: installing konsole (1/2)")
+        qapp.processEvents()
+        assert window._log_preview.isVisible()
+        assert "konsole" in window._log_preview.text()
+        # HTML-unsafe log output must not break the label
+        window._on_log_line("<b>not a tag</b> & done")
+        assert "not a tag" in window._log_preview.text()
+        # click opens the panel, which hides the preview
+        window._log_preview.clicked.emit()
+        qapp.processEvents()
+        assert window._log_panel.isVisible()
+        assert not window._log_preview.isVisible()
+        window._on_log_toggled(False)
 
     def test_log_panel_squishes_list(self, window, qapp):
         w_full = window._list.width()
@@ -397,14 +427,22 @@ class TestWindow:
         assert window._progress.maximum() == 1
         assert window._progress.value() == 0
 
-    def test_meta_hidden_unless_filtering(self, window, qapp):
-        assert not window._meta.isVisible()
-        window._apply_filter("kons")
+    def test_obsolete_preload_fills_tab(self, window, qapp, monkeypatch):
+        # The real preload thread races the test; drive the handler
+        # directly with staged data instead.
+        if window._obs_checker is not None and \
+                window._obs_checker.isRunning():
+            window._obs_checker.wait(15000)
+        window._obs_loaded = False
+        window._on_obs_preload_done(["pre-a", "pre-b"])
         qapp.processEvents()
-        assert window._meta.isVisible()
-        assert "Showing 1 of" in window._meta.text()
-        window._apply_filter("")
-        assert not window._meta.isVisible()
+        assert window._obs_loaded is True
+        assert set(window._obs_cards) == {"pre-a", "pre-b"}
+        assert window._view_buttons["obsolete"].text() == "Obsolete (2)"
+        # A later manual refresh still works.
+        monkeypatch.setattr(app, "get_obsolete_packages", lambda: [])
+        window._refresh_obsolete_view()
+        assert window._obs_cards == {}
 
     def test_honest_counts_ignore_pacman_total(self, window):
         window._safe_names = ["konsole", "aur-pkg", "kpackage"]
@@ -426,7 +464,7 @@ class TestWindow:
     def test_live_conflict_marks_row(self, window):
         window._on_live_conflict("konsole", "/usr/lib/x")
         assert window._model.item(0)["state"] == "failed"
-        assert "Files already exist" in window._status.toPlainText()
+        assert "Files already exist" in window._sub.text()
         assert window._live_conflicts == {"konsole": ["/usr/lib/x"]}
 
     def test_popover_content(self, window, qapp):
@@ -460,6 +498,377 @@ class TestWindow:
         # instead verify routing calls _run_single for safe rows:
         window._on_row_action("aur-pkg")
         assert window._model.item(1)["state"] == "installing"
+
+
+class TestMovesDialog:
+    def _moves(self):
+        return [
+            {"name": "graduated", "installed": "1.0-1", "official": "1.1-1",
+             "relation": "upgrade"},
+            {"name": "shiny", "installed": "2.0-1", "official": "1.9-1",
+             "relation": "downgrade"},
+        ]
+
+    def test_builds_rows(self, qapp):
+        dlg = app.MovesDialog(self._moves())
+        dlg.resize(760, 480)
+        dlg.show()
+        qapp.processEvents()
+        assert set(dlg._rows) == {"graduated", "shiny"}
+        assert dlg._rows["graduated"]._switch_btn.text() == "Switch"
+        dlg.close()
+
+    def test_switch_runs_and_verifies(self, qapp, monkeypatch):
+        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
+        monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
+        dlg = app.MovesDialog(self._moves())
+        dlg.resize(760, 480)
+        dlg.show()
+        qapp.processEvents()
+        dlg.request_switch("graduated")
+        assert isinstance(dlg._runner, FakeRunner)
+        dlg._runner.done.emit(True, "")
+        qapp.processEvents()
+        assert dlg._rows["graduated"]._switch_btn.text() == "Switched ✓"
+        assert dlg._runner is None  # queue drained
+        dlg.close()
+
+    def test_switch_failure_retries(self, qapp, monkeypatch):
+        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
+        dlg = app.MovesDialog(self._moves())
+        dlg.resize(760, 480)
+        dlg.show()
+        qapp.processEvents()
+        dlg.request_switch("graduated")
+        dlg._runner.done.emit(False, "boom")
+        qapp.processEvents()
+        assert dlg._rows["graduated"]._switch_btn.text() == "Retry"
+        dlg.close()
+
+    def test_downgrade_cancel_leaves_queue_empty(self, qapp, monkeypatch):
+        # window fixture patches QMessageBox.exec/clickedButton only for
+        # window tests; replicate the auto-dismiss stub here.
+        monkeypatch.setattr(app.QMessageBox, "exec", lambda self: None)
+        monkeypatch.setattr(app.QMessageBox, "clickedButton", lambda self: None)
+        dlg = app.MovesDialog(self._moves())
+        dlg.resize(760, 480)
+        dlg.show()
+        qapp.processEvents()
+        dlg.request_switch("shiny")  # downgrade → confirm → auto-dismiss
+        assert dlg._queue == []
+        assert dlg._runner is None
+        dlg.close()
+
+    def test_lock_blocks_switch(self, qapp, monkeypatch):
+        import os as _os
+        monkeypatch.setattr(_os.path, "exists", lambda p: True)
+        dlg = app.MovesDialog(self._moves())
+        dlg.resize(760, 480)
+        dlg.show()
+        qapp.processEvents()
+        dlg.request_switch("graduated")
+        assert dlg._queue == []
+        assert "Another package operation" in dlg._status.text()
+        dlg.close()
+
+
+class TestViews:
+    def test_empty_window_opens(self, qapp):
+        w = app.UpdateWindow([], {}, None)
+        w.resize(1280, 800)
+        w.show()
+        qapp.processEvents()
+        assert w._empty_label.isVisible()
+        assert not w._list.isVisible()
+        assert not w._update_btn.isEnabled()
+        assert "0" in w._sub.text()
+        w.close()
+
+    def test_empty_state_clears_on_new_row(self, qapp):
+        w = app.UpdateWindow([], {}, None)
+        w.resize(1280, 800)
+        w.show()
+        qapp.processEvents()
+        assert w._empty_label.isVisible()
+        w._model.ensure_row("late-dep")
+        qapp.processEvents()
+        assert not w._empty_label.isVisible()
+        assert w._list.isVisible()
+        w.close()
+
+    def test_switch_views(self, window, qapp):
+        window._switch_view("obsolete")
+        qapp.processEvents()
+        assert window._content_stack.currentIndex() == 1
+        assert window._footer_stack.currentIndex() == 1
+        assert window._view_buttons["obsolete"].isChecked()
+        window._switch_view("security")
+        assert window._content_stack.currentIndex() == 2
+        window._switch_view("tracked")
+        assert window._content_stack.currentIndex() == 3
+        assert window._footer_stack.currentIndex() == 3
+        assert window._view_buttons["tracked"].isChecked()
+        window._switch_view("updates")
+        assert window._content_stack.currentIndex() == 0
+
+    def test_view_badges(self, window):
+        assert window._view_buttons["updates"].text() == "Updates (4)"
+
+    def test_obsolete_view_lists_and_removes(
+            self, window, qapp, monkeypatch):
+        window._obs_loaded = False
+        window._switch_view("obsolete")
+        qapp.processEvents()
+        window._on_obs_preload_done(["old-a", "old-b"])
+        qapp.processEvents()
+        assert set(window._obs_cards) == {"old-a", "old-b"}
+        assert window._obs_remove_btn.isEnabled()
+        assert "2 obsolete" in window._obs_footer_label.text()
+
+        # removal success reloads async in place, no update starts
+        started = []
+        monkeypatch.setattr(window, "start_update",
+                            lambda: started.append(1))
+        window._remover = None
+        window._obsolete_ctx = "obsolete"
+        window._on_obsolete_removal_done(True, "")
+        qapp.processEvents()
+        assert started == []
+        assert "rescanning" in window._sub.text()
+        window._on_obs_preload_done([])
+        qapp.processEvents()
+        assert window._obs_cards == {}
+        assert not window._obs_remove_btn.isEnabled()
+        assert "✓" in window._sub.text()
+
+    def test_obsolete_empty_state(self, window, qapp, monkeypatch):
+        window._obs_loaded = False
+        window._switch_view("obsolete")
+        qapp.processEvents()
+        window._on_obs_preload_done([])
+        qapp.processEvents()
+        assert window._obs_cards == {}
+        assert not window._obs_remove_btn.isEnabled()
+        assert "No obsolete" in window._obs_summary.text()
+
+    def test_obsolete_switch_never_blocks(self, window, qapp, monkeypatch):
+        # Even if pacman hangs, switching tabs must return instantly:
+        # computation happens in the checker thread, never on the GUI.
+        def _boom():
+            raise AssertionError("must not run on GUI thread")
+
+        monkeypatch.setattr(app, "get_obsolete_packages", _boom)
+        window._obs_loaded = False
+        window._switch_view("obsolete")  # would raise if sync
+        qapp.processEvents()
+        assert "Scanning" in window._obs_summary.text()
+        window._on_obs_preload_done(["x"])
+        assert set(window._obs_cards) == {"x"}
+
+    def test_security_scan_shows_findings(
+            self, window, qapp, monkeypatch):
+        from PyQt6.QtCore import QObject, pyqtSignal
+
+        class FakeScanner(QObject):
+            progress = pyqtSignal(int, int, str)
+            done = pyqtSignal(list)
+
+            def __init__(self, *a, **k):
+                super().__init__()
+
+            def isRunning(self):
+                return False
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(app, "SystemScanner", FakeScanner)
+        window._switch_view("security")
+        window._run_security_scan()
+        assert window._sec_scanner is not None
+        window._sec_scanner.done.emit([
+            {"name": "evil", "version": "1", "repo": "aur",
+             "compromised": True, "reasons": ["listed"]},
+            {"name": "fine", "version": "1", "repo": "official",
+             "compromised": False, "reasons": []},
+        ])
+        qapp.processEvents()
+        # only findings get cards; clean packages stay quiet
+        assert set(window._sec_cards) == {"evil"}
+        assert "1 compromised of 2 checked" in \
+            window._sec_footer_label.text()
+        assert "✕" in window._sub.text()
+        assert window._sec_scan_btn.isEnabled()
+
+    def test_tray_opens_empty_window(self, qapp, monkeypatch):
+        from PyQt6.QtGui import QIcon
+        monkeypatch.setattr(app.TrayApp, "check_now", lambda self: None)
+        tray = app.TrayApp(qapp, QIcon())
+        tray._updates = []
+        tray._open_window()
+        qapp.processEvents()
+        assert tray._window is not None
+        assert tray._window._empty_label.isVisible()
+        tray._window.close()
+        qapp.processEvents()
+        tray._shutdown()
+
+    def _busy_thread(self):
+        import time as _t
+        from PyQt6.QtCore import QThread
+        stop = []
+
+        class Busy(QThread):
+            def run(self):
+                while not stop:
+                    _t.sleep(0.05)
+
+        b = Busy()
+        return b, stop
+
+    def test_release_parks_live_thread(self, window, qapp):
+        # Regression: dropping a running thread's wrapper aborts the
+        # process ("QThread: Destroyed while thread is still running").
+        # _release_thread must park it instead.
+        import time as _t
+        self._settle_track_loader(window, qapp)  # real loaders done first
+        b, stop = self._busy_thread()
+        b.start()
+        for _ in range(100):
+            if b.isRunning():
+                break
+            qapp.processEvents()
+            _t.sleep(0.02)
+        assert b.isRunning()
+        window._obs_checker = b
+        window._release_thread("_obs_checker")  # would abort pre-fix
+        assert window._obs_checker is None
+        assert b in window._orphans and b.isRunning()
+        stop.append(1)
+        assert b.wait(10000)
+        for _ in range(100):
+            qapp.processEvents()
+            if b not in window._orphans:
+                break
+        assert b not in window._orphans
+
+    def test_close_with_finishing_loader(self, window, qapp):
+        # A loader that exits shortly after close starts: close must
+        # wait it out cleanly (no abort, no park needed).
+        import time as _t
+        self._settle_track_loader(window, qapp)  # real loaders done first
+        b, stop = self._busy_thread()
+        b.start()
+        for _ in range(100):
+            if b.isRunning():
+                break
+            qapp.processEvents()
+            _t.sleep(0.02)
+        window._obs_checker = b
+        # Stop it from a real thread: the Qt loop is blocked inside
+        # close()'s wait(), so a QTimer could never fire in time.
+        import threading
+        threading.Timer(1.0, lambda: stop.append(1)).start()
+        window.close()  # blocks in wait until Busy exits
+        qapp.processEvents()
+        assert b not in window._orphans
+
+    def _settle_track_loader(self, window, qapp):
+        if window._obs_checker is not None:
+            window._obs_checker.wait(25000)
+        qapp.processEvents()  # flush obs done (chains the tracked loader)
+        loader = window._track_loader
+        if loader is not None:
+            loader.wait(25000)
+        qapp.processEvents()  # flush tracked done
+
+    def test_tracked_loads_and_badges(self, window, qapp):
+        self._settle_track_loader(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "b-aur", "version": "1-1", "repo": "aur"},
+             {"name": "a-off", "version": "2-1", "repo": "official"}],
+            [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+              "relation": "upgrade"}])
+        qapp.processEvents()
+        assert window._track_model.rowCount() == 2
+        # movable floats first
+        assert window._track_model.item(0)["name"] == "b-aur"
+        assert window._track_model.movable_names() == ["b-aur"]
+        assert window._view_buttons["tracked"].text() == "Tracked · 1 to move"
+        window._switch_view("tracked")
+        assert window._content_stack.currentIndex() == 3
+        assert window._footer_stack.currentIndex() == 3
+
+    def test_tracked_switch_runs_and_verifies(
+            self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
+        monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
+        self._settle_track_loader(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "b-aur", "version": "1-1", "repo": "aur"}],
+            [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+              "relation": "upgrade"}])
+        window._request_track_switch("b-aur")
+        assert isinstance(window._track_runner, FakeRunner)
+        assert window._track_model.item(0)["state"] == "switching"
+        window._track_runner.done.emit(True, "")
+        qapp.processEvents()
+        assert window._track_model.item(0)["state"] == "done"
+        assert window._track_runner is None
+        assert "official build" in window._sub.text()
+
+    def test_tracked_switch_failure_retries(
+            self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
+        self._settle_track_loader(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "b-aur", "version": "1-1", "repo": "aur"}],
+            [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+              "relation": "upgrade"}])
+        window._request_track_switch("b-aur")
+        window._track_runner.done.emit(False, "boom")
+        qapp.processEvents()
+        assert window._track_model.item(0)["state"] == "failed"
+
+    def test_tracked_downgrade_cancel(self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app.QMessageBox, "exec", lambda self: None)
+        monkeypatch.setattr(app.QMessageBox, "clickedButton", lambda self: None)
+        self._settle_track_loader(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "old", "version": "3-1", "repo": "aur"}],
+            [{"name": "old", "installed": "3-1", "official": "2-1",
+              "relation": "downgrade"}])
+        window._request_track_switch("old")  # confirm auto-dismissed
+        assert window._track_queue == []
+        assert window._track_runner is None
+
+    def test_tracked_lock_blocks(self, window, qapp, monkeypatch):
+        import os as _os
+        monkeypatch.setattr(_os.path, "exists", lambda p: True)
+        self._settle_track_loader(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "b", "version": "1-1", "repo": "aur"}],
+            [{"name": "b", "installed": "1-1", "official": "1.1-1",
+              "relation": "upgrade"}])
+        window._request_track_switch("b")
+        assert window._track_queue == []
+        assert "Another package operation" in window._sub.text()
+
+    def test_tracked_move_all_skips_downgrades(
+            self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
+        self._settle_track_loader(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "a", "version": "1-1", "repo": "aur"},
+             {"name": "d", "version": "3-1", "repo": "aur"}],
+            [{"name": "a", "installed": "1-1", "official": "1.1-1",
+              "relation": "upgrade"},
+             {"name": "d", "installed": "3-1", "official": "2-1",
+              "relation": "downgrade"}])
+        window._move_all_tracked()
+        # 'a' starts immediately; 'd' needs individual confirmation
+        assert window._track_queue == []
+        assert isinstance(window._track_runner, FakeRunner)
 
 
 class TestNotifyHelper:
@@ -505,7 +914,7 @@ class TestPerf:
             opt.font = v.font()
             heights.append(d.sizeHint(opt, idx).height())
         layout_s = time.perf_counter() - t0
-        assert all(h > 80 for h in heights)
+        assert all(h > 60 for h in heights)
         # Full-list first layout should be comfortably fast; per-row paint
         # afterwards is a single cached pass (dataChanged repaints 1 row).
         print(f"\n322 rows layout: {layout_s:.2f}s "

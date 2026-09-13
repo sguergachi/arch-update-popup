@@ -227,6 +227,99 @@ class TestVerifyUpgraded:
         assert title and advice
 
 
+class TestRepoMoves:
+    def test_parse_sync_versions(self):
+        out = ("Repository      : extra\nName            : foo\n"
+               "Version         : 1.2-3\nDescription     : x\n\n"
+               "Repository      : extra\nName            : bar\n"
+               "Version         : 4.5-6\n")
+        assert app.parse_sync_versions(out) == {"foo": "1.2-3", "bar": "4.5-6"}
+        assert app.parse_sync_versions("") == {}
+
+    def test_compare_versions(self, monkeypatch):
+        import subprocess as sp
+
+        def fake_run(cmd, **kwargs):
+            a, b = cmd[1], cmd[2]
+
+            class R:
+                stdout = "-1\n" if a < b else ("0\n" if a == b else "1\n")
+
+            return R()
+
+        monkeypatch.setattr(app.subprocess, "run", fake_run)
+        assert app.compare_versions("1.0", "2.0") == -1
+        assert app.compare_versions("2.0", "2.0") == 0
+        assert app.compare_versions("2.0", "1.0") == 1
+
+    def test_find_repo_moves(self, monkeypatch):
+        monkeypatch.setattr(app, "get_foreign_packages",
+                            lambda: {"newer": "1.0-1", "same": "2.0-1",
+                                     "older": "3.0-1", "auronly": "1.0-1"})
+        import subprocess as sp
+
+        class R:
+            stdout = ("Name            : newer\nVersion         : 1.1-1\n\n"
+                      "Name            : same\nVersion         : 2.0-1\n\n"
+                      "Name            : older\nVersion         : 2.9-1\n")
+
+        monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: R())
+        monkeypatch.setattr(app, "compare_versions",
+                            lambda a, b: -1 if a < b else (0 if a == b else 1))
+        moves = {m["name"]: m for m in app.find_repo_moves()}
+        assert set(moves) == {"newer", "same", "older"}
+        assert moves["newer"]["relation"] == "upgrade"
+        assert moves["same"]["relation"] == "same"
+        assert moves["older"]["relation"] == "downgrade"
+
+    def test_find_repo_moves_scoped(self, monkeypatch):
+        seen = {}
+
+        def fake_foreign():
+            return {"a": "1-1", "b": "1-1"}
+
+        monkeypatch.setattr(app, "get_foreign_packages", fake_foreign)
+
+        def fake_run(cmd, **kwargs):
+            seen["args"] = [c for c in cmd if not c.startswith("-")]
+            class R:
+                stdout = "Name            : a\nVersion         : 2-1\n"
+            return R()
+
+        monkeypatch.setattr(app.subprocess, "run", fake_run)
+        monkeypatch.setattr(app, "compare_versions", lambda a, b: -1)
+        moves = app.find_repo_moves(["a"])
+        assert [m["name"] for m in moves] == ["a"]
+        assert "pacman" in seen["args"][0]
+
+
+class TestScanStopHook:
+    def test_should_stop_aborts_early(self, monkeypatch):
+        calls = {"n": 0}
+
+        def fake_installed():
+            calls["n"] += 1
+            return [{"name": f"p{i}", "version": "1",
+                     "repo": "official"} for i in range(5)]
+
+        monkeypatch.setattr(app, "get_installed_packages", fake_installed)
+        monkeypatch.setattr(app, "_load_all_compromised_packages",
+                            lambda: {})
+        out = app.scan_installed_for_compromise(
+            should_stop=lambda: True)
+        assert out == []
+        assert calls["n"] == 1
+
+    def test_no_hook_scans_all(self, monkeypatch):
+        monkeypatch.setattr(
+            app, "get_installed_packages",
+            lambda: [{"name": "p0", "version": "1", "repo": "official"}])
+        monkeypatch.setattr(app, "_load_all_compromised_packages",
+                            lambda: {})
+        out = app.scan_installed_for_compromise()
+        assert out == []
+
+
 class TestRunnerCommands:
     def test_explicit_names_refresh_sync_dbs(self):
         r = app.UpdateRunner("paru", ["fzf", "konsole"])

@@ -29,6 +29,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -38,11 +39,11 @@ from PyQt6.QtCore import Qt, QAbstractListModel, QByteArray, QEvent, QModelIndex
 from PyQt6.QtGui import QBrush, QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap, QTextDocument
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QAbstractScrollArea, QDialog, QFrame,
-    QHBoxLayout, QLabel, QLineEdit, QListView, QMainWindow, QMenu, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QStyle,
-    QStyledItemDelegate, QStyleOptionButton,
-    QSystemTrayIcon, QTextBrowser, QTextEdit, QVBoxLayout,
+    QAbstractItemView, QApplication, QAbstractScrollArea, QButtonGroup,
+    QDialog, QFrame, QHBoxLayout, QLabel, QListView, QMainWindow,
+    QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSizePolicy, QStackedWidget, QStyle, QStyledItemDelegate,
+    QStyleOptionButton, QSystemTrayIcon, QTextBrowser, QTextEdit, QVBoxLayout,
     QWidget,
 )
 
@@ -584,7 +585,7 @@ def get_pending_updates(aur_helper: str | None) -> list[dict]:
     updates: list[dict] = []
 
     # Official repo updates
-    r = subprocess.run(["checkupdates"], capture_output=True, text=True)
+    r = _run(["checkupdates"], capture_output=True, text=True)
     if r.returncode == 0:
         for line in r.stdout.strip().splitlines():
             parts = line.split()
@@ -593,7 +594,7 @@ def get_pending_updates(aur_helper: str | None) -> list[dict]:
 
     # AUR updates
     if aur_helper:
-        r = subprocess.run([aur_helper, "-Qua"], capture_output=True, text=True)
+        r = _run([aur_helper, "-Qua"], capture_output=True, text=True)
         if r.returncode == 0:
             for line in r.stdout.strip().splitlines():
                 parts = line.split()
@@ -616,12 +617,12 @@ def fetch_pacman_info(pkg: str) -> dict:
     """Fetch package info; falls back to local DB for AUR packages."""
     info: dict = {"desc": "", "repo": "", "url": ""}
 
-    r = subprocess.run(["pacman", "-Si", pkg], capture_output=True, text=True)
+    r = _run(["pacman", "-Si", pkg], capture_output=True, text=True)
     src = r.stdout if r.returncode == 0 else ""
 
     if not src:
         # AUR / manually-installed package — use local database
-        r = subprocess.run(["pacman", "-Qi", pkg], capture_output=True, text=True)
+        r = _run(["pacman", "-Qi", pkg], capture_output=True, text=True)
         src = r.stdout
         info["repo"] = "aur"
 
@@ -646,6 +647,21 @@ def fetch_aur_pkgbuild(pkg: str) -> str | None:
     return None
 
 
+# ── Serialized subprocess spawns ─────────────────────────────────────────
+#
+# fork() from multiple threads while Qt/Python hold locks segfaults, so
+# every short-lived child (pacman queries, vercmp, notify) goes through
+# one process-wide lock. Long-lived installs use Popen (async, unlocked).
+
+_SPAWN_LOCK = threading.Lock()
+
+
+def _run(*args, **kwargs):
+    """subprocess.run serialized against concurrent forks."""
+    with _SPAWN_LOCK:
+        return subprocess.run(*args, **kwargs)
+
+
 # ── Desktop notifications ────────────────────────────────────────────────
 #
 # Failure notifications share ONE slot that updates in place (via the
@@ -658,7 +674,7 @@ def _notify_update(title: str, body: str, icon: str = "dialog-error",
     """Create-or-update a notification; return its id (0 on fallback)."""
     if shutil.which("gdbus"):
         try:
-            r = subprocess.run(
+            r = _run(
                 ["gdbus", "call", "--session",
                  "--dest", "org.freedesktop.Notifications",
                  "--object-path", "/org/freedesktop/Notifications",
@@ -675,7 +691,7 @@ def _notify_update(title: str, body: str, icon: str = "dialog-error",
         except Exception:
             pass
     try:
-        subprocess.run(["notify-send", title, body, "-i", icon, "-t",
+        _run(["notify-send", title, body, "-i", icon, "-t",
                         f"{timeout_ms:d}" if timeout_ms else "0"],
                        timeout=5)
     except Exception:
@@ -687,7 +703,7 @@ def _notify_close(nid: int) -> None:
     """Dismiss a notification created by _notify_update (no-op on fallback)."""
     if nid and shutil.which("gdbus"):
         try:
-            subprocess.run(
+            _run(
                 ["gdbus", "call", "--session",
                  "--dest", "org.freedesktop.Notifications",
                  "--object-path", "/org/freedesktop/Notifications",
@@ -894,14 +910,14 @@ def check_aur_supply_chain_attack(pkg_name: str) -> tuple[bool, list[str], dict 
 def get_installed_packages() -> list[dict]:
     """Get list of all explicitly installed packages with their repos."""
     pkgs: list[dict] = []
-    r = subprocess.run(["pacman", "-Qe"], capture_output=True, text=True)
+    r = _run(["pacman", "-Qe"], capture_output=True, text=True)
     if r.returncode == 0:
         for line in r.stdout.strip().splitlines():
             parts = line.split()
             if len(parts) >= 2:
                 pkgs.append({"name": parts[0], "version": parts[1]})
 
-    r2 = subprocess.run(["pacman", "-Qm"], capture_output=True, text=True)
+    r2 = _run(["pacman", "-Qm"], capture_output=True, text=True)
     foreign = set()
     if r2.returncode == 0:
         for line in r2.stdout.strip().splitlines():
@@ -925,12 +941,12 @@ def get_obsolete_packages() -> list[str]:
     These packages can block a full system upgrade (their exact-version pins
     are no longer satisfiable), so they are generally safe to remove.
     """
-    r = subprocess.run(["pacman", "-Qq"], capture_output=True, text=True)
+    r = _run(["pacman", "-Qq"], capture_output=True, text=True)
     if r.returncode != 0:
         return []
     installed = set(r.stdout.split())
 
-    r = subprocess.run(["pacman", "-Slq"], capture_output=True, text=True)
+    r = _run(["pacman", "-Slq"], capture_output=True, text=True)
     if r.returncode != 0:
         return []
     in_repos = set(r.stdout.split())
@@ -938,7 +954,7 @@ def get_obsolete_packages() -> list[str]:
     env_c = {**os.environ, "LC_ALL": "C"}  # keep pacman -Qi output parseable
     obsolete: list[str] = []
     for pkg in sorted(installed - in_repos):
-        r = subprocess.run(
+        r = _run(
             ["pacman", "-Qi", pkg], capture_output=True, text=True, env=env_c
         )
         if "Installed as a dependency" in r.stdout:
@@ -954,7 +970,7 @@ def find_blocked_obsolete_packages(packages: list[str]) -> list[str]:
     """
     blocked: list[str] = []
     for pkg in packages:
-        r = subprocess.run(
+        r = _run(
             ["pacman", "-R", "--print", pkg], capture_output=True, text=True
         )
         if r.returncode != 0:
@@ -979,6 +995,89 @@ def obsolete_conflict_culprits(output: str, obsolete: list[str]) -> list[str]:
     if re.search(r"could not satisfy dependencies|breaks dependency", output):
         return list(obsolete)
     return []
+
+
+# ── AUR → official move detection ────────────────────────────────────────
+#
+# Packages graduate from the AUR into the official repos. A foreign
+# (`pacman -Qm`) package that also exists in the sync DBs can be switched
+# to the official build with a plain `pacman -S`, gaining signed updates.
+
+_PACMAN_LOCK = "/var/lib/pacman/db.lck"
+
+
+def get_foreign_packages() -> dict[str, str]:
+    """Return {name: installed_version} for foreign (incl. AUR) packages."""
+    try:
+        r = _run(["pacman", "-Qm"], capture_output=True,
+                           text=True, timeout=30)
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for line in (r.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            out[parts[0]] = parts[1]
+    return out
+
+
+def parse_sync_versions(output: str) -> dict[str, str]:
+    """Parse `pacman -Si` batch output into {name: version}."""
+    found: dict[str, str] = {}
+    name = ""
+    for line in (output or "").splitlines():
+        if line.startswith("Name"):
+            name = line.split(":", 1)[1].strip()
+        elif line.startswith("Version") and name:
+            found[name] = line.split(":", 1)[1].strip()
+            name = ""
+    return found
+
+
+def compare_versions(a: str, b: str) -> int:
+    """-1 if a<b, 0 if equal, 1 if a>b (pacman vercmp semantics)."""
+    try:
+        r = _run(["vercmp", a, b], capture_output=True,
+                           text=True, timeout=10)
+        return max(-1, min(1, int((r.stdout or "0").strip())))
+    except Exception:
+        return 0
+
+
+def find_repo_moves(names: list[str] | None = None) -> list[dict]:
+    """Find foreign packages also provided by the official repos.
+
+    Returns [{name, installed, official, relation}] where relation is
+    'upgrade' (official newer), 'same', or 'downgrade' (needs confirm).
+    Pass `names` to check only those packages (faster for banners).
+    """
+    foreign = get_foreign_packages()
+    if not foreign:
+        return []
+    if names is not None:
+        wanted = set(names)
+        foreign = {k: v for k, v in foreign.items() if k in wanted}
+        if not foreign:
+            return []
+    try:
+        # NB: exit code is nonzero when ANY name is unknown — the found
+        # ones still print to stdout, so parse regardless of returncode.
+        r = _run(["pacman", "-Si", *foreign],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:
+        return []
+    sync = parse_sync_versions(r.stdout or "")
+    moves: list[dict] = []
+    for name, inst in foreign.items():
+        if name not in sync:
+            continue
+        cmp = compare_versions(inst, sync[name])
+        moves.append({
+            "name": name, "installed": inst, "official": sync[name],
+            "relation": "upgrade" if cmp < 0 else (
+                "same" if cmp == 0 else "downgrade"),
+        })
+    return moves
 
 
 # High-contrast colors readable on both light and dark themes.
@@ -1089,7 +1188,7 @@ def verify_upgraded(expected: dict[str, str]) -> list[tuple[str, str, str]]:
     if not pending:
         return []
     try:
-        r = subprocess.run(["pacman", "-Q", *pending],
+        r = _run(["pacman", "-Q", *pending],
                            capture_output=True, text=True, timeout=30)
     except Exception:
         return []
@@ -1127,6 +1226,7 @@ def is_log_noise(line: str) -> bool:
 
 def scan_installed_for_compromise(
     on_progress: None | (callable[[int, int, str], None]) = None,
+    should_stop: None | (callable[[], bool]) = None,
 ) -> list[dict]:
     """Scan all explicitly installed packages for supply-chain compromise.
 
@@ -1137,6 +1237,8 @@ def scan_installed_for_compromise(
     comp_pkgs = _load_all_compromised_packages()
 
     for i, pkg in enumerate(installed):
+        if should_stop is not None and should_stop():
+            return results
         if pkg["name"] in comp_pkgs:
             meta = comp_pkgs[pkg["name"]]
             install_dates = _get_package_install_dates(pkg["name"])
@@ -1166,7 +1268,6 @@ class UpdateChecker(QThread):
     """Checks for pending updates off the main thread."""
     updates_found = pyqtSignal(list)
     no_updates    = pyqtSignal()
-
     def __init__(self, aur_helper: str | None) -> None:
         super().__init__()
         self._aur_helper = aur_helper
@@ -1177,6 +1278,34 @@ class UpdateChecker(QThread):
             self.updates_found.emit(updates)
         else:
             self.no_updates.emit()
+
+
+class ObsoleteChecker(QThread):
+    """Computes the obsolete-package list off the GUI thread."""
+    done = pyqtSignal(list)  # list[str]
+
+    def run(self) -> None:
+        try:
+            names = get_obsolete_packages()
+        except Exception:
+            names = []
+        self.done.emit(names)
+
+
+class TrackedLoader(QThread):
+    """Loads explicitly installed packages + official-repo moves."""
+    done = pyqtSignal(list, list)  # (installed, moves)
+
+    def run(self) -> None:
+        try:
+            installed = get_installed_packages()
+        except Exception:
+            installed = []
+        try:
+            moves = find_repo_moves()
+        except Exception:
+            moves = []
+        self.done.emit(installed, moves)
 
 
 class InfoFetcher(QThread):
@@ -1225,9 +1354,14 @@ class SystemScanner(QThread):
     progress   = pyqtSignal(int, int, str)  # current, total, pkg_name
     done       = pyqtSignal(list)            # list[dict] — scan results
 
+    def __init__(self, should_stop=None) -> None:
+        super().__init__()
+        self._should_stop = should_stop
+
     def run(self) -> None:
         results = scan_installed_for_compromise(
-            on_progress=lambda cur, tot, name: self.progress.emit(cur, tot, name)
+            on_progress=lambda cur, tot, name: self.progress.emit(cur, tot, name),
+            should_stop=self._should_stop or self.isInterruptionRequested,
         )
         self.done.emit(results)
 
@@ -1491,18 +1625,15 @@ QWidget#stat-card {
 QLabel#stat-value { font-size: 15px; font-weight: 700; }
 QLabel#stat-caption { font-size: 11px; font-weight: 700; color: #757575; }
 
-/* — Search — */
-QLineEdit#search {
-    padding: 6px 14px; border: 1px solid palette(mid); border-radius: 18px;
-    background: palette(window); color: palette(text);
-    min-width: 260px; font-size: 13px;
-}
-QLineEdit#search:focus { border-color: #3584e4; }
-
 /* — Banners — */
 QWidget#banner-danger {
     background: palette(window);
     border: 1px solid #e5484d; border-left: 4px solid #e01b24;
+    border-radius: 10px;
+}
+QWidget#banner-moves {
+    background: palette(window);
+    border: 1px solid #3584e4; border-left: 4px solid #3584e4;
     border-radius: 10px;
 }
 QLabel#banner-title { font-size: 13px; font-weight: 700; color: #e01b24; }
@@ -1562,6 +1693,24 @@ QWidget#package-card-blocked {
     border: 1px solid #e5484d; border-left: 4px solid #e01b24;
     border-radius: 10px;
 }
+QWidget#package-card-done {
+    background: palette(window);
+    border: 1px solid #1f7a3a; border-left: 4px solid #26a269;
+    border-radius: 10px;
+}
+QWidget#package-card-failed {
+    background: palette(window);
+    border: 1px solid #e5484d; border-left: 4px solid #e01b24;
+    border-radius: 10px;
+}
+QLabel#package-name { font-size: 14px; font-weight: 700; color: palette(text); }
+QLabel#repo-badge {
+    font-size: 11px; font-weight: 700; border-radius: 8px;
+    padding: 2px 8px;
+}
+QLabel#package-versions { font-size: 12px; color: palette(text); }
+QLabel#package-date { font-size: 12px; color: #757575; }
+QWidget#list-inner { background: transparent; }
 /* — Package links (popover + scan cards) — */
 QLabel#package-link { font-size: 12px; }
 QLabel#package-link a { color: #3584e4; text-decoration: none; }
@@ -1573,25 +1722,6 @@ QProgressBar {
     min-height: 3px; max-height: 3px; color: transparent;
 }
 QProgressBar::chunk { background: #2e9b57; border-radius: 2px; }
-
-/* — Status messages: plain when idle, boxed for states that matter.
-     A read-only text box (not a QLabel) so wrapped text always gets its
-     full height — QLabel word-wrap miscalculates when text changes
-     after the window is shown. — */
-QTextEdit#status {
-    background: transparent; border: none;
-    font-size: 13px; color: palette(text);
-}
-QTextEdit#status-error {
-    background-color: #a4262c; color: #ffffff;
-    font-size: 13px; font-weight: 600;
-    border: none; border-radius: 8px; padding: 6px;
-}
-QTextEdit#status-ok {
-    background-color: #1f7a3a; color: #ffffff;
-    font-size: 13px;
-    border: none; border-radius: 8px; padding: 6px;
-}
 
 /* — Error log — */
 QLabel#details-label { font-size: 12px; font-weight: 700; color: palette(text); }
@@ -1608,6 +1738,13 @@ QTextBrowser#details {
 
 /* — Footer meta — */
 QLabel#meta { font-size: 12px; color: #757575; }
+
+/* — Clickable latest-log preview above the progress bar — */
+QLabel#log-preview {
+    font-size: 12px; color: palette(text);
+    padding: 2px 4px;
+}
+QLabel#log-preview:hover { color: #3584e4; }
 
 /* — Buttons: 40px primary/secondary, 30px small — */
 QPushButton#primary {
@@ -1628,6 +1765,24 @@ QPushButton#secondary-small {
     border-radius: 6px; font-size: 12px; padding: 0 12px;
 }
 QPushButton#secondary-small:hover { background: palette(midlight); }
+
+/* — View switcher tabs (checkable, exclusive) — */
+QPushButton#view-tab {
+    background: transparent; color: palette(text);
+    border: 1px solid palette(mid); border-radius: 8px;
+    font-size: 13px; font-weight: 600; padding: 0 18px;
+}
+QPushButton#view-tab:hover { background: palette(midlight); }
+QPushButton#view-tab:checked {
+    background: rgba(53,132,228,0.16); color: #3584e4;
+    border: 1px solid #3584e4;
+}
+
+/* — Empty state (no updates) — */
+QLabel#empty-state {
+    font-size: 15px; font-weight: 600; color: #757575;
+    padding: 48px 16px;
+}
 """
 
 
@@ -1705,10 +1860,27 @@ class _ScanRow(QWidget):
         outer.addWidget(verdict)
 
 
-_SEARCH_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
-  width="16" height="16" fill="none" stroke="#757575" stroke-width="2"
-  stroke-linecap="round"><circle cx="11" cy="11" r="7"/>
-  <line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>"""
+class _ObsoleteRow(QWidget):
+    """One obsolete package: name + why it can go."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.row_name = name
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setObjectName("package-card")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 10, 14, 12)
+        outer.setSpacing(4)
+        title = QLabel(name)
+        title.setObjectName("package-name")
+        outer.addWidget(title)
+        note = QLabel(
+            "No longer provided by any repository — usually a split "
+            "package dropped upstream. Safe to remove.")
+        note.setObjectName("package-date")
+        note.setWordWrap(True)
+        outer.addWidget(note)
+
 
 # ── Bundled status/action icon set ─────────────────────────────────────
 # Minimal geometric SVGs drawn for this app (no external dependency, no
@@ -1800,6 +1972,21 @@ class _StatCard(QWidget):
 
     def set_accent(self, color: str) -> None:
         self._value.setStyleSheet(f"color: {color};")
+
+
+class _ClickableLabel(QLabel):
+    """QLabel with a clicked signal (for the log preview line)."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
 
 
 # ── Virtualized package list ─────────────────────────────────────────────
@@ -2049,22 +2236,33 @@ class PackageDelegate(QStyledItemDelegate):
         has_more = bool(full) and full != notes
         shown = (notes[:_SNIPPET_LEN].rstrip() + "…"
                  if len(notes) > _SNIPPET_LEN else notes)
-        # Kicker merged inline (no separate row): "What's new: <snippet>".
-        notes_html = ("<span style='color:#757575'><b>What's new: </b></span>"
-                      + html.escape(shown).replace("\n", "<br>"))
-        notes_doc = self._doc(row, "notes", notes_html, cw,
-                              self._f_text, True, rev)
-
+        # One shared baseline row: "What's new: <snippet>" left,
+        # "Show more ↓" right after the text, "View package ↗" right.
+        # The snippet is elided to a single line so everything shares
+        # one row instead of stacking three.
         more_txt = "Show more  ↓" if has_more else ""
         link_txt = "View package  ↗"
         more_w = fm.horizontalAdvance(more_txt) if more_txt else 0
         link_w = fm.horizontalAdvance(link_txt)
+        prefix = "What's new: "
+        prefix_w = fm.horizontalAdvance(prefix)
+        single = " ".join(shown.split())
+        snippet_avail = max(
+            40, cw - prefix_w - link_w - 12
+            - ((more_w + 16 + 8) if more_txt else 0) - 8)
+        elided = fm.elidedText(single, Qt.TextElideMode.ElideRight,
+                               snippet_avail)
+        notes_html = ("<span style='color:#757575'><b>What's new: </b></span>"
+                      + html.escape(elided))
+        notes_doc = self._doc(row, "notes", notes_html, cw,
+                              self._f_text, True, rev)
 
         h_name = 20
         h_ver = int(ver_doc.size().height())
         h_desc = int(desc_doc.size().height())
-        h_notes = int(notes_doc.size().height())
-        h_actions = 18
+        h_notes = max(int(notes_doc.size().height()), 18)
+        text_w = prefix_w + fm.horizontalAdvance(elided)
+        notes_top = y + h_name + 1 + h_ver + 2 + h_desc + 3
         lay = {
             "check": QRect(x0 - self.RAIL + 5, y + 1, 18, 18),
             # +14 slack: rendered text can exceed horizontalAdvance by a
@@ -2076,16 +2274,13 @@ class PackageDelegate(QStyledItemDelegate):
             if (item["state"] != "idle" or item["compromised"]) else QRect(),
             "ver": QRect(x0, y + h_name + 1, cw, h_ver),
             "desc": QRect(x0, y + h_name + 1 + h_ver + 2, cw, h_desc),
-            "notes": QRect(x0, y + h_name + 1 + h_ver + 2 + h_desc + 3,
-                           cw, h_notes),
-            "more": QRect(x0, 0, more_w + 16, h_actions),
-            "link": QRect(right - link_w - 16, 0, link_w + 16, h_actions),
+            "notes": QRect(x0, notes_top, cw, h_notes),
+            "more": (QRect(x0 + int(text_w) + 6, notes_top, more_w + 16, h_notes)
+                     if more_txt else QRect()),
+            "link": QRect(right - link_w - 16, notes_top, link_w + 16, h_notes),
             "card": QRect(self.CDX, self.CDY, width - 2 * self.CDX, 0),
         }
-        ycur = (y + h_name + 1 + h_ver + 2 + h_desc + 3 + h_notes + 3)
-        lay["more"].moveTop(ycur)
-        lay["link"].moveTop(ycur)
-        ycur += h_actions + 3
+        ycur = notes_top + h_notes + 3
 
         if item["state"] in ("installing", "done", "failed"):
             lay["progress"] = QRect(x0, ycur, cw, 4)
@@ -2347,6 +2542,243 @@ class PackageDelegate(QStyledItemDelegate):
                 model.dataChanged.emit(idx, idx, [])
 
 
+# ── Tracked packages list (virtualized) ──────────────────────────────────
+#
+# All explicitly installed packages with their source repo. AUR rows that
+# also exist in the official repos get an inline Switch pill (same
+# one-at-a-time semantics as MovesDialog — pacman has a single lock).
+
+class TrackedModel(QAbstractListModel):
+    """One dict per explicitly installed package."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._items: list[dict] = []
+
+    def set_packages(self, installed: list[dict],
+                     moves: list[dict]) -> None:
+        by_name = {m["name"]: m for m in moves}
+        items = []
+        for pkg in installed:
+            m = by_name.get(pkg["name"])
+            items.append({
+                "name": pkg["name"], "version": pkg.get("version", ""),
+                "repo": pkg.get("repo", ""),
+                "official": m["official"] if m else "",
+                "relation": m["relation"] if m else "",
+                "state": "idle",
+            })
+        # Movable packages float to the top, then alphabetical.
+        items.sort(key=lambda it: (not it["official"], it["name"].lower()))
+        self.beginResetModel()
+        self._items = items
+        self.endResetModel()
+
+    def rowCount(self, parent: QModelIndex | None = None) -> int:
+        return 0 if parent is not None and parent.isValid() else len(self._items)
+
+    def item(self, row: int) -> dict:
+        return self._items[row]
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        if role == Qt.ItemDataRole.DisplayRole:
+            return self._items[index.row()]["name"]
+        return None
+
+    def row_of(self, name: str) -> int | None:
+        for r, it in enumerate(self._items):
+            if it["name"] == name:
+                return r
+        return None
+
+    def set_state(self, name: str, state: str) -> None:
+        r = self.row_of(name)
+        if r is not None:
+            self._items[r]["state"] = state
+            idx = self.index(r)
+            self.dataChanged.emit(idx, idx, [])
+
+    def movable_names(self) -> list[str]:
+        return [it["name"] for it in self._items if it["official"]]
+
+
+class TrackedDelegate(QStyledItemDelegate):
+    """Two-line rows: name + repo pill + version; Switch pill if movable."""
+
+    switch_requested = pyqtSignal(str)
+
+    CDX = 8
+    PAD = 12
+
+    def __init__(self, view: QListView) -> None:
+        super().__init__(view)
+        self._view = view
+        self._hover: tuple[int, str] = (-1, "")
+        self._f_name = QFont()
+        self._f_name.setBold(True)
+        self._f_text = QFont()
+        self._f_text.setPointSize(self._f_text.pointSize() - 1)
+        self._f_badge = QFont()
+        self._f_badge.setBold(True)
+        self._f_badge.setPointSize(self._f_badge.pointSize() - 2)
+
+    def _geom(self, row: int, item: dict, width: int) -> dict:
+        fm = QFontMetrics(self._f_text)
+        fm_name = QFontMetrics(self._f_name)
+        x0 = self.CDX + self.PAD
+        right = width - self.CDX - self.PAD
+        name_w = min(fm_name.horizontalAdvance(item["name"]) + 14,
+                     max(60, right - x0 - 220))
+        badge_txt = (item["repo"] or "").upper()
+        badge_w = (QFontMetrics(self._f_badge).horizontalAdvance(badge_txt) + 16
+                   if badge_txt else 0)
+        ver_w = fm.horizontalAdvance(item["version"])
+        h = 52
+        lay = {
+            "name": QRect(x0, 8, name_w, 20),
+            "badge": QRect(x0 + name_w + 8, 10, badge_w, 16),
+            "ver": QRect(right - ver_w - 6, 10, ver_w + 6, 16),
+            "sub": QRect(x0, 30, max(10, right - x0), 16),
+            "action": QRect(),
+            "action_txt": "",
+            "height": h,
+            "badge_txt": badge_txt,
+        }
+        if item["official"]:
+            txt = {"switching": "Switching…", "done": "Switched ✓",
+                   "failed": "Retry"}.get(item["state"], "Switch")
+            aw = fm.horizontalAdvance(txt) + 24
+            lay["action"] = QRect(right - aw, 28, aw, 22)
+            lay["action_txt"] = txt
+            lay["sub"].setWidth(max(10, right - aw - 8 - x0))
+        return lay
+
+    def sizeHint(self, option, index) -> QSize:
+        return QSize(option.rect.width() or 400, 52)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        try:
+            self._paint_inner(painter, option, index)
+        except Exception:
+            traceback.print_exc()
+
+    def _paint_inner(self, painter: QPainter, option, index) -> None:
+        item = index.model().item(index.row())
+        lay = self._geom(index.row(), item, option.rect.width())
+        p = painter
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pal = option.palette
+        card = QRect(self.CDX, 3, option.rect.width() - 2 * self.CDX, 46)
+        card.translate(option.rect.topLeft())
+
+        def move(r: QRect) -> QRect:
+            return QRect(r).translated(option.rect.topLeft())
+
+        p.setPen(QPen(pal.color(pal.ColorRole.Midlight), 1))
+        p.setBrush(QBrush(pal.color(pal.ColorRole.Window)))
+        p.drawRoundedRect(card, 10, 10)
+        accent = {"switching": "#3584e4", "done": "#26a269",
+                  "failed": "#e01b24"}.get(item["state"])
+        if accent:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(accent)))
+            p.drawRoundedRect(
+                QRect(card.left(), card.top() + 8, 4, card.height() - 16), 2, 2)
+
+        p.setPen(QPen(pal.color(pal.ColorRole.Text)))
+        p.setFont(self._f_name)
+        p.drawText(move(lay["name"]),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   fm_elided(self._f_name, item["name"], lay["name"].width()))
+        if lay["badge_txt"]:
+            rgb, fg = _repo_tint(item["repo"])
+            br = move(lay["badge"])
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(*rgb, 41)))
+            p.drawRoundedRect(br, 8, 8)
+            p.setPen(QPen(QColor(fg)))
+            p.setFont(self._f_badge)
+            p.drawText(br, Qt.AlignmentFlag.AlignCenter, lay["badge_txt"])
+        p.setFont(self._f_text)
+        p.setPen(QPen(QColor("#757575")))
+        p.drawText(move(lay["ver"]),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   item["version"])
+        # Sub line: official-version note, or repo origin.
+        p.setFont(self._f_text)
+        if item["official"]:
+            p.setPen(QPen(QColor("#1e8e3e")))
+            sub = f"Official {item['official']} available — switch for signed builds"
+        else:
+            p.setPen(QPen(QColor("#757575")))
+            sub = "Tracking " + ("official repos" if item["repo"] != "aur"
+                                 else "AUR")
+        p.drawText(move(lay["sub"]),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   fm_elided(self._f_text, sub, lay["sub"].width()))
+
+        if not lay["action"].isNull():
+            ar = move(lay["action"])
+            hover = self._hover == (index.row(), "action")
+            danger = item["state"] == "failed"
+            col = "#e01b24" if danger else "#3584e4"
+            if hover or item["state"] in ("switching", "done"):
+                p.setBrush(QBrush(QColor(col)))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawRoundedRect(ar, 8, 8)
+                p.setPen(QPen(QColor("#ffffff")))
+            else:
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(QColor(col), 1.5))
+                p.drawRoundedRect(ar, 8, 8)
+                p.setPen(QPen(QColor(col)))
+            p.drawText(ar, Qt.AlignmentFlag.AlignCenter, lay["action_txt"])
+        p.restore()
+
+    def editorEvent(self, event, model, option, index) -> bool:
+        try:
+            return self._editor_event_inner(event, model, option, index)
+        except Exception:
+            traceback.print_exc()
+            return False
+
+    def _editor_event_inner(self, event, model, option, index) -> bool:
+        if event.type() == QEvent.Type.MouseMove:
+            lay = self._geom(index.row(), model.item(index.row()),
+                             option.rect.width())
+            pos = event.position().toPoint() - option.rect.topLeft()
+            kind = ("action" if not lay["action"].isNull()
+                    and lay["action"].contains(pos) else "")
+            if (index.row(), kind) != self._hover:
+                old_row = self._hover[0]
+                self._hover = (index.row(), kind)
+                vp = self._view.viewport()
+                if old_row >= 0:
+                    vp.update(self._view.visualRect(model.index(old_row)))
+                vp.update(option.rect)
+                vp.setCursor(Qt.CursorShape.PointingHandCursor if kind
+                             else Qt.CursorShape.ArrowCursor)
+            return False
+        if (event.type() == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton):
+            lay = self._geom(index.row(), model.item(index.row()),
+                             option.rect.width())
+            pos = event.position().toPoint() - option.rect.topLeft()
+            if not lay["action"].isNull() and lay["action"].contains(pos):
+                self.switch_requested.emit(model.item(index.row())["name"])
+                return True
+        return False
+
+
+def fm_elided(font: QFont, text: str, width: int) -> str:
+    """Elide `text` to fit `width` pixels (single line)."""
+    return QFontMetrics(font).elidedText(text, Qt.TextElideMode.ElideRight,
+                                         max(20, width))
+
+
 class NotesPopover(QDialog):
     """'Show more' popover: full release notes + source + actions."""
 
@@ -2435,6 +2867,7 @@ class UpdateWindow(QMainWindow):
         self._single_name: str | None = None
         self._single_overwrite: str | None = None
         self._remover:   ObsoleteRemover | None = None
+        self._obsolete_ctx = "updates"  # or "obsolete" (view-owned removal)
         self._safe_names: list[str] = []
         self._last_run_names: list[str] = []
         self._done_names: set[str] = set()  # own honest completion tracking
@@ -2446,6 +2879,8 @@ class UpdateWindow(QMainWindow):
         self._last_error: str = ""
         self._installing_row: int | None = None
         self._popover: NotesPopover | None = None
+        self._orphans: set = set()  # parked threads (see _park_thread)
+        self._moves_dialog: MovesDialog | None = None
         self._fail_notif_id = 0  # single updating failure notification
         # Repeat-failure guard: same signature failing over and over means
         # the auto-fix isn't working — stop nagging, show the manual fix.
@@ -2480,30 +2915,46 @@ class UpdateWindow(QMainWindow):
 
         title_block = QVBoxLayout()
         title_block.setSpacing(2)
-        eyebrow = QLabel("SYSTEM UPDATES")
-        eyebrow.setObjectName("eyebrow")
-        title_block.addWidget(eyebrow)
         self._title = QLabel("Arch Update")
         self._title.setObjectName("title")
         title_block.addWidget(self._title)
         self._sub = QLabel()
         self._sub.setObjectName("subtitle")
+        self._sub.setWordWrap(True)
+        # Expanding: a word-wrapped label otherwise keeps its minimum
+        # width and stacks long messages into a narrow column.
+        self._sub.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._sub.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         title_block.addWidget(self._sub)
+        # THE unified status line: every user-facing message in this
+        # window renders here (see _set_status). _idle_summary holds the
+        # resting text that empty messages restore.
+        self._idle_summary = ""
         head.addLayout(title_block)
         head.addStretch()
 
-        self._search = QLineEdit()
-        self._search.setObjectName("search")
-        self._search.setPlaceholderText("Filter packages…")
-        self._search.setClearButtonEnabled(True)
-        self._search.addAction(
-            _svg_icon(_SEARCH_SVG), QLineEdit.ActionPosition.LeadingPosition
-        )
-        self._search.setFixedHeight(36)
-        self._search.textChanged.connect(self._apply_filter)
-        head.addWidget(self._search, 0, Qt.AlignmentFlag.AlignVCenter)
-        # Log toggle lives here, next to search: it governs the side
-        # panel, which spans the full content height below.
+        # View switcher lives here, right of the title: Updates |
+        # Obsolete | Security. (It replaces the old filter field — the
+        # stat strips and badges already carry the counts.)
+        self._view_buttons: dict[str, QPushButton] = {}
+        self._view_group = QButtonGroup(self)
+        self._view_group.setExclusive(True)
+        for _key, _label in (("updates", "Updates"), ("obsolete", "Obsolete"),
+                             ("security", "Security"), ("tracked", "Tracked")):
+            _btn = QPushButton(_label)
+            _btn.setObjectName("view-tab")
+            _btn.setCheckable(True)
+            _btn.setFixedHeight(36)
+            _btn.clicked.connect(
+                lambda _c=False, k=_key: self._switch_view(k))
+            self._view_group.addButton(_btn)
+            self._view_buttons[_key] = _btn
+            head.addWidget(_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        # Log toggle stays at the far right: it governs the side panel,
+        # which spans the full content height below.
         self._log_btn = QPushButton("Log")
         self._log_btn.setObjectName("secondary-small")
         self._log_btn.setFixedHeight(30)
@@ -2527,6 +2978,15 @@ class UpdateWindow(QMainWindow):
         content.addLayout(left, 1)
         self._left_col = left
 
+        self._content_stack = QStackedWidget()
+        left.addWidget(self._content_stack, 1)
+        self._up_page = QWidget()
+        up = QVBoxLayout(self._up_page)
+        up.setContentsMargins(0, 0, 0, 0)
+        up.setSpacing(12)
+        self._content_stack.addWidget(self._up_page)
+        self._view_buttons["updates"].setChecked(True)
+
         # ── Stats ───────────────────────────────────────────────────────────
         stats = QHBoxLayout()
         stats.setSpacing(12)
@@ -2543,7 +3003,7 @@ class UpdateWindow(QMainWindow):
         if n_comp:
             self._stat_blocked = _StatCard(str(n_comp), "blocked · skipped", "#e01b24")
             stats.addWidget(self._stat_blocked, 1)
-        left.addLayout(stats)
+        up.addLayout(stats)
 
         # ── Failure banner slot ─────────────────────────────────────────────
         # NOTE: intentionally no top banner widget. A dynamically shown
@@ -2585,22 +3045,41 @@ class UpdateWindow(QMainWindow):
                 Qt.TextInteractionFlag.TextSelectableByMouse
             )
             blay.addWidget(bbody)
-            left.addWidget(banner)
+            up.addWidget(banner)
+
+        # ── AUR → official moves prompt ─────────────────────────────────────
+        # If any listed AUR package also lives in the official repos, offer
+        # a one-click switch. Detection is two fast local pacman calls.
+        try:
+            _aur_names = {p["name"] for p in updates
+                          if (p.get("repo") or "").lower() == "aur"}
+            self._pending_moves = [m for m in find_repo_moves(list(_aur_names))
+                                   if m["name"] in _aur_names]
+        except Exception:
+            self._pending_moves = []
+        if self._pending_moves:
+            mv = QWidget()
+            mv.setObjectName("banner-moves")
+            mv.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            mb = QHBoxLayout(mv)
+            mb.setContentsMargins(16, 10, 16, 10)
+            mb.setSpacing(8)
+            mt = QLabel(
+                f"<b>{len(self._pending_moves)} of these AUR packages "
+                f"{'is' if len(self._pending_moves) == 1 else 'are'} also in "
+                "the official repos</b> — switch for signed builds.")
+            mt.setObjectName("banner-body")
+            mt.setWordWrap(True)
+            mb.addWidget(mt, 1)
+            review_btn = QPushButton("Review")
+            review_btn.setObjectName("secondary-small")
+            review_btn.setFixedHeight(30)
+            review_btn.clicked.connect(self._open_moves_dialog)
+            mb.addWidget(review_btn)
+            up.addWidget(mv)
 
         n_cached = sum(1 for i in range(n) if i in cached_info)
         self._set_idle_header(n_cached)
-
-        # ── List toolbar: filter result count only ──────────────────────────
-        # No bare "N packages" label here — the stat strip above already
-        # says that. This label only appears while filtering.
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(8)
-        self._meta = QLabel("")
-        self._meta.setObjectName("meta")
-        self._meta.setVisible(False)
-        toolbar.addWidget(self._meta, 0, Qt.AlignmentFlag.AlignVCenter)
-        toolbar.addStretch()
-        left.addLayout(toolbar)
 
         self._model = PackageModel(updates, cached_info)
         self._list = QListView()
@@ -2625,7 +3104,15 @@ class UpdateWindow(QMainWindow):
         self._delegate.more_requested.connect(self._on_more_requested)
         self._delegate.action_requested.connect(self._on_row_action)
         self._model.dataChanged.connect(self._on_model_changed)
-        left.addWidget(self._list, 1)
+        # Empty state: the window opens even with nothing to update.
+        self._empty_label = QLabel("✓  System is up to date — nothing to install.")
+        self._empty_label.setObjectName("empty-state")
+        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        up.addWidget(self._empty_label)
+        up.addWidget(self._list, 1)
+        self._model.rowsInserted.connect(lambda *a: self._refresh_empty_state())
+        self._model.rowsRemoved.connect(lambda *a: self._refresh_empty_state())
+        self._refresh_empty_state()
 
         # Side log panel: fixed width, hidden until toggled or failure.
         self._log_panel = QWidget()
@@ -2703,24 +3190,10 @@ class UpdateWindow(QMainWindow):
         self._anim.setInterval(120)
         self._anim.timeout.connect(lambda: self._delegate.tick(self._model))
 
-        # ── Zone 4 · Status: message + slim progress track ───────────────────
-        # Created here, added to the layout at the very bottom (above the
-        # footer) so the list always gets first claim on vertical space.
-        self._status = QTextEdit()
-        self._status.setObjectName("status")
-        self._status.setReadOnly(True)
-        self._status.setFrameShape(QFrame.Shape.NoFrame)
-        self._status.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._status.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._status.setSizeAdjustPolicy(
-            QAbstractScrollArea.SizeAdjustPolicy.AdjustToContents)
-        self._status.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        self._status.setVisible(False)
-
+        # ── Zone 4 · Slim progress track (divider before footer) ────────────
+        # NOTE: there is deliberately no status box down here. ALL user
+        # messages go through the single unified status line in the header
+        # (self._sub via _set_status) — one place, color-coded with icons.
         self._progress = QProgressBar()
         self._progress.setRange(0, n)
         self._progress.setValue(n_cached)
@@ -2736,15 +3209,23 @@ class UpdateWindow(QMainWindow):
         # the vertical space.
 
         # Status + progress pinned at the bottom of the left column so the
-        # list above always gets first claim on vertical space. The slim
-        # progress bar doubles as the divider before the footer.
-        left.addWidget(self._status)
-        left.addWidget(self._progress)
+        # list above always gets first claim on vertical space. A clickable
+        # preview of the latest log line sits just above the progress bar;
+        # clicking it opens the side log panel. The slim progress bar
+        # doubles as the divider before the footer.
+        self._log_preview = _ClickableLabel("")
+        self._log_preview.setObjectName("log-preview")
+        self._log_preview.setVisible(False)
+        self._log_preview.clicked.connect(self._show_log)
+        up.addWidget(self._log_preview)
+        up.addWidget(self._progress)
 
-        # ── Zone 5 · Footer: selection cluster left, actions right ──────────
+        # ── Zone 5 · Footers (one per view, swapped with content) ───────────
         # Selection lives here, next to the count it controls: label +
         # All / None. The primary Update action stays rightmost.
-        footer = QHBoxLayout()
+        self._footer_stack = QStackedWidget()
+        self._foot_updates = QWidget()
+        footer = QHBoxLayout(self._foot_updates)
         footer.setSpacing(8)
         self._sel_label = QLabel("")
         self._sel_label.setObjectName("meta")
@@ -2782,39 +3263,196 @@ class UpdateWindow(QMainWindow):
         self._update_btn.setIcon(app_icon("download", 16))
         self._update_btn.clicked.connect(self.start_update)
         footer.addWidget(self._update_btn)
-        left.addLayout(footer)
+        self._footer_stack.addWidget(self._foot_updates)
+
+        # ── Obsolete page: dropped-from-repo packages + bulk removal ────────
+        self._obs_page = QWidget()
+        ob = QVBoxLayout(self._obs_page)
+        ob.setContentsMargins(0, 0, 0, 0)
+        ob.setSpacing(12)
+        self._obs_summary = QLabel("")
+        self._obs_summary.setObjectName("meta")
+        ob.addWidget(self._obs_summary)
+        self._obs_scroll = QScrollArea()
+        self._obs_scroll.setObjectName("package-list")
+        self._obs_scroll.setWidgetResizable(True)
+        self._obs_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._obs_inner = QWidget()
+        self._obs_inner.setObjectName("list-inner")
+        self._obs_lay = QVBoxLayout(self._obs_inner)
+        self._obs_lay.setContentsMargins(8, 8, 8, 8)
+        self._obs_lay.setSpacing(8)
+        self._obs_stretch = QWidget()
+        self._obs_stretch.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self._obs_lay.addWidget(self._obs_stretch)
+        self._obs_scroll.setWidget(self._obs_inner)
+        ob.addWidget(self._obs_scroll, 1)
+        self._content_stack.addWidget(self._obs_page)
+        self._obs_loaded = False
+        self._obs_names: list[str] = []
+        self._obs_cards: dict[str, QWidget] = {}
+
+        self._foot_obsolete = QWidget()
+        fo = QHBoxLayout(self._foot_obsolete)
+        fo.setSpacing(8)
+        self._obs_footer_label = QLabel("")
+        self._obs_footer_label.setObjectName("meta")
+        fo.addWidget(self._obs_footer_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        fo.addStretch()
+        self._obs_close_btn = QPushButton("Close")
+        self._obs_close_btn.setObjectName("secondary")
+        self._obs_close_btn.setFixedHeight(40)
+        self._obs_close_btn.setMinimumWidth(120)
+        self._obs_close_btn.clicked.connect(self.close)
+        fo.addWidget(self._obs_close_btn)
+        self._obs_remove_btn = QPushButton("Remove obsolete")
+        self._obs_remove_btn.setObjectName("primary")
+        self._obs_remove_btn.setFixedHeight(40)
+        self._obs_remove_btn.setMinimumWidth(170)
+        self._obs_remove_btn.clicked.connect(self._remove_obsolete_from_view)
+        fo.addWidget(self._obs_remove_btn)
+        self._footer_stack.addWidget(self._foot_obsolete)
+
+        # ── Security page: in-window compromise scan + results ──────────────
+        self._sec_page = QWidget()
+        se = QVBoxLayout(self._sec_page)
+        se.setContentsMargins(0, 0, 0, 0)
+        se.setSpacing(12)
+        self._sec_status = QLabel(
+            "Scan all installed packages against known supply-chain attacks.")
+        self._sec_status.setObjectName("meta")
+        self._sec_status.setWordWrap(True)
+        se.addWidget(self._sec_status)
+        self._sec_scroll = QScrollArea()
+        self._sec_scroll.setObjectName("package-list")
+        self._sec_scroll.setWidgetResizable(True)
+        self._sec_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._sec_inner = QWidget()
+        self._sec_inner.setObjectName("list-inner")
+        self._sec_lay = QVBoxLayout(self._sec_inner)
+        self._sec_lay.setContentsMargins(8, 8, 8, 8)
+        self._sec_lay.setSpacing(8)
+        self._sec_stretch = QWidget()
+        self._sec_stretch.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self._sec_lay.addWidget(self._sec_stretch)
+        self._sec_scroll.setWidget(self._sec_inner)
+        se.addWidget(self._sec_scroll, 1)
+        self._content_stack.addWidget(self._sec_page)
+        self._sec_scanner: SystemScanner | None = None
+        self._sec_cards: dict[str, QWidget] = {}
+
+        # ── Tracked page: every explicitly installed package ────────────────
+        # Virtualized (hundreds of rows): name + repo pill + version, with
+        # an inline Switch pill wherever an official build exists.
+        self._track_page = QWidget()
+        tr = QVBoxLayout(self._track_page)
+        tr.setContentsMargins(0, 0, 0, 0)
+        tr.setSpacing(12)
+        self._track_summary = QLabel("Loading tracked packages…")
+        self._track_summary.setObjectName("meta")
+        tr.addWidget(self._track_summary)
+        self._track_model = TrackedModel()
+        self._track_list = QListView()
+        self._track_list.setObjectName("package-list")
+        self._track_list.setModel(self._track_model)
+        self._track_delegate = TrackedDelegate(self._track_list)
+        self._track_list.setItemDelegate(self._track_delegate)
+        self._track_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection)
+        self._track_list.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._track_list.setResizeMode(QListView.ResizeMode.Adjust)
+        self._track_list.setSpacing(0)
+        self._track_list.setFrameShape(QFrame.Shape.NoFrame)
+        self._track_list.setMouseTracking(True)
+        self._track_list.viewport().setMouseTracking(True)
+        self._track_delegate.switch_requested.connect(
+            self._request_track_switch)
+        tr.addWidget(self._track_list, 1)
+        self._content_stack.addWidget(self._track_page)
+        self._track_loaded = False
+        self._track_queue: list[str] = []
+        self._track_runner: UpdateRunner | None = None
+        self._track_current: str | None = None
+
+        self._foot_security = QWidget()
+        fs = QHBoxLayout(self._foot_security)
+        fs.setSpacing(8)
+        self._sec_footer_label = QLabel("")
+        self._sec_footer_label.setObjectName("meta")
+        fs.addWidget(self._sec_footer_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        fs.addStretch()
+        self._sec_close_btn = QPushButton("Close")
+        self._sec_close_btn.setObjectName("secondary")
+        self._sec_close_btn.setFixedHeight(40)
+        self._sec_close_btn.setMinimumWidth(120)
+        self._sec_close_btn.clicked.connect(self.close)
+        fs.addWidget(self._sec_close_btn)
+        self._sec_scan_btn = QPushButton("Run scan")
+        self._sec_scan_btn.setObjectName("primary")
+        self._sec_scan_btn.setFixedHeight(40)
+        self._sec_scan_btn.setMinimumWidth(170)
+        self._sec_scan_btn.setIcon(app_icon("check-circle", 16))
+        self._sec_scan_btn.setToolTip("Scan installed packages for compromise")
+        self._sec_scan_btn.clicked.connect(self._run_security_scan)
+        fs.addWidget(self._sec_scan_btn)
+        self._footer_stack.addWidget(self._foot_security)
+
+        self._foot_tracked = QWidget()
+        ft = QHBoxLayout(self._foot_tracked)
+        ft.setSpacing(8)
+        self._track_footer_label = QLabel("")
+        self._track_footer_label.setObjectName("meta")
+        ft.addWidget(self._track_footer_label, 0,
+                     Qt.AlignmentFlag.AlignVCenter)
+        ft.addStretch()
+        self._track_close_btn = QPushButton("Close")
+        self._track_close_btn.setObjectName("secondary")
+        self._track_close_btn.setFixedHeight(40)
+        self._track_close_btn.setMinimumWidth(120)
+        self._track_close_btn.clicked.connect(self.close)
+        ft.addWidget(self._track_close_btn)
+        self._track_move_all_btn = QPushButton("Move all to official")
+        self._track_move_all_btn.setObjectName("primary")
+        self._track_move_all_btn.setFixedHeight(40)
+        self._track_move_all_btn.setMinimumWidth(170)
+        self._track_move_all_btn.setToolTip(
+            "Switch every movable package to official builds, one by one")
+        self._track_move_all_btn.clicked.connect(self._move_all_tracked)
+        ft.addWidget(self._track_move_all_btn)
+        self._footer_stack.addWidget(self._foot_tracked)
+
+        left.addWidget(self._footer_stack)
+        self._update_view_badges()
         self._refresh_selection_ui()
+        # Preload the obsolete list in the background so the Obsolete
+        # tab (and its badge) is instant when first opened. The tracked
+        # list chains after it (see _on_obs_preload_done) — strictly one
+        # loader thread at a time.
+        self._obs_checker: ObsoleteChecker | None = ObsoleteChecker()
+        self._obs_checker.done.connect(self._on_obs_preload_done)
+        self._obs_checker.start()
+        self._track_loader: TrackedLoader | None = None
 
     # ── Helpers ────────────────────────────────────────────────────────────────
-
-    def _apply_filter(self, text: str) -> None:
-        q = text.strip().lower()
-        shown = 0
-        for r in range(self._model.rowCount()):
-            hidden = bool(q) and q not in self._model.item(r)["name"].lower()
-            self._list.setRowHidden(r, hidden)
-            shown += not hidden
-        n = self._model.rowCount()
-        # Redundant otherwise: the stat strip already shows the total.
-        self._meta.setVisible(bool(q))
-        if q:
-            self._meta.setText(f"Showing {shown} of {n}")
-
 
     def _set_idle_header(self, n_cached: int) -> None:
         n = len(self._updates)
         self._stat_ready.set_caption("ready to install")
         self._stat_ready.set_accent("#1e8e3e")
         if n_cached < n:
-            self._sub.setText(
+            self._idle_summary = (
                 f"<b>{n}</b> package{'s' if n != 1 else ''} available "
                 f"<span style='color:#757575'>· fetching release notes…</span>"
             )
         else:
-            self._sub.setText(
+            self._idle_summary = (
                 f"<b>{n}</b> package{'s' if n != 1 else ''} available "
                 f"<span style='color:#757575'>· release notes loaded ✓</span>"
             )
+        self._sub.setText(self._idle_summary)
 
     # — Selection —
     def _select_all(self, checked: bool) -> None:
@@ -2844,7 +3482,7 @@ class UpdateWindow(QMainWindow):
         else:
             self._sel_label.setText(f"{sel} of {total} selected")
         self._select_all_btn.setEnabled(sel < total)
-        self._select_none_btn.setEnabled(sel > 0)
+        self._select_none_btn.setEnabled(sel > 0 and total > 0)
         if self._updating:
             return
         if sel == 0:
@@ -2859,36 +3497,300 @@ class UpdateWindow(QMainWindow):
                 "Update All" if sel == total else f"Update {sel} selected")
             self._update_btn.setEnabled(True)
 
-    # ── Status / progress presentation ─────────────────────────────────────
+    # ── Views: Updates | Obsolete | Security ─────────────────────────────────
+    def _switch_view(self, key: str) -> None:
+        idx = {"updates": 0, "obsolete": 1, "security": 2, "tracked": 3}[key]
+        self._content_stack.setCurrentIndex(idx)
+        self._footer_stack.setCurrentIndex(idx)
+        self._view_buttons[key].setChecked(True)
+        if key == "obsolete" and not self._obs_loaded:
+            # Never compute on the GUI thread (pacman spawns freeze
+            # the UI) — show a loading note; the checker fills it in.
+            self._obs_summary.setText("Scanning for obsolete packages…")
+            self._load_obsolete_async()
+        self._update_view_badges()
+
+    def _refresh_empty_state(self) -> None:
+        empty = self._model.rowCount() == 0
+        self._empty_label.setVisible(empty)
+        self._list.setVisible(not empty)
+        self._update_view_badges()
+
+    # ── Obsolete view ────────────────────────────────────────────────────────
+    def _refresh_obsolete_view(self) -> None:
+        try:
+            names = get_obsolete_packages()
+        except Exception:
+            names = []
+        self._fill_obsolete_view(names)
+
+    def _load_obsolete_async(self) -> None:
+        """(Re)compute the obsolete list in the background."""
+        old = self._obs_checker
+        if old is not None and old.isRunning():
+            return  # already loading; its done signal fills the view
+        self._obs_checker = ObsoleteChecker()
+        self._obs_checker.done.connect(self._on_obs_preload_done)
+        self._obs_checker.start()
+
+    def _on_obs_preload_done(self, names: list[str]) -> None:
+        self._release_thread("_obs_checker")
+        if not self._obs_loaded:
+            self._fill_obsolete_view(names)
+        # Chain the tracked load AFTER obsolete finishes: never fork
+        # pacman from two threads at once (multithreaded fork +
+        # concurrent subprocess I/O segfaults).
+        if not self._track_loaded and self._track_loader is None:
+            self._track_loader = TrackedLoader()
+            self._track_loader.done.connect(self._on_tracked_loaded)
+            self._track_loader.start()
+
+    def _fill_obsolete_view(self, names: list[str]) -> None:
+        self._obs_loaded = True
+        self._obs_names = names
+        for card in self._obs_cards.values():
+            self._obs_lay.removeWidget(card)
+            card.deleteLater()
+        self._obs_cards = {}
+        for name in names:
+            card = _ObsoleteRow(name)
+            self._obs_cards[name] = card
+            self._obs_lay.insertWidget(self._obs_lay.count() - 1, card)
+        if names:
+            self._obs_summary.setText(
+                f"<b>{len(names)}</b> package{'s' if len(names) != 1 else ''} "
+                "no longer provided by any repository.")
+            self._obs_footer_label.setText(
+                f"{len(names)} obsolete package{'s' if len(names) != 1 else ''}")
+            self._obs_remove_btn.setText(
+                f"Remove {len(names)} obsolete")
+        else:
+            self._obs_summary.setText(
+                "No obsolete packages — everything installed is provided "
+                "by a repository ✓")
+            self._obs_footer_label.setText("Nothing to remove")
+            self._obs_remove_btn.setText("Remove obsolete")
+        self._obs_remove_btn.setEnabled(bool(names))
+        self._update_view_badges()
+
+    def _remove_obsolete_from_view(self) -> None:
+        if not self._obs_names or self._remover is not None:
+            return
+        names = "\n".join(f"  • {pkg}" for pkg in self._obs_names)
+        box = QMessageBox(self)
+        box.setWindowTitle("Remove obsolete packages")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(
+            "These installed packages are no longer provided by any enabled\n"
+            "repository (e.g. split packages dropped upstream). They can block\n"
+            "future updates and are generally safe to remove:\n\n"
+            f"{names}\n\n"
+            "Remove them now?"
+        )
+        remove_btn = box.addButton("Remove", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is not remove_btn:
+            return
+        self._obsolete_ctx = "obsolete"
+        self._start_obsolete_removal(list(self._obs_names))
+
+    # ── Security view ────────────────────────────────────────────────────────
+    def _run_security_scan(self) -> None:
+        if self._sec_scanner is not None and self._sec_scanner.isRunning():
+            return
+        self._sec_scan_btn.setEnabled(False)
+        self._sec_status.setText("Scanning installed packages…")
+        for card in self._sec_cards.values():
+            self._sec_lay.removeWidget(card)
+            card.deleteLater()
+        self._sec_cards = {}
+        self._sec_scanner = SystemScanner()
+        self._sec_scanner.progress.connect(self._on_sec_progress)
+        self._sec_scanner.done.connect(self._on_sec_done)
+        self._sec_scanner.start()
+
+    def _on_sec_progress(self, current: int, total: int, pkg: str) -> None:
+        self._sec_status.setText(f"Scanning… {current}/{total}  ({pkg})")
+
+    def _on_sec_done(self, results: list[dict]) -> None:
+        self._release_thread("_sec_scanner")
+        self._sec_scan_btn.setEnabled(True)
+        n_comp = sum(1 for r in results if r.get("compromised"))
+        for pkg in results:
+            if not pkg.get("compromised"):
+                continue  # clean list stays quiet; only findings shown
+            card = _ScanRow(pkg)
+            self._sec_cards[pkg["name"]] = card
+            self._sec_lay.insertWidget(self._sec_lay.count() - 1, card)
+        n = len(results)
+        self._sec_footer_label.setText(
+            f"{n_comp} compromised of {n} checked" if n_comp
+            else f"{n} checked — none compromised")
+        if n_comp:
+            self._sec_status.setText(
+                f"<b style='color:#e5484d'>{n_comp} compromised package"
+                f"{'s' if n_comp != 1 else ''} found</b> out of {n} checked.")
+            self._set_status(
+                f"Security scan: {n_comp} compromised package"
+                f"{'s' if n_comp != 1 else ''} found — see Security view.",
+                "error")
+        else:
+            self._sec_status.setText(
+                f"✓  {n} packages checked — none compromised.")
+            self._set_status(
+                f"Security scan complete — {n} packages checked, "
+                "none compromised.", "ok")
+
+    # ── Tracked view ─────────────────────────────────────────────────────────
+    def _on_tracked_loaded(self, installed: list[dict],
+                           moves: list[dict]) -> None:
+        self._release_thread("_track_loader")
+        self._track_loaded = True
+        self._track_model.set_packages(installed, moves)
+        self._refresh_tracked_summary()
+        self._update_view_badges()
+
+    def _refresh_tracked_summary(self) -> None:
+        n = self._track_model.rowCount()
+        movable = self._track_model.movable_names()
+        if n == 0 and not self._track_loaded:
+            self._track_summary.setText("Loading tracked packages…")
+            self._track_footer_label.setText("Loading…")
+        elif not movable:
+            self._track_summary.setText(
+                f"<b>{n}</b> tracked packages — all on official builds ✓")
+            self._track_footer_label.setText(f"{n} tracked")
+        else:
+            self._track_summary.setText(
+                f"<b>{n}</b> tracked packages · "
+                f"<b>{len(movable)}</b> also in official repos")
+            self._track_footer_label.setText(
+                f"{len(movable)} can move to official")
+        self._track_move_all_btn.setEnabled(bool(movable))
+
+    def _update_view_badges(self) -> None:
+        n_up = self._model.rowCount()
+        self._view_buttons["updates"].setText(
+            f"Updates ({n_up})" if n_up else "Updates")
+        if getattr(self, "_obs_loaded", False):
+            n_ob = len(self._obs_names)
+            self._view_buttons["obsolete"].setText(
+                f"Obsolete ({n_ob})" if n_ob else "Obsolete")
+        if getattr(self, "_track_loaded", False):
+            n_tr = self._track_model.rowCount()
+            n_mv = len(self._track_model.movable_names())
+            self._view_buttons["tracked"].setText(
+                f"Tracked ({n_tr})" if n_tr and not n_mv
+                else (f"Tracked · {n_mv} to move" if n_mv else "Tracked"))
+
+    # — Inline AUR → official switching (one at a time: one pacman lock) —
+    def _request_track_switch(self, name: str) -> None:
+        r = self._track_model.row_of(name)
+        if r is None:
+            return
+        item = self._track_model.item(r)
+        if not item["official"] or name in self._track_queue \
+                or name == self._track_current:
+            return
+        if item["relation"] == "downgrade" and item["state"] != "failed":
+            box = QMessageBox(self)
+            box.setWindowTitle(f"Switch {name}?")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(
+                f"The official build ({item['official']}) is OLDER than your "
+                f"installed AUR build ({item['version']}).\n\n"
+                "Switching will downgrade the package. Proceed?")
+            go_btn = box.addButton("Switch anyway",
+                                   QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is not go_btn:
+                return
+        if os.path.exists(_PACMAN_LOCK):
+            self._set_status(
+                "Another package operation is running — wait for it to "
+                "finish, then retry.", "error")
+            return
+        self._track_queue.append(name)
+        self._track_model.set_state(name, "idle")
+        self._run_next_track_switch()
+
+    def _move_all_tracked(self) -> None:
+        for name in self._track_model.movable_names():
+            if name not in self._track_queue and name != self._track_current:
+                r = self._track_model.row_of(name)
+                if r is not None and self._track_model.item(r)["relation"] != "downgrade":
+                    self._track_queue.append(name)
+        # Downgrades need individual confirmation — skip them in bulk.
+        self._run_next_track_switch()
+        self._set_status(
+            f"Queued {len(self._track_queue)} move"
+            f"{'s' if len(self._track_queue) != 1 else ''} to official builds…",
+            "info")
+
+    def _run_next_track_switch(self) -> None:
+        if self._track_runner is not None or not self._track_queue:
+            return
+        if os.path.exists(_PACMAN_LOCK):
+            self._set_status(
+                "Pacman database is locked — retry when the other "
+                "operation finishes.", "error")
+            self._track_queue.clear()
+            return
+        name = self._track_queue.pop(0)
+        self._track_current = name
+        self._track_model.set_state(name, "switching")
+        self._set_status(f"Switching {name} to the official build…", "info")
+        self._track_runner = UpdateRunner(None, [name])
+        self._track_runner.done.connect(self._on_track_switch_done)
+        self._track_runner.start()
+
+    def _on_track_switch_done(self, success: bool, output: str) -> None:
+        name = self._track_current or ""
+        self._release_thread("_track_runner")
+        self._track_current = None
+        r = self._track_model.row_of(name)
+        if r is None:
+            self._run_next_track_switch()
+            return
+        item = self._track_model.item(r)
+        verified = False
+        if success:
+            verified = not verify_upgraded({name: item["official"]})
+        if success and verified:
+            self._track_model.set_state(name, "done")
+            self._set_status(f"{name} now tracks the official build ✓", "ok")
+        else:
+            if success:
+                output += (f"\n{name}: still not at {item['official']} — "
+                           "was not upgraded (stale sync database)")
+            self._track_model.set_state(name, "failed")
+            self._set_status(
+                f"Switching {name} failed — use Retry on its row.", "error")
+        self._refresh_tracked_summary()
+        self._update_view_badges()
+        self._run_next_track_switch()
+
+    # ── Unified status line (header, under the title) ────────────────────
+    # Every user-facing message in this window renders here — idle
+    # summaries, install progress, auth prompts, errors, success notes.
+    # Color-coded with a glyph prefix; empty text restores the idle
+    # summary instead of leaving a hole.
 
     def _set_status(self, text: str, kind: str = "info") -> None:
-        """Show a status message; the box hides itself when empty.
+        """Show a status message.
 
-        kind: "info" (plain text), "error" (white on red), "ok" (white on green).
-        Height is fitted deterministically to the document (capped), so the
-        box can neither balloon nor clip — no reliance on async layout.
+        kind: "info" (plain), "error" (red ✕), "ok" (green ✓).
         """
-        self._status.setHtml(text)
-        self._status.setVisible(bool(text))
+        if not text:
+            self._sub.setText(self._idle_summary)
+            return
         if kind == "error":
-            self._status.setObjectName("status-error")
+            text = f"<b style='color:#e5484d'>✕</b> {text}"
         elif kind == "ok":
-            self._status.setObjectName("status-ok")
-        else:
-            self._status.setObjectName("status")
-        self._status.style().unpolish(self._status)
-        self._status.style().polish(self._status)
-        if text:
-            self._fit_status_height()
-
-    def _fit_status_height(self) -> None:
-        """Fix the status box height to its content (1 line … 140px max)."""
-        doc = self._status.document()
-        doc.setTextWidth(max(self._status.viewport().width(), 100))
-        doc.adjustSize()
-        line = self._status.fontMetrics().lineSpacing()
-        self._status.setFixedHeight(
-            max(line + 16, min(int(doc.size().height()) + 20, 140)))
+            text = f"<b style='color:{_NEW_GREEN}'>✓</b> {text}"
+        self._sub.setText(text)
 
     def _set_progress_state(self, state: str, text: str = "") -> None:
         """Recolor the divider-track: 'normal' (idle green), 'active'
@@ -2972,13 +3874,15 @@ class UpdateWindow(QMainWindow):
         _notify_close(self._fail_notif_id)
         self._fail_notif_id = 0
         self._hide_failure_ui()
-        self._set_status("", "info")
         self._model.reset_states()
         self._done_names = set()
         self._live_conflicts = {}
         self._seen_building = set()
         if self._log_view.toPlainText().strip():
             self._log_view.appendPlainText("── New run ──")
+        else:
+            self._log_preview.setText("")
+            self._log_preview.setVisible(False)
         self._note_activity()
         self._stuck_warned = False
         self._watchdog.start()
@@ -2987,7 +3891,6 @@ class UpdateWindow(QMainWindow):
         self._safe_names = safe_names
 
         n = len(safe_names)
-        self._sub.setText(f"Installing… <b>0</b> of <b>{n}</b> selected")
         self._stat_ready.set_value(str(n))
         self._stat_ready.set_caption("remaining")
         self._stat_ready.set_accent("#1e8e3e")
@@ -3036,14 +3939,13 @@ class UpdateWindow(QMainWindow):
         self._progress.setValue(min(done, n))
         self._stat_ready.set_value(str(max(n - done, 0)))
         if self._model.item(r).get("auto"):
-            self._sub.setText(
+            self._set_status(
                 f"Installing dependency <b>{pkg}</b> — "
                 f"{done} of {n} selected done "
                 f"<span style='color:#757575'>(auto-added below)</span>")
         else:
-            self._sub.setText(
+            self._set_status(
                 f"Installing <b>{pkg}</b> — {done} of {n} selected done")
-        self._set_status("", "info")
         self._installing_row = r
         self._model.set_state(pkg, "installing")
         self._list.scrollTo(self._model.index(r),
@@ -3057,7 +3959,7 @@ class UpdateWindow(QMainWindow):
             return
         self._seen_building.add(pkg)
         r = self._model.ensure_row(pkg)
-        self._sub.setText(
+        self._set_status(
             f"Building AUR package <b>{pkg}</b> — "
             f"{self._done_selected_count()} of "
             f"{max(len(self._safe_names or []), 1)} selected done "
@@ -3075,7 +3977,7 @@ class UpdateWindow(QMainWindow):
         r = self._model.ensure_row(pkg)
         self._model.set_state(pkg, "failed")
         self._set_status(
-            f"✕ Files already exist on disk: {pkg} "
+            f"Files already exist on disk: {pkg} "
             f"({path}). Finishing output — retry help will appear below.",
             "error")
         self._show_log()
@@ -3088,6 +3990,14 @@ class UpdateWindow(QMainWindow):
         if is_log_noise(line):
             return
         self._log_view.appendPlainText(line)
+        # Keep a one-line preview above the progress bar; it hides while
+        # the full panel is open (redundant then).
+        short = line.strip()
+        if len(short) > 140:
+            short = short[:139] + "…"
+        self._log_preview.setText(
+            f"<span style='color:#757575'>▸</span> {html.escape(short)}")
+        self._log_preview.setVisible(not self._log_panel.isVisible())
 
     # — Watchdog + cancel —
     def _note_activity(self) -> None:
@@ -3121,6 +4031,9 @@ class UpdateWindow(QMainWindow):
 
     def _on_log_toggled(self, checked: bool) -> None:
         self._log_panel.setVisible(checked)
+        # The preview is a stand-in for the closed panel.
+        self._log_preview.setVisible(
+            not checked and bool(self._log_view.toPlainText().strip()))
 
     def _show_log(self) -> None:
         if not self._log_btn.isChecked():
@@ -3186,8 +4099,8 @@ class UpdateWindow(QMainWindow):
             msg = f"<b>{n_selected} package{'s' if n_selected != 1 else ''}</b> updated"
             if n_comp:
                 msg += f" <span style='color:#757575'>· {n_comp} compromised skipped</span>"
-            self._sub.setText(msg)
-            self._set_status("System is up to date. Closing in a moment…", "ok")
+            msg += " <span style='color:#757575'>· closing…</span>"
+            self._set_status(msg, "ok")
             subprocess.Popen([
                 "notify-send", "Arch Update Complete",
                 f"Successfully updated {n_selected} package{'s' if n_selected != 1 else ''}."
@@ -3200,7 +4113,7 @@ class UpdateWindow(QMainWindow):
 
         # ── Failure path ──────────────────────────────────────────────
         self._updating = False
-        self._runner = None
+        self._release_thread("_runner")
         self._retry_mode = True
         self._watchdog.stop()
 
@@ -3259,17 +4172,15 @@ class UpdateWindow(QMainWindow):
         self._stat_ready.set_value(str(n_pending))
         self._stat_ready.set_caption("pending — retry")
         self._stat_ready.set_accent("#e01b24")
-        self._sub.setText(
-            f"<b style='color:#e5484d'>Update failed</b> — "
-            f"<b>{n_pending}</b> package{'s' if n_pending != 1 else ''} "
-            "pending"
-        )
         self._show_log()
 
-        # Unmissable who/why summary in the status box (proven to render),
-        # then jump the list to the failed row and its Retry pill.
+        # Unmissable who/why summary in the unified header status, then
+        # jump the list to the failed row and its Retry pill.
         who = ", ".join(failed_names) if failed_names else "unknown package"
-        self._set_status(f"✕ {title}: {who}. {advice}", "error")
+        self._set_status(
+            f"<b>Update failed</b> — {title}: {who}. "
+            f"<b>{n_pending}</b> package{'s' if n_pending != 1 else ''} "
+            f"pending. {advice}", "error")
         self._fail_row = (self._model.row_of(failed_names[0])
                           if failed_names else None)
         self._scroll_to_failed()
@@ -3339,6 +4250,27 @@ class UpdateWindow(QMainWindow):
     def _on_more_requested(self, row: int) -> None:
         self.show_popover(row)
 
+    # — AUR → official moves —
+    def _open_moves_dialog(self) -> None:
+        if self._moves_dialog is not None:
+            self._moves_dialog.raise_()
+            self._moves_dialog.activateWindow()
+            return
+        self._moves_dialog = MovesDialog(self._pending_moves)
+        self._moves_dialog.closed.connect(self._on_moves_dialog_closed)
+        self._moves_dialog.moves_done.connect(self._on_moves_changed)
+        self._moves_dialog.show()
+        self._moves_dialog.raise_()
+        self._moves_dialog.activateWindow()
+
+    def _on_moves_dialog_closed(self) -> None:
+        self._moves_dialog = None
+
+    def _on_moves_changed(self) -> None:
+        self._set_status(
+            "Switched to official builds — press Check Now (tray) or "
+            "reopen this window to refresh the list.", "ok")
+
     def show_popover(self, row: int) -> None:
         self._popover = NotesPopover(self, self._model.item(row))
         self._popover.show()
@@ -3399,7 +4331,7 @@ class UpdateWindow(QMainWindow):
 
     def _on_single_done(self, success: bool, output: str) -> None:
         name = self._single_name or ""
-        self._single = None
+        self._release_thread("_single")
         self._single_name = None
         self._anim.stop()
         self._watchdog.stop()
@@ -3422,7 +4354,6 @@ class UpdateWindow(QMainWindow):
             _notify_close(self._fail_notif_id)
             self._fail_notif_id = 0
             self._sub.setText(f"<b>{name}</b> installed ✓")
-            self._set_status("", "info")
             subprocess.Popen([
                 "notify-send", "Arch Update", f"{name} installed.",
                 "-i", "system-software-update", "-t", "6000",
@@ -3436,7 +4367,7 @@ class UpdateWindow(QMainWindow):
         self._details_label.setVisible(True)
         self._details.setVisible(True)
         self._copy_btn.setVisible(True)
-        self._set_status(f"✕ {name}: {title}. {advice}", "error")
+        self._set_status(f"{name}: {title}. {advice}", "error")
         self._fail_row = r
         self._scroll_to_failed()
         self._show_log()
@@ -3513,13 +4444,28 @@ class UpdateWindow(QMainWindow):
         self._remover.start()
 
     def _on_obsolete_removal_done(self, success: bool, output: str) -> None:
-        self._remover = None
+        self._release_thread("_remover")
         if not success:
             last = [l for l in output.splitlines() if l.strip()][-2:]
             hint = " · ".join(last) if last else "No output captured"
             self._set_status(f"Obsolete removal failed: {hint}", "error")
             self._update_btn.setEnabled(True)
             self._skip_btn.setEnabled(True)
+            return
+        if getattr(self, "_obsolete_ctx", "updates") == "obsolete":
+            # View-owned removal: reload async (never on GUI thread),
+            # stay in the view.
+            self._obsolete_ctx = "updates"
+            self._obs_loaded = False
+            self._set_status("Obsolete packages removed ✓ — rescanning…", "ok")
+            self._update_btn.setEnabled(True)
+            self._skip_btn.setEnabled(True)
+            self._skip_btn.setText("Skip for Now")
+            self._select_all_btn.setEnabled(True)
+            self._select_none_btn.setEnabled(True)
+            self._refresh_selection_ui()
+            self._obs_summary.setText("Scanning for obsolete packages…")
+            self._load_obsolete_async()
             return
         self._set_status("Obsolete packages removed — retrying update…", "info")
         self.start_update()
@@ -3529,18 +4475,12 @@ class UpdateWindow(QMainWindow):
             self.close()
         elif (
             event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-            and not self._search.hasFocus()
             and self._update_btn.isEnabled()
+            and self._content_stack.currentIndex() == 0
         ):
             self.start_update()
         else:
             super().keyPressEvent(event)
-
-    def resizeEvent(self, event) -> None:  # type: ignore[override]
-        super().resizeEvent(event)
-        # Wrapped height depends on width — refit the status box.
-        if self._status.isVisible():
-            self._fit_status_height()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         # Never destroy a running QThread: sip turns that into a hard
@@ -3551,18 +4491,63 @@ class UpdateWindow(QMainWindow):
         super().closeEvent(event)
         self.closed.emit()
 
+    def _park_thread(self, thread) -> None:
+        """Keep a still-running thread alive until it finishes itself.
+
+        NEVER destroy (or raw-terminate) a running QThread: terminate()
+        poisons its state so the later wrapper drop aborts the process
+        ("QThread: Destroyed while thread is still running"). Parked
+        threads are deleted by Qt once finished.
+        """
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: self._orphans.discard(thread))
+        self._orphans.add(thread)
+        if thread.isFinished():
+            thread.deleteLater()
+            self._orphans.discard(thread)
+
+    def _release_thread(self, attr: str) -> None:
+        """Drop a finished worker reference, safely.
+
+        wait() releases the GIL while blocking, so a worker still
+        unwinding from its final emit always finishes first — destroying
+        its wrapper a moment earlier aborts the whole process. Falls
+        back to parking if it somehow never finishes.
+        """
+        thread = getattr(self, attr, None)
+        if thread is None:
+            return
+        if thread.isRunning() and not thread.wait(5000):
+            self._park_thread(thread)
+        setattr(self, attr, None)
+
     def _stop_runners(self) -> None:
-        """Terminate any running workers and wait for them to finish."""
-        for attr in ("_runner", "_single", "_remover"):
+        """Stop all workers. Installers get a graceful terminate (their
+        run loops notice the dead child and exit normally); pure-compute
+        threads only ever get interruption + parking."""
+        for attr in ("_runner", "_single", "_remover", "_track_runner"):
             thread = getattr(self, attr, None)
             if thread is not None:
                 if thread.isRunning():
                     try:
-                        thread.terminate()
+                        thread.terminate()  # graceful override: kills child
                     except Exception:
                         pass
-                    thread.wait(8000)
+                    if not thread.wait(8000):
+                        self._park_thread(thread)
                 setattr(self, attr, None)
+        for attr in ("_sec_scanner", "_obs_checker", "_track_loader"):
+            thread = getattr(self, attr, None)
+            if thread is None:
+                continue
+            if thread.isRunning():
+                try:
+                    thread.requestInterruption()
+                except Exception:
+                    pass
+                if not thread.wait(12000):
+                    self._park_thread(thread)
+            setattr(self, attr, None)
 
 
 # ── Scan dialog ─────────────────────────────────────────────────────────────────
@@ -3667,6 +4652,277 @@ class ScanDialog(QMainWindow):
         self.closed.emit()
 
 
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        super().closeEvent(event)
+        self.closed.emit()
+
+
+# ── AUR → official moves dialog ──────────────────────────────────────────
+
+_RELATION_PILL: dict[str, tuple[str, str, str]] = {
+    # relation: (label, background css, foreground)
+    "upgrade": ("OFFICIAL NEWER", "rgba(30,142,62,0.16)", "#1e8e3e"),
+    "same": ("SAME VERSION", "rgba(117,117,117,0.16)", "#757575"),
+    "downgrade": ("OFFICIAL OLDER", "rgba(230,97,0,0.16)", "#e66100"),
+}
+
+
+class _MoveRow(QWidget):
+    """One candidate: name + relation pill, versions, Switch button."""
+
+    def __init__(self, move: dict, on_switch) -> None:
+        super().__init__()
+        self.move_name = move["name"]
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setObjectName("package-card")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 10, 14, 12)
+        outer.setSpacing(4)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        name = QLabel(move["name"])
+        name.setObjectName("package-name")
+        top.addWidget(name)
+        label, bg, fg = _RELATION_PILL[move["relation"]]
+        pill = QLabel(label)
+        pill.setObjectName("repo-badge")
+        pill.setStyleSheet(f"background: {bg}; color: {fg};")
+        top.addWidget(pill)
+        top.addStretch()
+        self._switch_btn = QPushButton("Switch")
+        self._switch_btn.setObjectName("secondary-small")
+        self._switch_btn.setFixedHeight(30)
+        self._switch_btn.setToolTip(
+            "Replace the AUR build with the official repository package")
+        self._switch_btn.clicked.connect(lambda: on_switch(self.move_name))
+        top.addWidget(self._switch_btn)
+        outer.addLayout(top)
+
+        ver = QLabel(
+            f"<span style='color:#757575'>AUR <s>{move['installed']}</s></span>"
+            f"  →  <b style='color:{_NEW_GREEN}'>official "
+            f"{move['official']}</b>")
+        ver.setObjectName("package-versions")
+        outer.addWidget(ver)
+
+        self._state_lbl = QLabel("")
+        self._state_lbl.setObjectName("package-date")
+        self._state_lbl.setWordWrap(True)
+        outer.addWidget(self._state_lbl)
+
+    def set_row_state(self, state: str, text: str = "") -> None:
+        """idle | switching | done | failed — button + note follow."""
+        self._state_lbl.setText(text)
+        if state == "switching":
+            self._switch_btn.setEnabled(False)
+            self._switch_btn.setText("Switching…")
+            self._state_lbl.setStyleSheet("color: #3584e4;")
+        elif state == "done":
+            self._switch_btn.setEnabled(False)
+            self._switch_btn.setText("Switched ✓")
+            self._state_lbl.setStyleSheet(f"color: {_NEW_GREEN};")
+            self._set_card("package-card-done")
+        elif state == "failed":
+            self._switch_btn.setEnabled(True)
+            self._switch_btn.setText("Retry")
+            self._state_lbl.setStyleSheet("color: #e01b24;")
+            self._set_card("package-card-failed")
+        else:
+            self._switch_btn.setEnabled(True)
+            self._switch_btn.setText(
+                "Queued" if text.startswith("Queued") else "Switch")
+            self._set_card("package-card")
+
+    def _set_card(self, name: str) -> None:
+        self.setObjectName(name)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+class MovesDialog(QMainWindow):
+    """Review foreign packages available in official repos; switch them."""
+
+    closed = pyqtSignal()
+    moves_done = pyqtSignal()  # at least one switch succeeded
+
+    def __init__(self, moves: list[dict]) -> None:
+        super().__init__()
+        self._moves = {m["name"]: m for m in moves}
+        self._rows: dict[str, _MoveRow] = {}
+        self._queue: list[str] = []
+        self._runner: UpdateRunner | None = None
+        self._current: str | None = None
+        self._changed = False
+        self._orphans: set = set()  # parked threads, never destroyed live
+
+        n = len(moves)
+        self.setWindowTitle(
+            f"Switch to Official Packages — {n} candidate"
+            f"{'s' if n != 1 else ''}")
+        self.setMinimumSize(760, 480)
+        self.setStyleSheet(_APP_QSS)
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        lay = QVBoxLayout(root)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.setSpacing(16)
+
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(_app_icon().pixmap(40, 40))
+        head.addWidget(icon_lbl, 0, Qt.AlignmentFlag.AlignTop)
+        tb = QVBoxLayout()
+        tb.setSpacing(2)
+        eyebrow = QLabel("REPOSITORY MOVES")
+        eyebrow.setObjectName("eyebrow")
+        tb.addWidget(eyebrow)
+        title = QLabel("Switch to Official Packages")
+        title.setObjectName("title")
+        tb.addWidget(title)
+        sub = QLabel(
+            "These installed AUR packages are also in the official repos. "
+            "Switching gives you signed builds and updates.")
+        sub.setObjectName("subtitle")
+        sub.setWordWrap(True)
+        tb.addWidget(sub)
+        head.addLayout(tb)
+        head.addStretch()
+        lay.addLayout(head)
+        lay.addWidget(_divider())
+
+        scroll = QScrollArea()
+        scroll.setObjectName("package-list")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        inner.setObjectName("list-inner")
+        ll = QVBoxLayout(inner)
+        ll.setContentsMargins(8, 8, 8, 8)
+        ll.setSpacing(8)
+        for m in moves:
+            row = _MoveRow(m, self.request_switch)
+            self._rows[m["name"]] = row
+            ll.addWidget(row)
+        ll.addStretch()
+        scroll.setWidget(inner)
+        lay.addWidget(scroll, 1)
+
+        lay.addWidget(_divider())
+        footer = QHBoxLayout()
+        footer.setSpacing(8)
+        self._status = QLabel("")
+        self._status.setObjectName("meta")
+        footer.addWidget(self._status, 0, Qt.AlignmentFlag.AlignVCenter)
+        footer.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("secondary")
+        close_btn.setFixedHeight(40)
+        close_btn.setMinimumWidth(120)
+        close_btn.clicked.connect(self.close)
+        footer.addWidget(close_btn)
+        lay.addLayout(footer)
+
+    # — Switch flow (strictly sequential: pacman has one lock) —
+    def request_switch(self, name: str) -> None:
+        if name in self._queue or name == self._current:
+            return
+        move = self._moves.get(name)
+        if move is None:
+            return
+        if move["relation"] == "downgrade" and self._rows[name]._switch_btn.text() != "Retry":
+            box = QMessageBox(self)
+            box.setWindowTitle(f"Switch {name}?")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(
+                f"The official build ({move['official']}) is OLDER than your "
+                f"installed AUR build ({move['installed']}).\n\n"
+                "Switching will downgrade the package. Proceed?")
+            go_btn = box.addButton("Switch anyway",
+                                   QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is not go_btn:
+                return
+        if os.path.exists(_PACMAN_LOCK):
+            self._status.setText(
+                "Another package operation is running — "
+                "close the update window or wait, then retry.")
+            return
+        self._queue.append(name)
+        self._rows[name].set_row_state("idle", "Queued — waiting for turn…")
+        self._run_next()
+
+    def _run_next(self) -> None:
+        if self._runner is not None or not self._queue:
+            return
+        if os.path.exists(_PACMAN_LOCK):
+            self._status.setText(
+                "Pacman database is locked — retry when the other "
+                "operation finishes.")
+            for name in self._queue:
+                self._rows[name].set_row_state("idle")
+            self._queue.clear()
+            return
+        name = self._queue.pop(0)
+        self._current = name
+        self._rows[name].set_row_state("switching", "Installing official build…")
+        self._status.setText(f"Switching {name}… (a password dialog may appear)")
+        # Force the pacman path: deterministic official-repo install.
+        self._runner = UpdateRunner(None, [name])
+        self._runner.done.connect(self._on_switch_done)
+        self._runner.start()
+
+    def _on_switch_done(self, success: bool, output: str) -> None:
+        name = self._current or ""
+        if self._runner is not None:
+            self._runner.wait(5000)
+            self._runner = None
+        self._current = None
+        move = self._moves.get(name, {})
+        verified = False
+        if success and move:
+            verified = not verify_upgraded({name: move["official"]})
+        if success and verified:
+            self._rows[name].set_row_state(
+                "done", f"Now tracking official {move['official']} ✓")
+            self._changed = True
+            self.moves_done.emit()
+        else:
+            if success:
+                # Exit 0 but version didn't land (stale DB edge).
+                output += (f"\n{name}: still not at {move.get('official', '?')} — "
+                           "was not upgraded (stale sync database)")
+            lines = [l for l in output.splitlines() if l.strip()]
+            hint = " · ".join(lines[-2:]) if lines else "No output captured"
+            self._rows[name].set_row_state("failed", hint)
+        self._status.setText(
+            "Done — reopen the update window or Check Now to refresh."
+            if not self._queue else f"Continuing ({len(self._queue)} queued)…")
+        self._run_next()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        # Never destroy a running QThread (aborts the process). The
+        # runner stops gracefully via terminate(); if it won't stop,
+        # park it instead of dropping the wrapper.
+        if self._runner is not None:
+            if self._runner.isRunning():
+                try:
+                    self._runner.terminate()
+                except Exception:
+                    pass
+                if not self._runner.wait(8000):
+                    self._runner.finished.connect(self._runner.deleteLater)
+                    self._runner.finished.connect(
+                        lambda: self._orphans.discard(self._runner))
+                    self._orphans.add(self._runner)
+            self._runner = None
+        super().closeEvent(event)
+        self.closed.emit()
+
+
 # ── System tray application ────────────────────────────────────────────────────
 
 class TrayApp(QObject):
@@ -3683,6 +4939,7 @@ class TrayApp(QObject):
         self._fetcher:     InfoFetcher | None              = None
         self._scanner:     SystemScanner | None            = None
         self._scan_window: ScanDialog | None               = None
+        self._moves_dialog: MovesDialog | None             = None
         self._obsolete_remover: ObsoleteRemover | None     = None
         self._orphans: set = set()  # parked threads (see _park_thread)
         app.aboutToQuit.connect(self._shutdown)
@@ -3700,7 +4957,7 @@ class TrayApp(QObject):
         menu.addSeparator()
         self._show_act = menu.addAction("Show Updates…")
         self._show_act.triggered.connect(self._open_window)
-        self._show_act.setEnabled(False)
+        self._show_act.setEnabled(True)
         self._check_act = menu.addAction("Check Now")
         self._check_act.triggered.connect(self.check_now)
         menu.addSeparator()
@@ -3709,6 +4966,8 @@ class TrayApp(QObject):
         menu.addSeparator()
         self._obsolete_act = menu.addAction("Remove Obsolete Packages…")
         self._obsolete_act.triggered.connect(self.remove_obsolete)
+        self._moves_act = menu.addAction("Switch AUR → Official…")
+        self._moves_act.triggered.connect(self.open_moves)
         menu.addSeparator()
         quit_act = menu.addAction("Quit")
         quit_act.triggered.connect(app.quit)
@@ -3798,7 +5057,7 @@ class TrayApp(QObject):
         self._cached_info = {}
         self._tray.setToolTip("Arch Update  —  system up to date")
         self._status_act.setText("System is up to date")
-        self._show_act.setEnabled(False)
+        self._show_act.setEnabled(True)
 
     # ── Fetcher lifecycle ──────────────────────────────────────────────────────
 
@@ -3833,6 +5092,15 @@ class TrayApp(QObject):
             thread.deleteLater()
             self._orphans.discard(thread)
 
+    def _release_thread(self, attr: str) -> None:
+        """Drop a finished worker reference, safely (see window version)."""
+        thread = getattr(self, attr, None)
+        if thread is None:
+            return
+        if thread.isRunning() and not thread.wait(5000):
+            self._park_thread(thread)
+        setattr(self, attr, None)
+
     def _on_row_cached(self, row: int, name: str, new_ver: str,
                        desc: str, notes: str, date: str,
                        full: str, source: str, source_url: str) -> None:
@@ -3844,7 +5112,7 @@ class TrayApp(QObject):
     def _on_fetch_done(self) -> None:
         if self._window is not None:
             self._window.on_fetch_done()
-        self._fetcher = None
+        self._release_thread("_fetcher")
 
     # ── Tray interaction ───────────────────────────────────────────────────────
 
@@ -3856,12 +5124,8 @@ class TrayApp(QObject):
             self._open_window()
 
     def _open_window(self) -> None:
-        if not self._updates:
-            self._tray.showMessage(
-                "Arch Update", "System is up to date.",
-                QSystemTrayIcon.MessageIcon.Information, 3000,
-            )
-            return
+        # The window always opens — even with nothing to update — so the
+        # Obsolete and Security tools are reachable from the main app.
         if self._window is not None:
             self._window.raise_()
             self._window.activateWindow()
@@ -3919,7 +5183,7 @@ class TrayApp(QObject):
         self._stop_fetcher()
         self._tray.setToolTip("Arch Update  —  system up to date")
         self._status_act.setText("System is up to date")
-        self._show_act.setEnabled(False)
+        self._show_act.setEnabled(True)
         QTimer.singleShot(5000, self.check_now)
 
     # ── System scan ──────────────────────────────────────────────────────────────
@@ -3940,7 +5204,7 @@ class TrayApp(QObject):
         )
 
     def _on_scan_done(self, results: list[dict]) -> None:
-        self._scanner = None
+        self._release_thread("_scanner")
         self._scan_act.setEnabled(True)
         n_comp = sum(1 for r in results if r["compromised"])
         n = len(results)
@@ -3973,6 +5237,48 @@ class TrayApp(QObject):
         self._scan_window = None
 
     # ── Obsolete packages cleanup ────────────────────────────────────────────────
+
+    # ── AUR → official moves ─────────────────────────────────────────────────
+    def open_moves(self) -> None:
+        """Scan for foreign packages also in the repos; prompt to switch."""
+        if self._moves_dialog is not None:
+            self._moves_dialog.raise_()
+            self._moves_dialog.activateWindow()
+            return
+        self._moves_act.setEnabled(False)
+        try:
+            moves = find_repo_moves()
+        except Exception:
+            moves = []
+        self._moves_act.setEnabled(True)
+        if not moves:
+            self._tray.showMessage(
+                "Arch Update",
+                "No installed AUR packages found in the official repos.",
+                QSystemTrayIcon.MessageIcon.Information, 5000,
+            )
+            return
+        names = ", ".join(m["name"] for m in moves[:5])
+        if len(moves) > 5:
+            names += f" (+{len(moves) - 5} more)"
+        self._tray.showMessage(
+            "Arch Update",
+            f"{len(moves)} AUR package{'s' if len(moves) != 1 else ''} also "
+            f"in official repos ({names}) — click Review to switch.",
+            QSystemTrayIcon.MessageIcon.Information, 8000,
+        )
+        self._moves_dialog = MovesDialog(moves)
+        self._moves_dialog.closed.connect(self._on_moves_closed)
+        self._moves_dialog.moves_done.connect(self._on_moves_done)
+        self._moves_dialog.show()
+        self._moves_dialog.raise_()
+        self._moves_dialog.activateWindow()
+
+    def _on_moves_closed(self) -> None:
+        self._moves_dialog = None
+
+    def _on_moves_done(self) -> None:
+        self.check_now()
 
     def remove_obsolete(self) -> None:
         """Proactively offer to remove packages dropped from the repositories."""

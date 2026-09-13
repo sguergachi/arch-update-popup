@@ -116,16 +116,22 @@ class TestDelegate:
     def test_size_hint_sane(self, view):
         opt, idx = _option(view, 0)
         h = view.itemDelegate().sizeHint(opt, idx).height()
-        assert 100 < h < 1500, h
+        assert 70 < h < 1500, h
 
     def test_layout_inside_card(self, view):
         d = view.itemDelegate()
         opt, idx = _option(view, 0)
         lay = d._layout(0, view.model().item(0), opt.rect.width())
         card = lay["card"]
-        for key in ("check", "name", "ver", "desc", "notes", "link"):
+        for key in ("check", "name", "ver", "desc", "notes", "link", "more"):
             r = lay[key]
+            if r.isNull():
+                continue
             assert card.left() <= r.left() and r.right() <= card.right(), key
+        # What's-new row shares one baseline: notes, more, link aligned
+        assert lay["notes"].top() == lay["link"].top()
+        if not lay["more"].isNull():
+            assert lay["more"].top() == lay["notes"].top()
 
     def test_checkbox_hit_toggles(self, view, qapp):
         d = view.itemDelegate()
@@ -220,3 +226,102 @@ class TestDelegate:
         monkeypatch.setattr(d, "_layout", lambda *a, **k: 1 / 0)
         opt, idx = _option(view, 0)
         assert d.sizeHint(opt, idx).height() == 120
+
+
+class TestTrackedModel:
+    def _model(self):
+        m = app.TrackedModel()
+        m.set_packages(
+            [{"name": "b-aur", "version": "1-1", "repo": "aur"},
+             {"name": "a-off", "version": "2-1", "repo": "official"},
+             {"name": "c-aur", "version": "3-1", "repo": "aur"}],
+            [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+              "relation": "upgrade"}])
+        return m
+
+    def test_sort_movable_first(self):
+        m = self._model()
+        assert m.rowCount() == 3
+        assert m.item(0)["name"] == "b-aur"
+        assert [m.item(r)["name"] for r in (1, 2)] == ["a-off", "c-aur"]
+
+    def test_movable_names(self):
+        assert self._model().movable_names() == ["b-aur"]
+
+    def test_state_signal(self):
+        m = self._model()
+        seen = []
+        m.dataChanged.connect(lambda *a: seen.append(a))
+        m.set_state("b-aur", "switching")
+        assert len(seen) == 1
+        assert m.item(0)["state"] == "switching"
+        m.set_state("nope", "done")  # unknown: silent no-op
+        assert len(seen) == 1
+
+    def test_display_role(self):
+        m = self._model()
+        assert m.data(m.index(0)) == "b-aur"
+
+
+@pytest.fixture()
+def tracked_view(qapp):
+    m = app.TrackedModel()
+    m.set_packages(
+        [{"name": "b-aur", "version": "1-1", "repo": "aur"},
+         {"name": "a-off", "version": "2-1", "repo": "official"}],
+        [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+          "relation": "upgrade"}])
+    v = QListView()
+    v.resize(900, 400)
+    v.setModel(m)
+    d = app.TrackedDelegate(v)
+    v.setItemDelegate(d)
+    v.show()
+    return v
+
+
+def _topt(view, row):
+    idx = view.model().index(row)
+    opt = QStyleOptionViewItem()
+    opt.rect = view.visualRect(idx)
+    opt.palette = view.palette()
+    opt.font = view.font()
+    return opt, idx
+
+
+class TestTrackedDelegate:
+    def test_size_hint(self, tracked_view):
+        opt, idx = _topt(tracked_view, 0)
+        assert tracked_view.itemDelegate().sizeHint(opt, idx).height() == 52
+
+    def test_action_only_when_movable(self, tracked_view):
+        d = tracked_view.itemDelegate()
+        opt, idx = _topt(tracked_view, 0)
+        lay = d._geom(0, tracked_view.model().item(0), opt.rect.width())
+        assert lay["action_txt"] == "Switch"
+        assert not lay["action"].isNull()
+        opt1, _ = _topt(tracked_view, 1)
+        lay1 = d._geom(1, tracked_view.model().item(1), opt1.rect.width())
+        assert lay1["action"].isNull()
+
+    def test_switch_hit(self, tracked_view, qapp):
+        d = tracked_view.itemDelegate()
+        opt, idx = _topt(tracked_view, 0)
+        lay = d._geom(0, tracked_view.model().item(0), opt.rect.width())
+        got = []
+        d.switch_requested.connect(got.append)
+        c = lay["action"].center() + opt.rect.topLeft()
+        ev = QMouseEvent(QEvent.Type.MouseButtonRelease, QPointF(c),
+                         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        assert d.editorEvent(ev, tracked_view.model(), opt, idx) is True
+        assert got == ["b-aur"]
+
+    def test_paint_ok(self, tracked_view, qapp):
+        d = tracked_view.itemDelegate()
+        opt, idx = _topt(tracked_view, 0)
+        pm = QPixmap(900, 100)
+        p = QPainter(pm)
+        d.paint(p, opt, idx)
+        p.end()
+        qapp.processEvents()
