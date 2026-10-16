@@ -1,4 +1,6 @@
 """Pure-logic tests: changelog detection, failure classification, helpers."""
+import os
+
 import pytest
 
 from conftest import load_app
@@ -330,17 +332,104 @@ class TestScanStopHook:
 
 
 class TestRunnerCommands:
-    def test_explicit_names_refresh_sync_dbs(self):
+    def test_explicit_names_refresh_sync_dbs(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: n == "sudo")
         r = app.UpdateRunner("paru", ["fzf", "konsole"])
         assert "-Sy" in r._cmd and "-Syu" not in r._cmd
+        r._cleanup()
         r = app.UpdateRunner(None, ["fzf"])
-        assert r._cmd[:3] == ["pkexec", "pacman", "-Sy"]
+        assert r._cmd[:4] == ["sudo", "-A", "pacman", "-Sy"]
+        assert "SUDO_ASKPASS" in r._child_env()
+        r._cleanup()
 
-    def test_full_upgrade_unchanged(self):
+    def test_full_upgrade_unchanged(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: n == "sudo")
         r = app.UpdateRunner("paru", None)
         assert "-Syu" in r._cmd
+        r._cleanup()
         r = app.UpdateRunner(None, None)
-        assert "-Syu" in r._cmd
+        assert r._cmd[:3] == ["sudo", "-A", "pacman"]
+        r._cleanup()
+
+
+class TestAskpass:
+    """Command shape + script lifecycle for privileged operations.
+
+    Never runs pacman/pkexec/sudo: only construction, env export and
+    file cleanup are exercised (the thread bodies are stubbed hermetic
+    in conftest anyway).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _sudo_present(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: n == "sudo")
+
+    def _remover(self, *args, **kw):
+        r = app.ObsoleteRemover(*args, **kw)
+        self._cleanup_later.append(r)
+        return r
+
+    def setup_method(self):
+        self._cleanup_later = []
+
+    def teardown_method(self):
+        for r in self._cleanup_later:
+            r._cleanup()
+
+    def test_remover_uses_sudo_askpass(self):
+        r = self._remover(["perplexity"])
+        assert r._cmd[0] == "sudo"
+        assert "-A" in r._cmd[:3]
+        assert r._cmd[2:4] == ["pacman", "-Rns"]
+        assert r._cmd[-1] == "--noconfirm"
+        env = r._child_env()
+        assert env["SUDO_ASKPASS"] == r._askpass
+        assert os.path.isfile(r._askpass)
+
+    def test_askpass_script_is_0700(self):
+        r = self._remover(["pkg"])
+        assert app.stat.S_IMODE(os.stat(r._askpass).st_mode) == 0o700
+
+    def test_askpass_removed_after_cleanup(self):
+        r = self._remover(["pkg"])
+        path = r._askpass
+        r._cleanup()
+        assert not os.path.exists(path)
+        assert r._askpass is None
+
+    def test_askpass_script_prefer_kdialog(self):
+        body = open(self._remover(["pkg"])._askpass).read()
+        assert "kdialog" in body
+        assert "zenity" in body  # fallback without kdialog
+
+    def test_remover_force_uses_rdd(self):
+        r = self._remover(["pkg"], force=True)
+        assert "-Rdd" in r._cmd and "-Rns" not in r._cmd
+
+    def test_no_sudo_falls_back_to_pkexec(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: False)
+        r = self._remover(["pkg"])
+        assert r._cmd[:2] == ["pkexec", "pacman"]
+        assert r._askpass is None
+        assert "SUDO_ASKPASS" not in r._child_env()
+        r = app.UpdateRunner(None, ["pkg"])
+        self._cleanup_later.append(r)
+        assert r._cmd[:2] == ["pkexec", "pacman"]
+        assert r._askpass is None
+
+    def test_update_runner_no_helper_uses_sudo(self):
+        r = app.UpdateRunner(None, ["fzf"])
+        self._cleanup_later.append(r)
+        assert r._cmd[0] == "sudo" and "-A" in r._cmd[:3]
+        assert r._cmd[2:4] == ["pacman", "-Sy"]
+
+    def test_pkexec_tty_error_classifies_cancelled(self):
+        kind = app.classify_update_failure(
+            "✕ Removing perplexity failed: Error creating textual "
+            "authentication agent: Error opening current controlling "
+            "terminal for the process (`/dev/tty'): "
+            "No such device or address")[0]
+        assert kind == "cancelled"
 
 
 class TestIcons:

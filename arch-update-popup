@@ -1188,7 +1188,11 @@ def classify_update_failure(output: str) -> tuple[str, str, str]:
                    "sorry, try again", "incorrect password",
                    "authentication failure", "authentication failed",
                    "not authorized", "not authorised",
+                   # pkexec without a running polkit agent falls back to its
+                   # textual agent, which needs a controlling TTY — absent
+                   # in a tray-launched GUI: nothing ran, so it's a cancel.
                    "no password was provided", "no authentication agent",
+                   "authentication agent", "controlling terminal",
                    "auth failed"):
         if needle in low:
             return _FAILURE_HINTS[0]
@@ -1753,6 +1757,46 @@ class SystemScanner(QThread):
         self.done.emit(results)
 
 
+# ── Privileged operations without a TTY ────────────────────────────────────
+#
+# This app is launched from the tray/systemd, so it has **no controlling
+# tty**: pkexec cannot work here. With no polkit agent running it falls
+# back to its *textual* authentication agent, which fails with
+# "Error opening current controlling terminal (/dev/tty): No such device
+# or address". Every privileged path therefore runs `sudo -A` (askpass)
+# with a GUI password dialog; pkexec remains only as a fallback for the
+# rare machine without sudo installed.
+
+def make_askpass_script(prompt: str) -> str:
+    """Write a temporary askpass helper for `sudo -A` and return its path.
+
+    sudo executes the askpass program detached from any terminal, so the
+    password must come from a GUI dialog: kdialog first (KDE), zenity as
+    the fallback, otherwise fail — nothing runs rather than hanging.
+    The caller owns the file and MUST unlink it in every exit path
+    (success, failure, terminate/kill).
+    """
+    safe = prompt.replace("'", "'\\''")
+    body = (
+        '#!/bin/bash\n'
+        '# GUI askpass for "sudo -A": the caller runs from the tray with\n'
+        '# no controlling TTY, so authentication needs a GUI dialog.\n'
+        f'prompt="${{1:-{safe}}}"\n'
+        'if command -v kdialog >/dev/null 2>&1; then\n'
+        '  exec kdialog --title "Arch Update" --password "$prompt" 2>/dev/null\n'
+        'fi\n'
+        'if command -v zenity >/dev/null 2>&1; then\n'
+        '  exec zenity --title "Arch Update" --password 2>/dev/null\n'
+        'fi\n'
+        'exit 1\n'
+    )
+    fd, path = tempfile.mkstemp(suffix=".sh", prefix="arch-update-askpass-")
+    with os.fdopen(fd, "w") as f:
+        f.write(body)
+    os.chmod(path, stat.S_IRWXU)  # 0700: only the owner may read the prompt
+    return path
+
+
 class UpdateRunner(QThread):
     """Runs the package update and streams per-package install progress."""
     install_progress = pyqtSignal(int, int, str)  # current, total, pkg_name
@@ -1773,30 +1817,35 @@ class UpdateRunner(QThread):
         # `-S pkg` installs whatever version the on-disk DBs hold, which
         # silently reinstalls the OLD version when the DBs are stale
         # (exit code 0, nothing upgraded, packages reappear next open).
+        prompt = "Enter sudo password to install updates:"
         if aur_helper:
-            fd, path = tempfile.mkstemp(suffix=".sh", prefix="arch-update-askpass-")
-            with os.fdopen(fd, "w") as f:
-                f.write(
-                    '#!/bin/bash\n'
-                    'kdialog --title "Arch Update" --password '
-                    '"${1:-Enter sudo password to install updates:}" 2>/dev/null\n'
-                )
-            os.chmod(path, stat.S_IRWXU)
-            self._askpass = path
+            self._askpass = make_askpass_script(prompt)
             if packages:
                 self._cmd = [aur_helper, "--sudoflags", "-A", "-Sy", *packages, "--noconfirm", *extra]
             else:
                 self._cmd = [aur_helper, "--sudoflags", "-A", "-Syu", "--noconfirm", *extra]
+        elif shutil.which("sudo"):
+            self._askpass = make_askpass_script(prompt)
+            if packages:
+                self._cmd = ["sudo", "-A", "pacman", "-Sy", *packages, "--noconfirm", *extra]
+            else:
+                self._cmd = ["sudo", "-A", "pacman", "-Syu", "--noconfirm", *extra]
         else:
+            # No sudo on the system: pkexec is the only way to authenticate.
             if packages:
                 self._cmd = ["pkexec", "pacman", "-Sy", *packages, "--noconfirm", *extra]
             else:
                 self._cmd = ["pkexec", "pacman", "-Syu", "--noconfirm", *extra]
 
-    def run(self) -> None:
+    def _child_env(self) -> dict:
+        """Environment for the child process, exporting SUDO_ASKPASS."""
         env = os.environ.copy()
         if self._askpass:
             env["SUDO_ASKPASS"] = self._askpass
+        return env
+
+    def run(self) -> None:
+        env = self._child_env()
 
         # Use a pty so paru/pacman think they're writing to a terminal and
         # flush output per line rather than buffering to the pipe.
@@ -1905,20 +1954,46 @@ class ObsoleteRemover(QThread):
         self._proc: subprocess.Popen | None = None
         self._killed = False
         op = "-Rdd" if force else "-Rns"
-        self._cmd = ["pkexec", "pacman", op, *packages, "--noconfirm"]
+        # Use `sudo -A` + askpass: we run from the tray with no controlling
+        # TTY, so pkexec fails with "Error opening current controlling
+        # terminal" unless a polkit agent is running.
+        if shutil.which("sudo"):
+            self._askpass = make_askpass_script(
+                "Enter sudo password to remove packages:")
+            self._cmd = ["sudo", "-A", "pacman", op, *packages, "--noconfirm"]
+        else:
+            self._askpass = None
+            self._cmd = ["pkexec", "pacman", op, *packages, "--noconfirm"]
+
+    def _child_env(self) -> dict:
+        """Environment for the child process, exporting SUDO_ASKPASS."""
+        env = os.environ.copy()
+        if self._askpass:
+            env["SUDO_ASKPASS"] = self._askpass
+        return env
+
+    def _cleanup(self) -> None:
+        if self._askpass:
+            try:
+                os.unlink(self._askpass)
+            except OSError:
+                pass
+            self._askpass = None
 
     def run(self) -> None:
+        env = self._child_env()
         master_fd, slave_fd = pty.openpty()
         try:
             proc = subprocess.Popen(
                 self._cmd,
                 stdout=slave_fd, stderr=slave_fd,
                 stdin=subprocess.DEVNULL,
-                close_fds=True,
+                env=env, close_fds=True,
             )
         except FileNotFoundError as e:
             os.close(master_fd)
             os.close(slave_fd)
+            self._cleanup()
             self.done.emit(False, str(e))
             return
 
@@ -1958,6 +2033,7 @@ class ObsoleteRemover(QThread):
             pass
 
         proc.wait()
+        self._cleanup()
         if self._killed:
             lines.append("Cancelled by user.")
         self.done.emit(proc.returncode == 0 and not self._killed,
@@ -6035,9 +6111,9 @@ class UpdateWindow(QMainWindow):
                 if self._track_model.row_of(n) is not None:
                     self._track_model.set_state(n, "idle")
             label = names[0] if len(names) == 1 else f"{len(names)} packages"
-            self._set_status(f"Removing {label} cancelled — nothing was "
-                             "changed.", "info")
-            self._log_action(f"Removing {label} cancelled")
+            self._set_status(
+                "Authentication was dismissed — nothing was changed.", "info")
+            self._log_action(f"Removing {label} cancelled by authentication")
             self._refresh_tracked_summary()
             self._update_view_badges()
             return
@@ -6371,9 +6447,9 @@ class UpdateWindow(QMainWindow):
             for n in names:
                 self._un_set_state(n, "idle")
             label = names[0] if len(names) == 1 else f"{len(names)} packages"
-            self._set_status(f"Removing {label} cancelled — nothing was "
-                             "changed.", "info")
-            self._log_action(f"Removing {label} cancelled")
+            self._set_status(
+                "Authentication was dismissed — nothing was changed.", "info")
+            self._log_action(f"Removing {label} cancelled by authentication")
             self._refresh_untracked_summary()
             self._update_view_badges()
             return
@@ -7269,9 +7345,10 @@ class UpdateWindow(QMainWindow):
         if not success:
             if classify_update_failure(output)[0] == "cancelled":
                 # Circuit breaker: auth dismissed — nothing was removed.
-                self._set_status("Removal cancelled — nothing was changed.",
-                                 "info")
-                self._log_action("Obsolete removal cancelled")
+                self._set_status(
+                    "Authentication was dismissed — nothing was changed.",
+                    "info")
+                self._log_action("Obsolete removal cancelled by authentication")
                 self._update_btn.setEnabled(True)
                 self._cancel_btn.setEnabled(True)
                 return

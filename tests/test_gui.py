@@ -378,11 +378,13 @@ class TestWindow:
         assert r.terminated is True
         assert window._single is None
 
-    def test_obsolete_remover_graceful_terminate(self):
+    def test_obsolete_remover_graceful_terminate(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: n == "sudo")
         r = app.ObsoleteRemover(["some-pkg"])
         assert r._proc is None
         r.terminate()  # no process yet — must not raise
         assert r._killed is True
+        r._cleanup()  # don't leak the askpass script in /tmp
 
     def test_stop_fetcher_parks_stuck_thread(self, qapp, monkeypatch):
         # A fetcher blocked in network I/O past the wait timeout must be
@@ -1477,14 +1479,15 @@ class TestViews:
         window._track_uninstaller.done.emit(False, "Request dismissed")
         qapp.processEvents()
         assert window._track_model.item(0)["state"] == "idle"
-        assert "cancelled" in window._sub.text().lower()
+        assert "dismissed" in window._sub.text().lower()
 
     def test_obsolete_removal_cancel_aborts_cleanly(self, window, qapp):
         window._remover = FakeRunner()
         window._on_obsolete_removal_done(False, "Request dismissed")
         qapp.processEvents()
         assert window._remover is None
-        assert "cancelled" in window._sub.text().lower()
+        assert "dismissed" in window._sub.text().lower()
+        assert "nothing was changed" in window._sub.text().lower()
         assert window._update_btn.isEnabled()
 
     def test_tracked_main_click_moves_when_unselected(
