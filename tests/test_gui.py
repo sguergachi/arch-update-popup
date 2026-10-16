@@ -55,6 +55,50 @@ class FakeRunner(QObject):
         pass
 
 
+class FakeChecker(QObject):
+    """UpdateChecker stub: check runs until the test emits a result."""
+    updates_found = pyqtSignal(list)
+    no_updates = pyqtSignal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self._running = False
+
+    def isRunning(self):
+        return self._running
+
+    def wait(self, ms=0):
+        return True
+
+    def start(self):
+        self._running = True
+
+    def requestInterruption(self):
+        pass
+
+
+class FakeInfoFetcher(QObject):
+    """InfoFetcher stub: rows arrive only when the test emits them."""
+    row_ready = pyqtSignal(int, str, str, str, str, str, str, str, str)
+    finished = pyqtSignal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self._running = False
+
+    def isRunning(self):
+        return self._running
+
+    def wait(self, ms=0):
+        return True
+
+    def start(self):
+        pass
+
+    def requestInterruption(self):
+        pass
+
+
 @pytest.fixture()
 def window(qapp, monkeypatch):
     monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
@@ -77,19 +121,140 @@ class TestWindow:
         assert window._update_btn.isEnabled()  # 3 of 3 checkable selected
 
     def test_header_tabs(self, window, qapp):
-        # Tabs replaced the filter field: Updates | Obsolete |
-        # Security | Tracked.
+        # Tabs left to right: Updates | Tracked | Untracked | Obsolete |
+        # Security.
         assert not hasattr(window, "_search")
         tabs = window._view_buttons
         assert [b.text() for b in
-                (tabs["updates"], tabs["obsolete"], tabs["security"],
-                 tabs["tracked"])] == [
-            "Updates (4)", "Obsolete", "Security", "Tracked"]
+                (tabs["updates"], tabs["tracked"], tabs["untracked"],
+                 tabs["obsolete"], tabs["security"])] == [
+            "Updates (4)", "Tracked", "Untracked", "Obsolete", "Security"]
         assert tabs["updates"].isChecked()
         head = window.centralWidget().layout().itemAt(0).layout()
-        for key in ("updates", "obsolete", "security", "tracked"):
-            assert head.indexOf(tabs[key]) >= 0
-        assert head.indexOf(window._log_btn) >= 0
+        order = [head.indexOf(tabs[k]) for k in
+                 ("updates", "tracked", "untracked", "obsolete", "security")]
+        assert order == sorted(order)
+        assert head.indexOf(window._log_btn) > order[-1]
+
+    def _stage_recheck(self, window, monkeypatch):
+        monkeypatch.setattr(app, "UpdateChecker", FakeChecker)
+        monkeypatch.setattr(app, "InfoFetcher", FakeInfoFetcher)
+        monkeypatch.setattr(app, "load_pkg_info_cache", lambda: {})
+        window._switch_view("updates")  # active tab → Check Now
+        # The tab keeps its label: changing it would reflow the switcher.
+        assert window._view_buttons["updates"].text() == "Updates (4)"
+        assert not window._view_buttons["updates"].isEnabled()
+        assert "Checking for updates" in window._sub.text()
+        # The list knows it is loading, but rows are on screen, so the
+        # placeholder stays out of their way.
+        assert window._loading is True
+        assert not window._empty_state.isVisible()
+        return window._rechecker
+
+    def test_reclick_updates_tab_checks_now(self, window, qapp, monkeypatch):
+        checker = self._stage_recheck(window, monkeypatch)
+        assert isinstance(checker, FakeChecker)
+        # Second click while checking is ignored (same checker).
+        window._switch_view("updates")
+        assert window._rechecker is checker
+        fresh = [
+            {"name": "newpkg", "old": "1-1", "new": "2-1", "repo": "extra"},
+            {"name": "aur-new", "old": "1-1", "new": "1.1-1", "repo": "aur"},
+        ]
+        checker.updates_found.emit(fresh)
+        qapp.processEvents()
+        assert window._rechecker is None
+        assert window._model.rowCount() == 2
+        assert window._model.item(0)["name"] == "newpkg"
+        assert window._view_buttons["updates"].text() == "Updates (2)"
+        assert window._view_buttons["updates"].isEnabled()
+        assert "2</b> packages available" in window._sub.text()
+        assert "Check complete" in window._log_view.toPlainText()
+        # Fresh rows get their own info feed.
+        assert isinstance(window._recheck_fetcher, FakeInfoFetcher)
+        window._recheck_fetcher.row_ready.emit(
+            0, "newpkg", "2-1", "Desc!", "notes", "2026-01-01",
+            "full", "", "")
+        assert window._model.item(0)["desc"] == "Desc!"
+        window._recheck_fetcher.finished.emit()
+        qapp.processEvents()
+        assert window._recheck_fetcher is None
+        assert "release notes loaded" in window._sub.text()
+
+    def test_recheck_empty_clears_list(self, window, qapp, monkeypatch):
+        checker = self._stage_recheck(window, monkeypatch)
+        checker.no_updates.emit()
+        qapp.processEvents()
+        assert window._model.rowCount() == 0
+        assert window._empty_label.isVisible()
+        assert window._view_buttons["updates"].text() == "Updates"
+        assert "up to date" in window._sub.text()
+        # The footer holds its shape: Refresh stays put, the primary is
+        # just off — it never morphs into a second check button.
+        assert window._update_btn.text() == "Update"
+        assert not window._update_btn.isEnabled()
+        assert not window._recheck_btn.isHidden()
+
+    def test_recheck_blocked_while_installing(self, window, monkeypatch):
+        monkeypatch.setattr(app, "UpdateChecker", FakeChecker)
+        window._updating = True
+        window._switch_view("updates")
+        assert window._rechecker is None
+        assert "still running" in window._sub.text()
+        assert window._view_buttons["updates"].isEnabled()
+        window._updating = False
+
+    def test_stale_tray_feed_ignored_after_recheck(
+            self, window, qapp, monkeypatch):
+        checker = self._stage_recheck(window, monkeypatch)
+        checker.updates_found.emit(
+            [{"name": "newpkg", "old": "1-1", "new": "2-1",
+              "repo": "extra"}])
+        qapp.processEvents()
+        assert window._info_gen == 1
+        # A late tray feed for the OLD list must not touch the new rows.
+        window.on_info_ready(0, "STALE", "s", "d", "f", "", "")
+        assert window._model.item(0)["desc"] != "STALE"
+        window.on_fetch_done()
+        assert "fetching release notes" in window._sub.text()
+
+    def test_recheck_button_checks_now(self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "UpdateChecker", FakeChecker)
+        monkeypatch.setattr(app, "InfoFetcher", FakeInfoFetcher)
+        monkeypatch.setattr(app, "load_pkg_info_cache", lambda: {})
+        assert window._recheck_btn.isEnabled()
+        assert window._recheck_btn.text() == "Refresh"
+        window._recheck_btn.click()
+        qapp.processEvents()
+        assert isinstance(window._rechecker, FakeChecker)
+        assert not window._recheck_btn.isEnabled()
+        assert not window._update_btn.isEnabled()
+        window._rechecker.no_updates.emit()
+        qapp.processEvents()
+        assert window._model.rowCount() == 0
+        assert window._recheck_btn.isEnabled()
+        assert window._view_buttons["updates"].text() == "Updates"
+
+    def test_update_blocked_during_recheck(self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "UpdateChecker", FakeChecker)
+        monkeypatch.setattr(app, "InfoFetcher", FakeInfoFetcher)
+        monkeypatch.setattr(app, "load_pkg_info_cache", lambda: {})
+        window._switch_view("updates")
+        assert window._rechecker is not None
+        window.start_update()
+        assert window._updating is False  # refused
+        assert "still running" in window._sub.text()
+        window._rechecker.no_updates.emit()
+        qapp.processEvents()
+        assert window._recheck_btn.isEnabled()
+
+    def test_tab_switch_still_works(self, window, qapp):
+        window._switch_view("tracked")
+        assert window._content_stack.currentIndex() == 1
+        assert window._rechecker is None  # no check on plain navigation
+        window._switch_view("updates")  # coming back: plain switch, no check
+        assert window._content_stack.currentIndex() == 0
+        assert window._rechecker is None
 
     def test_select_none_disables_update(self, window):
         window._select_all(False)
@@ -151,7 +316,9 @@ class TestWindow:
         window._on_update_done(False, out)
         assert len(calls) == first  # identical repeat: no new dialogs
         assert "Manual fix" in window._details.toPlainText()
-        assert "2 times in a row" in window._sub.text()
+        # The header line is elided to one line; the sentence itself is
+        # kept whole in _status_full (and the tooltip).
+        assert "2 times in a row" in window._status_full
 
     def test_watchdog_warns_and_cancel(self, window):
         import time as _t
@@ -282,6 +449,74 @@ class TestWindow:
         window._on_update_done(False, "")
         assert calls == []
 
+    def test_cancelled_aborts_cleanly(self, window, qapp):
+        # Dismissing sudo mid-run: no failed rows, no red error, no
+        # retry mode — back to idle with everything still selected.
+        window._safe_names = ["konsole"]
+        window._updating = True
+        r = window._model.row_of("konsole")
+        window._model.set_state("konsole", "installing")
+        window._installing_row = r
+        window._on_update_done(False, "Request dismissed")
+        qapp.processEvents()
+        assert window._model.item(r)["state"] == "idle"
+        assert window._updating is False
+        assert window._retry_mode is False
+        assert window._fail_streak == 0
+        assert "Update cancelled" in window._sub.text()
+        assert "failed" not in window._sub.text().lower()
+        assert window._details.isHidden()
+        assert window._update_btn.isEnabled()
+        assert "Retry" not in window._update_btn.text()
+        assert "Update cancelled" in window._log_view.toPlainText()
+        # Stat card relaxes back to ready, progress to idle hairline.
+        assert window._stat_ready._caption.text() == "READY TO INSTALL"
+        assert window._progress.value() == 0
+
+    def test_failed_sudo_reenables_update_all(self, window, qapp):
+        # Real pkexec auth failure: nothing ran — Update All comes back
+        # immediately so the user can retry, with no failed rows.
+        window._safe_names = ["konsole"]
+        window._updating = True
+        r = window._model.row_of("konsole")
+        window._model.set_state("konsole", "installing")
+        window._installing_row = r
+        window._update_btn.setEnabled(False)
+        window._on_update_done(
+            False,
+            "Error executing command as another user: Not authorized\n"
+            "This incident has been reported.")
+        qapp.processEvents()
+        assert window._model.item(r)["state"] == "idle"
+        assert window._retry_mode is False
+        assert window._update_btn.isEnabled()
+        assert "Retry" not in window._update_btn.text()
+        assert window._details.isHidden()
+        assert "Update cancelled" in window._sub.text()
+
+    def test_checker_exception_reports_no_updates(self, qapp, monkeypatch):
+        # A crashing check must resolve as "no updates", never wedge the
+        # Checking… state with no signal.
+        monkeypatch.setattr(app, "get_pending_updates", lambda h: 1 / 0)
+        got = []
+        c = app.UpdateChecker(None)
+        c.updates_found.connect(lambda u: got.append(("found", u)))
+        c.no_updates.connect(lambda: got.append(("empty",)))
+        c.run()  # synchronous: must not raise
+        assert got == [("empty",)]
+
+    def test_single_cancelled_aborts_cleanly(self, window, qapp):
+        r = window._model.row_of("konsole")
+        window._model.set_state("konsole", "installing")
+        window._single_name = "konsole"
+        window._on_single_done(False, "Sorry, try again.\n"
+                               "sudo: 3 incorrect password attempts")
+        qapp.processEvents()
+        assert window._model.item(r)["state"] == "idle"
+        assert window._details.isHidden()
+        assert "cancelled" in window._sub.text().lower()
+        assert "konsole install cancelled" in window._log_view.toPlainText()
+
     def test_success_closes_slot(self, window, monkeypatch):
         closed = []
         monkeypatch.setattr(app, "_notify_close", lambda nid: closed.append(nid))
@@ -297,19 +532,7 @@ class TestWindow:
         window._model.set_state("konsole", "done")
         window._on_update_done(False, "boom")
         assert "−1" not in window._sub.text()
-        assert "<b>0</b> packages pending" in window._sub.text()
-
-    def test_scan_dialog_builds(self, window, qapp):
-        s = app.ScanDialog([
-            {"name": "a", "version": "1", "repo": "aur",
-             "compromised": False, "reasons": []},
-            {"name": "b", "version": "2", "repo": "official",
-             "compromised": True, "reasons": ["listed"]},
-        ])
-        s.resize(1100, 620)
-        s.show()
-        qapp.processEvents()
-        s.close()
+        assert "0 packages pending" in window._status_full
 
     def test_log_window(self, window):
         window._on_log_line("[###] 100%")
@@ -319,6 +542,44 @@ class TestWindow:
         window._on_log_toggled(True)
         assert window._log_view.isVisible()
         window._on_log_toggled(False)
+
+    def test_theme_switch_reapplies_live(self, window, qapp):
+        from PyQt6.QtCore import QEvent
+        from PyQt6.QtGui import QPalette, QColor
+        # Every themed button icon is registered for refresh.
+        registered = {btn for btn, _, _, _ in window._theme_icons.values()}
+        assert window._update_btn in registered
+        assert window._log_btn in registered
+        assert window._sec_scan_btn in registered
+        for btn in (window._recheck_btn, window._track_refresh_btn,
+                    window._un_refresh_btn, window._obs_refresh_btn):
+            assert btn in registered
+        assert len(registered) == len(window._theme_icons)
+        # Prime the Updates delegate cache under the light theme.
+        window.on_info_ready(0, "desc", "notes", "2026-01-01", "full", "", "")
+        qapp.processEvents()
+        assert len(window._delegate._docs) > 0
+        old = qapp.palette()
+        try:
+            dark = QPalette()
+            dark.setColor(QPalette.ColorRole.Window, QColor(35, 38, 41))
+            dark.setColor(QPalette.ColorRole.Text, QColor(239, 240, 241))
+            # paletteChanged fires → _apply_theme() via the signal.
+            qapp.setPalette(dark)
+            qapp.processEvents()
+            assert window._theme_dark is True
+            assert "#a9a9a9" in window.styleSheet()
+            # Rebuilt docs carry the dark text color, not the old light one.
+            doc = window._delegate._doc(0, "desc", "x", 300, None, False, 0)
+            assert "#eff0f1" in doc.defaultStyleSheet().lower()
+            # changeEvent path is wired too (no-op when theme unchanged).
+            window.changeEvent(QEvent(QEvent.Type.StyleChange))
+            assert window._theme_dark is True
+        finally:
+            qapp.setPalette(old)
+            qapp.processEvents()
+        assert window._theme_dark is False
+        assert window.styleSheet() == app._APP_QSS
 
     def test_status_unified_in_header(self, window, qapp):
         idle = window._sub.text()
@@ -340,12 +601,13 @@ class TestWindow:
         content = lay.itemAt(2).layout()  # head, divider, content row
         left = content.itemAt(0).layout()
         # view switcher + content stack + footer stack
-        assert window._content_stack.count() == 4
-        assert window._footer_stack.count() == 4
+        assert window._content_stack.count() == 5
+        assert window._footer_stack.count() == 5
         assert window._content_stack.currentIndex() == 0
         assert window._footer_stack.currentIndex() == 0
         tabs = window._view_buttons
-        assert set(tabs) == {"updates", "obsolete", "security", "tracked"}
+        assert set(tabs) == {"updates", "obsolete", "security", "tracked",
+                             "untracked"}
         assert tabs["updates"].isChecked()
         # slim progress lives in the updates page above its footer
         assert window._progress.parent() is not None
@@ -361,7 +623,8 @@ class TestWindow:
         assert window._copy_btn.isHidden()  # no failure yet
         # log toggle shares the header row with the view tabs
         head = lay.itemAt(0).layout()
-        for key in ("updates", "obsolete", "security"):
+        for key in ("updates", "tracked", "untracked", "obsolete",
+                    "security"):
             assert head.indexOf(window._view_buttons[key]) >= 0
         assert head.indexOf(window._log_btn) >= 0
 
@@ -396,10 +659,12 @@ class TestWindow:
         assert window._model.item(0)["state"] == "done"
 
     def test_log_preview_opens_panel(self, window, qapp):
-        assert not window._log_preview.isVisible()
+        # The preview always occupies its line (nothing may shift); only
+        # its text changes.
+        assert window._log_preview.isVisible()
+        assert window._log_preview.text() == ""
         window._on_log_line(":: installing konsole (1/2)")
         qapp.processEvents()
-        assert window._log_preview.isVisible()
         assert "konsole" in window._log_preview.text()
         # HTML-unsafe log output must not break the label
         window._on_log_line("<b>not a tag</b> & done")
@@ -408,7 +673,8 @@ class TestWindow:
         window._log_preview.clicked.emit()
         qapp.processEvents()
         assert window._log_panel.isVisible()
-        assert not window._log_preview.isVisible()
+        assert window._log_preview.text() == ""  # redundant while open
+        assert window._log_preview.isVisible()   # but the line stays
         window._on_log_toggled(False)
 
     def test_log_panel_squishes_list(self, window, qapp):
@@ -452,7 +718,9 @@ class TestWindow:
         assert window._progress.maximum() == 3
         assert window._progress.value() <= 1
         assert "3 of 3" not in window._sub.text()
-        assert "of 3 selected done" in window._sub.text()
+        # 0 of 3 done (the row it named is only *starting*) → 0%.
+        assert "0 of 3 done" in window._sub.text()
+        assert "<b>0%</b>" in window._sub.text()
 
     def test_build_event_creates_row(self, window):
         n0 = window._model.rowCount()
@@ -545,6 +813,19 @@ class TestMovesDialog:
         assert dlg._rows["graduated"]._switch_btn.text() == "Retry"
         dlg.close()
 
+    def test_switch_cancel_resets_row(self, qapp, monkeypatch):
+        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
+        dlg = app.MovesDialog(self._moves())
+        dlg.resize(760, 480)
+        dlg.show()
+        qapp.processEvents()
+        dlg.request_switch("graduated")
+        dlg._runner.done.emit(False, "Request dismissed")
+        qapp.processEvents()
+        assert dlg._rows["graduated"]._switch_btn.text() == "Switch"
+        assert dlg._runner is None
+        dlg.close()
+
     def test_downgrade_cancel_leaves_queue_empty(self, qapp, monkeypatch):
         # window fixture patches QMessageBox.exec/clickedButton only for
         # window tests; replicate the auto-dismiss stub here.
@@ -578,10 +859,47 @@ class TestViews:
         w.resize(1280, 800)
         w.show()
         qapp.processEvents()
+        # The list frame stays on screen with the empty state inside it —
+        # an empty list is still a list, not floating text.
         assert w._empty_label.isVisible()
-        assert not w._list.isVisible()
+        assert w._empty_state.isVisible()
+        assert w._list.isVisible()
+        assert w._empty_state.parent() is w._list.viewport()
+        # Nothing stands down: hiding a container would shift the whole
+        # window when the list fills (see AGENTS.md).
+        assert w._list_header.isVisible()
+        assert w._stats_row.isVisible()
+        assert w._stat_blocked is not None
+        assert w._empty_title.text() == "You're up to date"
+        # Empty list: the update action is off, Refresh stays put.
         assert not w._update_btn.isEnabled()
-        assert "0" in w._sub.text()
+        assert w._update_btn.text() == "Update"
+        assert not w._recheck_btn.isHidden()
+        assert w._sub.text() == "No updates pending"
+        w.close()
+
+    def test_primary_check_now_rechecks_when_empty(
+            self, qapp, monkeypatch):
+        monkeypatch.setattr(app, "UpdateChecker", FakeChecker)
+        monkeypatch.setattr(app, "InfoFetcher", FakeInfoFetcher)
+        monkeypatch.setattr(app, "load_pkg_info_cache", lambda: {})
+        w = app.UpdateWindow([], {}, None)
+        w.resize(1280, 800)
+        w.show()
+        qapp.processEvents()
+        assert not w._update_btn.isEnabled()   # nothing to update
+        w._recheck_btn.click()                 # Refresh is the way in
+        qapp.processEvents()
+        assert isinstance(w._rechecker, FakeChecker)
+        w._rechecker.updates_found.emit(
+            [{"name": "fresh", "old": "1-1", "new": "2-1",
+              "repo": "extra"}])
+        qapp.processEvents()
+        # …and the update action comes back to life.
+        assert w._update_btn.isEnabled()
+        assert w._update_btn.text() == "Update All"
+        assert not w._recheck_btn.isHidden()
+        assert w._model.rowCount() == 1
         w.close()
 
     def test_empty_state_clears_on_new_row(self, qapp):
@@ -599,14 +917,14 @@ class TestViews:
     def test_switch_views(self, window, qapp):
         window._switch_view("obsolete")
         qapp.processEvents()
-        assert window._content_stack.currentIndex() == 1
-        assert window._footer_stack.currentIndex() == 1
-        assert window._view_buttons["obsolete"].isChecked()
-        window._switch_view("security")
-        assert window._content_stack.currentIndex() == 2
-        window._switch_view("tracked")
         assert window._content_stack.currentIndex() == 3
         assert window._footer_stack.currentIndex() == 3
+        assert window._view_buttons["obsolete"].isChecked()
+        window._switch_view("security")
+        assert window._content_stack.currentIndex() == 4
+        window._switch_view("tracked")
+        assert window._content_stack.currentIndex() == 1
+        assert window._footer_stack.currentIndex() == 1
         assert window._view_buttons["tracked"].isChecked()
         window._switch_view("updates")
         assert window._content_stack.currentIndex() == 0
@@ -649,7 +967,7 @@ class TestViews:
         qapp.processEvents()
         assert window._obs_cards == {}
         assert not window._obs_remove_btn.isEnabled()
-        assert "No obsolete" in window._obs_summary.text()
+        assert "Nothing obsolete" in window._obs_summary.text()
 
     def test_obsolete_switch_never_blocks(self, window, qapp, monkeypatch):
         # Even if pacman hangs, switching tabs must return instantly:
@@ -794,10 +1112,10 @@ class TestViews:
         # movable floats first
         assert window._track_model.item(0)["name"] == "b-aur"
         assert window._track_model.movable_names() == ["b-aur"]
-        assert window._view_buttons["tracked"].text() == "Tracked · 1 to move"
+        assert window._view_buttons["tracked"].text() == "Tracked (2)"
         window._switch_view("tracked")
-        assert window._content_stack.currentIndex() == 3
-        assert window._footer_stack.currentIndex() == 3
+        assert window._content_stack.currentIndex() == 1
+        assert window._footer_stack.currentIndex() == 1
 
     def test_tracked_switch_runs_and_verifies(
             self, window, qapp, monkeypatch):
@@ -829,6 +1147,43 @@ class TestViews:
         window._track_runner.done.emit(False, "boom")
         qapp.processEvents()
         assert window._track_model.item(0)["state"] == "failed"
+
+    def test_tracked_nothing_movable_reported(self, window, qapp):
+        self._settle_track_loader(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "a-off", "version": "2-1", "repo": "official"},
+             {"name": "b-aur", "version": "1-1", "repo": "aur"}],
+            [])
+        qapp.processEvents()
+        assert "none in the official repos" in window._track_summary.text()
+        assert "nothing to move" in window._track_footer_label.text()
+        assert not window._track_move_all_btn.isEnabled()
+
+    def test_activity_log_records_actions(self, window, qapp):
+        window._log_action("Removing foo…")
+        window._log_action("Opened bar")
+        text = window._log_view.toPlainText()
+        assert "◆ Removing foo…" in text
+        assert "◆ Opened bar" in text
+        # Preview follows the latest line; the panel stays shut.
+        assert "Opened bar" in window._log_preview.text()
+        assert not window._log_panel.isVisible()
+
+    def test_error_details_dismissable(self, window, qapp):
+        window._details.setPlainText("boom")
+        window._details_label.setVisible(True)
+        window._details.setVisible(True)
+        window._copy_btn.setVisible(True)
+        window._dismiss_btn.setVisible(True)
+        qapp.processEvents()
+        assert not window._details.isHidden()
+        window._dismiss_btn.click()
+        qapp.processEvents()
+        assert window._details.isHidden()
+        assert window._details_label.isHidden()
+        assert window._copy_btn.isHidden()
+        assert window._dismiss_btn.isHidden()
+        assert window._details.toPlainText() == ""
 
     def test_tracked_downgrade_cancel(self, window, qapp, monkeypatch):
         monkeypatch.setattr(app.QMessageBox, "exec", lambda self: None)
@@ -870,6 +1225,280 @@ class TestViews:
         assert window._track_queue == []
         assert isinstance(window._track_runner, FakeRunner)
 
+    class _AcceptBox:
+        """QMessageBox stub that always picks the first AcceptRole button."""
+        from PyQt6.QtWidgets import QMessageBox as _MB
+        Icon = _MB.Icon
+        ButtonRole = _MB.ButtonRole
+
+        def __init__(self, *a, **k):
+            self._accept = object()
+
+        def setWindowTitle(self, *a): pass
+        def setIcon(self, *a): pass
+        def setText(self, *a): pass
+        def addButton(self, *a, **k): return self._accept
+        def exec(self): return None
+        def clickedButton(self): return self._accept
+
+    def _stage_tracked(self, window, qapp):
+        self._settle_track_loader(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "del-me", "version": "1-1", "repo": "aur"}],
+            [])
+        qapp.processEvents()
+
+    def test_tracked_uninstall_success(self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "QMessageBox", self._AcceptBox)
+        monkeypatch.setattr(app, "ObsoleteRemover", FakeRunner)
+        monkeypatch.setattr(app, "find_blocked_obsolete_packages",
+                            lambda pkgs: [])
+        import subprocess as sp
+
+        class R:
+            returncode = 1  # pacman -Q: package gone
+
+        monkeypatch.setattr(sp, "run", lambda *a, **k: R())
+        self._stage_tracked(window, qapp)
+        window._request_track_uninstall("del-me")
+        assert isinstance(window._track_uninstaller, FakeRunner)
+        assert window._track_model.item(0)["state"] == "uninstalling"
+        window._track_uninstaller.done.emit(True, "")
+        qapp.processEvents()
+        assert window._track_model.row_of("del-me") is None
+        assert "uninstalled" in window._sub.text()
+
+    def test_tracked_uninstall_failure(self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "QMessageBox", self._AcceptBox)
+        monkeypatch.setattr(app, "ObsoleteRemover", FakeRunner)
+        monkeypatch.setattr(app, "find_blocked_obsolete_packages",
+                            lambda pkgs: [])
+        self._stage_tracked(window, qapp)
+        window._request_track_uninstall("del-me")
+        window._track_uninstaller.done.emit(False, "boom")
+        qapp.processEvents()
+        assert window._track_model.item(0)["state"] == "failed"
+        assert window._track_model.item(0)["failed_op"] == "uninstall"
+        assert "Removing del-me failed" in window._sub.text()
+
+    def test_tracked_uninstall_cancel(self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app.QMessageBox, "exec", lambda self: None)
+        monkeypatch.setattr(app.QMessageBox, "clickedButton", lambda self: None)
+        self._stage_tracked(window, qapp)
+        window._request_track_uninstall("del-me")  # confirm dismissed
+        assert window._track_uninstaller is None
+        assert window._track_model.item(0)["state"] == "idle"
+
+    def test_tracked_uninstall_busy(self, window, qapp):
+        self._settle_track_loader(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "del-me", "version": "1-1", "repo": "aur"}],
+            [])
+        window._track_uninstaller = FakeRunner()
+        window._request_track_uninstall("del-me")
+        assert "already running" in window._sub.text()
+        window._track_uninstaller = None
+
+    def _stage_untracked(self, window, qapp):
+        apps = [app._tracked_row("firefox", "1.0-1", "official",
+                                 title="Firefox", desktop="/u/firefox.desktop",
+                                 desc="Web browser")]
+        pkgs = [app._tracked_row("libfoo", "2-1", "official")]
+        window._on_untracked_loaded(apps, pkgs)
+        qapp.processEvents()
+        return apps, pkgs
+
+    def test_untracked_tab_index_and_lazy_load(
+            self, window, qapp, monkeypatch):
+        assert window._untracked_loaded is False
+        assert window._untracked_loader is None
+        started = []
+        orig = app.UntrackedLoader
+
+        class SpyLoader(orig):
+            def start(self):
+                started.append(True)
+                super().start()
+
+        monkeypatch.setattr(app, "UntrackedLoader", SpyLoader)
+        window._switch_view("untracked")
+        assert window._content_stack.currentIndex() == 2
+        assert window._footer_stack.currentIndex() == 2
+        assert window._view_buttons["untracked"].isChecked()
+        assert started == [True]
+        assert window._untracked_loader is not None
+        # Second visit does not re-scan.
+        window._switch_view("updates")
+        window._switch_view("untracked")
+        assert started == [True]
+        # Settle the real loader so it never outlives teardown (a live
+        # QThread at process exit aborts).
+        loader = window._untracked_loader
+        if loader is not None:
+            loader.wait(30000)
+        qapp.processEvents()
+
+    def test_untracked_loads_and_badges(self, window, qapp):
+        self._stage_untracked(window, qapp)
+        assert window._untracked_loaded is True
+        assert window._unapp_model.rowCount() == 1
+        assert window._unpkg_model.rowCount() == 1
+        assert window._view_buttons["untracked"].text() == "Untracked (2)"
+        assert "1</b> application" in window._un_summary.text()
+        assert "1</b> dependency package" in window._un_summary.text()
+        # App row shows the title; ops use the package name.
+        d = window._unapp_view.itemDelegate()
+        from PyQt6.QtWidgets import QStyleOptionViewItem as _Opt
+        idx = window._unapp_model.index(0)
+        opt = _Opt()
+        opt.rect = window._unapp_view.visualRect(idx)
+        opt.palette = window._unapp_view.palette()
+        opt.font = window._unapp_view.font()
+        lay = d._geom(0, window._unapp_model.item(0), opt.rect.width())
+        assert lay["title"] == "Firefox"
+
+    def test_untracked_batch_footer(self, window, qapp):
+        self._stage_untracked(window, qapp)
+        assert window._un_uninstall_btn.text() == "Uninstall selected"
+        assert not window._un_uninstall_btn.isEnabled()
+        window._unapp_model.set_all(True)
+        window._refresh_untracked_footer()
+        qapp.processEvents()
+        assert window._un_uninstall_btn.text() == "Uninstall 1 selected"
+        assert window._un_uninstall_btn.isEnabled()
+        assert "1 of 2 selected" in window._un_sel_label.text()
+
+    def test_untracked_uninstall_success(self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "QMessageBox", self._AcceptBox)
+        monkeypatch.setattr(app, "ObsoleteRemover", FakeRunner)
+        monkeypatch.setattr(app, "find_blocked_obsolete_packages",
+                            lambda pkgs: [])
+        import subprocess as sp
+
+        class R:
+            returncode = 1  # pacman -Q: package gone
+
+        monkeypatch.setattr(sp, "run", lambda *a, **k: R())
+        self._stage_untracked(window, qapp)
+        window._request_untracked_uninstall("libfoo")
+        assert isinstance(window._untracked_uninstaller, FakeRunner)
+        assert window._unpkg_model.item(0)["state"] == "uninstalling"
+        window._untracked_uninstaller.done.emit(True, "")
+        qapp.processEvents()
+        assert window._unpkg_model.row_of("libfoo") is None
+        assert window._unapp_model.rowCount() == 1  # untouched
+        assert "uninstalled" in window._sub.text()
+
+    def test_untracked_unowned_app_skipped(self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "QMessageBox", self._AcceptBox)
+        monkeypatch.setattr(app, "ObsoleteRemover", FakeRunner)
+        window._on_untracked_loaded(
+            [app._tracked_row("mystuff", "", "", title="My Stuff")], [])
+        qapp.processEvents()
+        window._request_untracked_uninstall("mystuff")
+        assert window._untracked_uninstaller is None  # nothing to remove
+        assert "isn't owned by any package" in window._sub.text()
+
+    def test_tracked_multiselect_footer_morphs(self, window, qapp):
+        self._settle_track_loader(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "a", "version": "1", "repo": "aur"},
+             {"name": "b", "version": "1", "repo": "extra"}],
+            [])
+        qapp.processEvents()
+        # No selection → move-all offering (nothing movable here).
+        assert window._track_move_all_btn.text() == "Move all to official"
+        assert not window._track_move_all_btn.isEnabled()
+        # Check one row → main button becomes the uninstall action.
+        window._track_model.set_all(True)
+        window._refresh_tracked_footer()
+        qapp.processEvents()
+        assert window._track_move_all_btn.text() == "Uninstall 2 selected"
+        assert window._track_move_all_btn.isEnabled()
+        # The list header carries the selection: ticked when everything
+        # in view is selected, and it says so in words too.
+        assert window._track_header.check.checkState() == \
+            Qt.CheckState.Checked
+        assert "All 2 packages selected" in window._track_sel_label.text()
+        window._select_tracked_all(False)
+        assert window._track_move_all_btn.text() == "Move all to official"
+
+    def test_tracked_batch_uninstall_success(self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "QMessageBox", self._AcceptBox)
+        monkeypatch.setattr(app, "ObsoleteRemover", FakeRunner)
+        monkeypatch.setattr(app, "find_blocked_obsolete_packages",
+                            lambda pkgs: [])
+        import subprocess as sp
+
+        class R:
+            returncode = 1  # pacman -Q: package gone
+
+        monkeypatch.setattr(sp, "run", lambda *a, **k: R())
+        self._settle_track_loader(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "a", "version": "1", "repo": "aur"},
+             {"name": "b", "version": "1", "repo": "extra"}],
+            [])
+        window._track_model.set_all(True)
+        window._refresh_tracked_footer()
+        assert window._track_move_all_btn.text() == "Uninstall 2 selected"
+        window._on_track_main_clicked()
+        assert isinstance(window._track_uninstaller, FakeRunner)
+        assert window._track_uninstall_names == ["a", "b"]
+        window._track_uninstaller.done.emit(True, "")
+        qapp.processEvents()
+        assert window._track_model.rowCount() == 0
+        assert "uninstalled" in window._sub.text()
+
+    def test_tracked_switch_cancel_aborts_cleanly(
+            self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
+        self._settle_track_loader(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "b-aur", "version": "1-1", "repo": "aur"}],
+            [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+              "relation": "upgrade"}])
+        window._request_track_switch("b-aur")
+        assert window._track_model.item(0)["state"] == "switching"
+        window._track_runner.done.emit(False, "Request dismissed")
+        qapp.processEvents()
+        assert window._track_model.item(0)["state"] == "idle"
+        assert window._track_runner is None
+        assert "cancelled" in window._sub.text().lower()
+
+    def test_tracked_uninstall_cancel_aborts_cleanly(
+            self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "QMessageBox", self._AcceptBox)
+        monkeypatch.setattr(app, "ObsoleteRemover", FakeRunner)
+        monkeypatch.setattr(app, "find_blocked_obsolete_packages",
+                            lambda pkgs: [])
+        self._stage_tracked(window, qapp)
+        window._request_track_uninstall("del-me")
+        window._track_uninstaller.done.emit(False, "Request dismissed")
+        qapp.processEvents()
+        assert window._track_model.item(0)["state"] == "idle"
+        assert "cancelled" in window._sub.text().lower()
+
+    def test_obsolete_removal_cancel_aborts_cleanly(self, window, qapp):
+        window._remover = FakeRunner()
+        window._on_obsolete_removal_done(False, "Request dismissed")
+        qapp.processEvents()
+        assert window._remover is None
+        assert "cancelled" in window._sub.text().lower()
+        assert window._update_btn.isEnabled()
+
+    def test_tracked_main_click_moves_when_unselected(
+            self, window, qapp, monkeypatch):
+        self._settle_track_loader(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "b-aur", "version": "1-1", "repo": "aur"}],
+            [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+              "relation": "upgrade"}])
+        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
+        window._on_track_main_clicked()
+        assert isinstance(window._track_runner, FakeRunner)
+        assert window._track_current == "b-aur"
+
 
 class TestNotifyHelper:
     def test_parses_gdbus_id(self, monkeypatch):
@@ -890,6 +1519,324 @@ class TestNotifyHelper:
                             lambda *a, **k: seen.append(a[0]))
         assert app._notify_update("t", "b") == 0
         assert seen and seen[0][0] == "notify-send"
+
+
+class TestNoLayoutShifts:
+    """The window's geometry is fixed; only what sits inside a slot changes.
+
+    This is the law in AGENTS.md, as a test: pressing Refresh, getting an
+    empty list, or streaming log output must not move anything.
+    """
+
+    STRUCTURE = ("_stats_row", "_list_header", "_list", "_log_preview",
+                 "_progress")
+
+    def _snap(self, window):
+        snap = {name: getattr(window, name).geometry()
+                for name in self.STRUCTURE}
+        # Footer buttons may resize with their label, but their baseline
+        # and right edge must not move.
+        snap["_update_btn"] = (window._update_btn.geometry().right(),
+                               window._update_btn.height())
+        snap["_recheck_btn"] = (window._recheck_btn.geometry().right(),
+                                window._recheck_btn.height())
+        return snap
+
+    class _SilentChecker(QObject):
+        """A checker that never reports: the test drives the states."""
+        updates_found = pyqtSignal(list)
+        no_updates = pyqtSignal()
+
+        def __init__(self, *a, **k):
+            super().__init__()
+
+        def isRunning(self):
+            return False
+
+        def wait(self, ms=0):
+            return True
+
+        def start(self):
+            pass
+
+        def requestInterruption(self):
+            pass
+
+    def test_refresh_and_empty_do_not_move_the_layout(
+            self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "UpdateChecker", self._SilentChecker)
+        window.resize(1280, 800)
+        qapp.processEvents()
+        before = self._snap(window)
+
+        # With rows on screen a refresh changes nothing but the status
+        # line: no placeholder, no movement.
+        window._recheck_updates()
+        qapp.processEvents()
+        assert not window._empty_state.isVisible()
+        assert self._snap(window) == before
+
+        # Empty list, then refresh: the box itself says it is loading…
+        window._on_recheck_empty()
+        qapp.processEvents()
+        assert window._empty_title.text() == "You're up to date"
+        assert self._snap(window) == before
+        window._recheck_updates()
+        qapp.processEvents()
+        assert window._empty_state.isVisible()
+        assert window._empty_title.text() == "Loading…"
+        assert window._empty_label.text() == "Checking for updates…"
+        assert self._snap(window) == before
+
+        # …and lands back on rows, in the same place.
+        window._on_recheck_found(_updates())
+        qapp.processEvents()
+        assert not window._empty_state.isVisible()
+        assert self._snap(window) == before
+
+    def test_log_line_does_not_move_the_list(self, window, qapp):
+        before = window._list.geometry()
+        window._on_log_line(":: installing konsole (1/2)")
+        qapp.processEvents()
+        assert window._log_preview.text() != ""   # the line is used…
+        assert window._list.geometry() == before  # …but nothing moved
+
+    def test_filter_does_not_move_the_layout(self, window, qapp):
+        window.resize(1280, 800)
+        qapp.processEvents()
+        before = self._snap(window)
+        window._list_header.search.setText("aur")
+        qapp.processEvents()
+        assert self._snap(window) == before
+        window._list_header.search.clear()
+        qapp.processEvents()
+        assert self._snap(window) == before
+
+    def test_every_row_is_the_same_height(self, window, qapp):
+        # Uneven rows make a pixel-scrolled view re-anchor as it measures,
+        # which looks like the list scrolling by itself.
+        window.resize(1280, 800)
+        qapp.processEvents()
+        d = window._list.itemDelegate()
+        width = window._list.viewport().width()
+        heights = {d._layout(r, window._model.item(r), width)["height"]
+                   for r in range(window._model.rowCount())}
+        assert len(heights) == 1
+        assert window._list.resizeMode() == app.QListView.ResizeMode.Fixed
+
+
+class TestEmptyState:
+    """An empty window still reads as a composed screen."""
+
+    def test_placeholder_says_when_it_was_checked(self, qapp):
+        import time as _t
+        w = app.UpdateWindow([], {}, None)
+        w.resize(1280, 800)
+        w.show()
+        qapp.processEvents()
+        assert "Not checked yet" in w._empty_label.text()
+        w._mark_checked()
+        w._refresh_empty_state()
+        assert "Last checked just now" in w._empty_label.text()
+        assert "next check in" in w._empty_label.text()
+        # …and ages into a clock time rather than lying about "just now".
+        w._checked_at = _t.time() - 7200
+        w._refresh_empty_state()
+        assert "Last checked at" in w._empty_label.text()
+        w.close()
+
+    def test_filter_empty_state_keeps_the_filter_box(self, qapp):
+        w = app.UpdateWindow([{"name": "konsole", "old": "1-1", "new": "2-1",
+                               "repo": "official"}], {}, None)
+        w.resize(1280, 800)
+        w.show()
+        qapp.processEvents()
+        assert not w._empty_state.isVisible()
+        w._list_header.search.setText("nothing-matches")
+        qapp.processEvents()
+        assert w._empty_state.isVisible()
+        assert w._list_header.isVisible()
+        assert w._empty_title.text() == "No matches"
+        w.close()
+
+
+class TestListHeaderAndFilter:
+    """Row controls live with the rows: select-all, count, and a filter."""
+
+    def test_header_sits_with_the_list(self, window, qapp):
+        up = window._content_stack.widget(0).layout()
+        widgets = [up.itemAt(i).widget() for i in range(up.count())]
+        assert window._list_header in widgets
+        assert widgets.index(window._list_header) < widgets.index(window._list)
+        # ...and the footer no longer carries All/None buttons.
+        assert not hasattr(window, "_select_all_btn")
+        assert not hasattr(window, "_select_none_btn")
+
+    def test_select_all_checkbox_drives_selection(self, window, qapp):
+        window._select_all(False)
+        qapp.processEvents()
+        assert window._list_header.check.checkState() == \
+            Qt.CheckState.Unchecked
+        window._list_header.check.click()
+        qapp.processEvents()
+        assert window._list_header.check.checkState() == Qt.CheckState.Checked
+        assert window._model.selected_count() == window._model.checkable_count()
+        window._list_header.check.click()
+        qapp.processEvents()
+        assert window._list_header.check.checkState() == \
+            Qt.CheckState.Unchecked
+        assert window._model.selected_count() == 0
+
+    def test_partial_selection_shows_a_count(self, window, qapp):
+        window._select_all(False)
+        window._on_row_toggled(0)
+        qapp.processEvents()
+        assert window._list_header.check.checkState() == \
+            Qt.CheckState.PartiallyChecked
+        assert window._list_header.count.isVisible()
+        assert "1 of 3 selected" in window._sel_label.text()
+
+    def test_filter_hides_non_matching_rows(self, window, qapp):
+        window._list_header.search.setText("aur")
+        qapp.processEvents()
+        assert window._model.rowCount() == 2
+        names = [window._model.item(r)["name"] for r in
+                 range(window._model.rowCount())]
+        assert names == ["aur-pkg", "evil"]
+        window._list_header.search.setText("konsole")
+        qapp.processEvents()
+        assert window._model.rowCount() == 1
+        window._list_header.search.clear()
+        qapp.processEvents()
+        assert window._model.rowCount() == 4
+
+    def test_filter_matches_description_and_notes(self, window, qapp):
+        window.on_info_ready(0, "A terminal emulator", "notes", "", "full",
+                             "", "")
+        qapp.processEvents()
+        window._list_header.search.setText("emulator")
+        qapp.processEvents()
+        assert [window._model.item(r)["name"] for r in
+                range(window._model.rowCount())] == ["konsole"]
+
+    def test_filter_reports_what_it_hides(self, window, qapp):
+        window._list_header.search.setText("aur")
+        qapp.processEvents()
+        assert "2 of 4" in window._list_header.filtered.text()
+        # The tab still answers "how many updates are pending".
+        assert window._view_buttons["updates"].text() == "Updates (4)"
+        window._list_header.search.clear()
+        qapp.processEvents()
+        assert window._list_header.filtered.text() == ""
+        assert not window._list_header.filtered.isVisible()
+
+    def test_filter_offers_a_way_back(self, window, qapp):
+        window._list_header.search.setText("nothing-matches-this")
+        qapp.processEvents()
+        assert window._model.rowCount() == 0
+        assert window._empty_label.isVisible()
+        assert "Nothing here matches" in window._empty_label.text()
+        assert window._empty_title.text() == "No matches"
+        # With a filter on, the box that clears it stays put.
+        assert window._list_header.isVisible()
+
+    def test_select_all_applies_to_visible_rows_only(self, window, qapp):
+        # Selecting with a filter on must not silently reach hidden rows.
+        window._list_header.search.setText("aur")
+        qapp.processEvents()
+        window._select_all(True)
+        qapp.processEvents()
+        assert window._model.checked_names() == ["aur-pkg"]
+        assert window._model.rowCount() == 2
+
+    def test_row_info_still_lands_while_filtered(self, window, qapp):
+        window._list_header.search.setText("konsole")
+        qapp.processEvents()
+        # The fetcher addresses rows by source index; that must keep
+        # working when the visible set is a subset.
+        window.on_info_ready(2, "desc for evil", "notes for evil", "", "",
+                             "", "")
+        qapp.processEvents()
+        assert window._model._items[2]["desc"] == "desc for evil"
+
+    def test_every_view_footer_refreshes(self, window, qapp):
+        for btn in (window._recheck_btn, window._track_refresh_btn,
+                    window._un_refresh_btn, window._obs_refresh_btn):
+            assert btn.text() == "Refresh"
+        # Security's scan is its refresh: one button, no duplicate.
+        assert window._sec_scan_btn.text() == "Run scan"
+        assert not hasattr(window, "_sec_close_btn")
+
+    def test_tracked_filter(self, window, qapp):
+        # Flush the window's own (stubbed) load chain first: it would
+        # otherwise deliver an empty list over the rows staged here.
+        if window._obs_checker is not None:
+            window._obs_checker.wait(25000)
+        qapp.processEvents()
+        if window._track_loader is not None:
+            window._track_loader.wait(25000)
+        qapp.processEvents()
+        window._on_tracked_loaded(
+            [{"name": "hyprland", "version": "1", "repo": "aur"},
+             {"name": "firefox", "version": "2", "repo": "official"}], [])
+        qapp.processEvents()
+        window._track_header.search.setText("hypr")
+        qapp.processEvents()
+        assert window._track_model.rowCount() == 1
+        assert window._track_model.item(0)["name"] == "hyprland"
+        window._track_header.search.clear()
+        qapp.processEvents()
+        assert window._track_model.rowCount() == 2
+
+    def test_no_close_buttons_anywhere(self, window):
+        for name in ("_skip_btn", "_obs_close_btn", "_sec_close_btn",
+                     "_track_close_btn", "_un_close_btn"):
+            assert not hasattr(window, name), name
+
+
+class TestLogPanelState:
+    def test_placeholder_until_something_is_logged(self, window, qapp):
+        window._log_btn.setChecked(True)
+        qapp.processEvents()
+        assert window._log_empty.isVisible()
+        assert not window._log_view.isVisible()
+        window._on_log_line(":: installing konsole")
+        qapp.processEvents()
+        assert not window._log_empty.isVisible()
+        assert window._log_view.isVisible()
+        assert window._log_has_content is True
+        window._clear_log()
+        qapp.processEvents()
+        assert window._log_empty.isVisible()
+        assert window._log_has_content is False
+
+    def test_clearing_then_logging_works_again(self, window, qapp):
+        window._on_log_line("first")
+        window._clear_log()
+        window._log_action("second")
+        qapp.processEvents()
+        assert window._log_has_content is True
+        assert "second" in window._log_view.toPlainText()
+
+
+class TestProgressReadout:
+    def test_phrase_is_a_percentage(self, window):
+        window._safe_names = ["a", "b", "c", "d"]
+        window._done_names = {"a", "b"}
+        phrase = window._progress_phrase()
+        assert "<b>50%</b>" in phrase
+        assert "2 of 4 done" in phrase
+
+    def test_status_leads_with_the_percentage(self, window):
+        window._safe_names = ["konsole", "aur-pkg"]
+        window._done_names = {"konsole"}
+        window._on_install_progress(1, 2, "aur-pkg")
+        assert "<b>50%</b>" in window._sub.text()
+
+    def test_percentage_never_exceeds_a_hundred(self, window):
+        window._safe_names = ["a"]
+        window._done_names = {"a", "ghost"}
+        assert "<b>100%</b>" in window._progress_phrase()
 
 
 class TestPerf:

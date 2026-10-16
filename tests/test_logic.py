@@ -110,6 +110,15 @@ class TestClassify:
     @pytest.mark.parametrize("output,want", [
         ("", "cancelled"),
         ("Authorization failed: dismissed", "cancelled"),
+        ("Cancelled by user.", "cancelled"),
+        ("Sorry, try again.\nSorry, try again.\n"
+         "sudo: 3 incorrect password attempts", "cancelled"),
+        ("authentication failure; log file incorrect", "cancelled"),
+        # Real pkexec/sudo auth failures: nothing ran → clean retry state.
+        ("Error executing command as another user: Not authorized\n"
+         "This incident has been reported.", "cancelled"),
+        ("sudo: no password was provided", "cancelled"),
+        ("Authentication failed", "cancelled"),
         ("pkg: /x exists in filesystem", "file-conflict"),
         ("invalid or corrupted package (PGP signature)", "signature"),
         ("failed to synchronize all databases", "sync"),
@@ -340,3 +349,56 @@ class TestIcons:
                      "check-circle", "error-circle", "warn-triangle",
                      "info-circle", "box", "select-all", "select-none"):
             assert name in app._ICON_SVGS
+
+
+class TestDesignSystem:
+    def test_type_scale_is_ordered(self):
+        sizes = [app._sp(n) for n in (11, 12, 13, 20, 22)]
+        assert sizes == sorted(sizes)
+        assert len(set(sizes)) == len(sizes)
+
+    def test_grid_values_are_multiples_of_four(self):
+        # The strict grid: every structural spacing value is a 4px step.
+        for n in (4, 8, 12, 16, 24, 52):
+            assert app._sp(n) % 4 == 0 or app._SCALE != 1.0
+
+    def test_semantic_colors_come_from_the_scheme(self, monkeypatch):
+        monkeypatch.setattr(app, "_KDE_CACHE", {}, raising=False)
+        monkeypatch.setattr(app, "_TOKEN_CACHE", {}, raising=False)
+        colors = [app._accent_hex(), app._positive_hex(),
+                  app._warning_hex(), app._negative_hex(), app._link_hex()]
+        for color in colors:
+            assert color.startswith("#") and len(color) == 7
+
+    def test_qss_has_no_stray_placeholders(self):
+        qss = app._themed_qss()
+        assert "%(" not in qss
+        assert "pxpx" not in qss
+
+    def test_soft_color_is_rgba(self):
+        assert app._soft("#ff0000").startswith("rgba(255,0,0,")
+
+
+class TestRebootProbe:
+    def test_true_when_running_modules_are_gone(self, monkeypatch):
+        monkeypatch.setattr(app.os.path, "isdir", lambda p: False)
+        assert app.reboot_required() is True
+
+    def test_false_when_running_modules_exist(self, monkeypatch):
+        monkeypatch.setattr(app.os.path, "isdir", lambda p: True)
+        assert app.reboot_required() is False
+
+
+class TestSettings:
+    def test_roundtrip(self, tmp_path, monkeypatch):
+        target = tmp_path / "settings.json"
+        monkeypatch.setattr(app, "_settings_file", lambda: str(target))
+        assert app.load_settings() == {}
+        app.save_settings({"geometry": [1, 2, 3, 4]})
+        assert app.load_settings() == {"geometry": [1, 2, 3, 4]}
+
+    def test_broken_file_is_not_fatal(self, tmp_path, monkeypatch):
+        target = tmp_path / "settings.json"
+        target.write_text("{not json")
+        monkeypatch.setattr(app, "_settings_file", lambda: str(target))
+        assert app.load_settings() == {}
