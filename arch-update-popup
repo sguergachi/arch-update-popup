@@ -2725,15 +2725,11 @@ class _ObsoleteRow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setObjectName("package-card")
         body = _card_layout(self, None, spacing=0)
-        row = QHBoxLayout()
-        row.setSpacing(_sp(12))
         title = QLabel(name)
         title.setObjectName("package-name")
-        row.addWidget(title)
-        row.addStretch()
-        row.addWidget(_badge("no repository", "warning"),
-                      0, Qt.AlignmentFlag.AlignVCenter)
-        body.addLayout(row)
+        body.addWidget(title)
+        # No per-row badge: every row would carry the identical
+        # "no repository" pill — the page summary above says it once.
 
 
 # ── Bundled status/action icon set ─────────────────────────────────────
@@ -3152,6 +3148,24 @@ class _FilterableModel:
     def source_count(self) -> int:
         """Rows in the full list, filter or no filter."""
         return len(self._items)
+
+
+class _ViewResizeHook(QObject):
+    """Re-lay fixed-mode card rows when the viewport width changes.
+
+    The lists use ResizeMode.Fixed: row sizes are queried once and never
+    re-measured, so a narrower viewport (opening the log panel, a window
+    resize) keeps the old row width — cards clip on the right and a
+    horizontal scrollbar appears.
+    """
+    def __init__(self, view: "QListView") -> None:
+        QObject.__init__(self, view)
+        self._view = view
+
+    def eventFilter(self, obj, ev) -> bool:  # noqa: N802
+        if ev.type() == QEvent.Type.Resize:
+            self._view.doItemsLayout()
+        return False
 
 
 class PackageModel(_FilterableModel, QAbstractListModel):
@@ -4009,6 +4023,13 @@ class TrackedDelegate(QStyledItemDelegate):
         # an official build exists (mirrors the Updates old → new line),
         # followed by the description when there is room for it.
         official = item["official"] or ""
+        # Untracked app rows show the human application name as their
+        # title — the *package* name (what Uninstall removes) must stay
+        # visible, so it rides on the version line.
+        pkg_txt = ""
+        if (item.get("title") or "").strip() and item["title"] != item["name"]:
+            pkg_txt = item["name"] if not item["version"] \
+                else f" · {item['name']}"
         if official:
             ver_left = f"{item['version']} → " if item["version"] else ""
             ver_left_w = fm.horizontalAdvance(ver_left)
@@ -4017,7 +4038,10 @@ class TrackedDelegate(QStyledItemDelegate):
                 max(20, cw - ver_left_w))
         else:
             ver_left = fm.elidedText(item["version"],
-                                     Qt.TextElideMode.ElideRight, max(20, cw))
+                                     Qt.TextElideMode.ElideRight,
+                                     max(20, cw
+                                         - fm.horizontalAdvance(pkg_txt)))
+            ver_left += pkg_txt
             ver_left_w = 0
             ver_right = ""
         h_name, h_line, h_pill = self._rows()
@@ -4654,69 +4678,21 @@ class UpdateWindow(QMainWindow):
         # failing packages, and the list auto-scrolls to the failed row.
         self._fail_row: int | None = None
 
-        # ── Compromised warning banner ──────────────────────────────────────
-        if self._compromised:
-            banner = QWidget()
-            banner.setObjectName("banner-danger")
-            banner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-            blay = _card_layout(banner, _negative_hex())
-            comp_pkgs = [p for p in updates if p.get("compromised")]
-            btitle = QLabel(
-                f"Security warning — {len(comp_pkgs)} compromised "
-                f"package{'s' if len(comp_pkgs) != 1 else ''} will be skipped"
-            )
-            btitle.setObjectName("banner-title")
-            btitle.setWordWrap(True)
-            blay.addWidget(btitle)
-            comp_names = "\n".join(
-                f"  • {p['name']}: {'; '.join(p.get('compromise_reasons', ['unknown']))}"
-                for p in comp_pkgs
-            )
-            bbody = QLabel(
-                f"{comp_names}\n"
-                "These packages will be skipped during update — safe packages "
-                "can still be installed. Leave the flagged packages alone "
-                "until they are verified safe."
-            )
-            bbody.setObjectName("banner-body")
-            bbody.setWordWrap(True)
-            bbody.setTextInteractionFlags(
-                Qt.TextInteractionFlag.TextSelectableByMouse
-            )
-            blay.addWidget(bbody)
-            up.addWidget(banner)
-
-        # ── AUR → official moves prompt ─────────────────────────────────────
-        # If any listed AUR package also lives in the official repos, offer
-        # a one-click switch. Detection is two fast local pacman calls.
-        try:
-            _aur_names = {p["name"] for p in updates
-                          if (p.get("repo") or "").lower() == "aur"}
-            self._pending_moves = [m for m in find_repo_moves(list(_aur_names))
-                                   if m["name"] in _aur_names]
-        except Exception:
-            self._pending_moves = []
-        if self._pending_moves:
-            mv = QWidget()
-            mv.setObjectName("banner-moves")
-            mv.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-            mv_body = _card_layout(mv, _accent_hex())
-            mb = QHBoxLayout()
-            mb.setSpacing(_sp(12))
-            mv_body.addLayout(mb)
-            mt = QLabel(
-                f"<b>{len(self._pending_moves)} of these AUR packages "
-                f"{'is' if len(self._pending_moves) == 1 else 'are'} also in "
-                "the official repos</b> — switch for signed builds.")
-            mt.setObjectName("banner-body")
-            mt.setWordWrap(True)
-            mb.addWidget(mt, 1)
-            review_btn = QPushButton("Review")
-            review_btn.setObjectName("secondary-small")
-            review_btn.setFixedHeight(_sp(28))
-            review_btn.clicked.connect(self._open_moves_dialog)
-            mb.addWidget(review_btn)
-            up.addWidget(mv)
+        # ── View banners (two deliberate, allowed layout shifts) ────────────
+        # The security warning and the AUR→official prompt stand between
+        # the stats and the list and mirror the *current* check's facts.
+        # They are rebuilt by _refresh_view_banners() at construction and
+        # on every model swap (see AGENTS.md — these two are the only
+        # containers allowed to appear/disappear).
+        self._slot_security = QWidget()
+        lay_sec = QVBoxLayout(self._slot_security)
+        lay_sec.setContentsMargins(0, 0, 0, 0)
+        up.addWidget(self._slot_security)
+        self._slot_moves = QWidget()
+        lay_moves = QVBoxLayout(self._slot_moves)
+        lay_moves.setContentsMargins(0, 0, 0, 0)
+        up.addWidget(self._slot_moves)
+        self._refresh_view_banners(recompute_moves=True)
 
         n_cached = sum(1 for i in range(n) if i in cached_info)
         self._set_idle_header(n_cached)
@@ -4743,6 +4719,9 @@ class UpdateWindow(QMainWindow):
         self._list.setViewportMargins(0, 8, 0, 8)
         self._list.setMouseTracking(True)
         self._list.viewport().setMouseTracking(True)
+        # Fixed rows carry their own width: re-measure when the viewport
+        # narrows (log panel, window resize) or the cards clip.
+        self._list.viewport().installEventFilter(_ViewResizeHook(self._list))
         self._delegate.toggled.connect(self._on_row_toggled)
         self._delegate.link_activated.connect(
             lambda url: QDesktopServices.openUrl(QUrl(url)))
@@ -5054,6 +5033,10 @@ class UpdateWindow(QMainWindow):
         self._track_list.setViewportMargins(0, 8, 0, 8)
         self._track_list.setMouseTracking(True)
         self._track_list.viewport().setMouseTracking(True)
+        # Fixed rows carry their own width: re-measure when the viewport
+        # narrows (log panel, window resize) or the cards clip.
+        self._track_list.viewport().installEventFilter(
+            _ViewResizeHook(self._track_list))
         self._track_delegate.switch_requested.connect(
             self._request_track_switch)
         self._track_delegate.uninstall_requested.connect(
@@ -5538,6 +5521,109 @@ class UpdateWindow(QMainWindow):
         self._update_view_badges()  # restores the Updates tab text + count
         self._view_buttons["updates"].setEnabled(True)
         self._recheck_btn.setEnabled(True)
+        self._refresh_view_banners()
+
+    def _clear_container(self, slot: QWidget) -> None:
+        lay = slot.layout()
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _rebuild_security_banner(self) -> None:
+        """Security banner inside its slot, mirroring the current list.
+
+        Hidden is the default: no compromised rows → no banner. When
+        shown, this is one of the two allowed layout shifts (AGENTS.md).
+        """
+        self._clear_container(self._slot_security)
+        comp_pkgs = [p for p in self._updates if p.get("compromised")]
+        if not comp_pkgs:
+            self._slot_security.setVisible(False)
+            return
+        banner = QWidget()
+        banner.setObjectName("banner-danger")
+        banner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        blay = _card_layout(banner, _negative_hex())
+        btitle = QLabel(
+            f"Security warning — {len(comp_pkgs)} compromised "
+            f"package{'s' if len(comp_pkgs) != 1 else ''} will be skipped"
+        )
+        btitle.setObjectName("banner-title")
+        btitle.setWordWrap(True)
+        blay.addWidget(btitle)
+        comp_names = "\n".join(
+            f"  • {p['name']}: {'; '.join(p.get('compromise_reasons', ['unknown']))}"
+            for p in comp_pkgs
+        )
+        bbody = QLabel(
+            f"{comp_names}\n"
+            "These packages will be skipped during update — safe packages "
+            "can still be installed. Leave the flagged packages alone "
+            "until they are verified safe."
+        )
+        bbody.setObjectName("banner-body")
+        bbody.setWordWrap(True)
+        bbody.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        blay.addWidget(bbody)
+        self._slot_security.layout().addWidget(banner)
+        self._slot_security.setVisible(True)
+
+    def _rebuild_moves_banner(self, recompute: bool = False) -> None:
+        """AUR→official banner inside its slot, mirroring the current list.
+
+        `recompute` (construction only) asks pacman for the candidate set;
+        afterwards the set is just filtered to the names the fresh check
+        still lists — no settle-time forks on the GUI thread.
+        """
+        _aur_names = {p["name"] for p in self._updates
+                      if (p.get("repo") or "").lower() == "aur"}
+        if not _aur_names:
+            self._pending_moves = []
+        elif recompute:
+            # Detection is two fast local pacman calls; allowed here only
+            # because the window is mid-construction (established pattern).
+            try:
+                self._pending_moves = [
+                    m for m in find_repo_moves(list(_aur_names))
+                    if m["name"] in _aur_names]
+            except Exception:
+                self._pending_moves = []
+        else:
+            self._pending_moves = [
+                m for m in (self._pending_moves or []) if m["name"] in _aur_names]
+        self._clear_container(self._slot_moves)
+        if not self._pending_moves:
+            self._slot_moves.setVisible(False)
+            return
+        mv = QWidget()
+        mv.setObjectName("banner-moves")
+        mv.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        mv_body = _card_layout(mv, _accent_hex())
+        mb = QHBoxLayout()
+        mb.setSpacing(_sp(12))
+        mv_body.addLayout(mb)
+        mt = QLabel(
+            f"<b>{len(self._pending_moves)} of these AUR packages "
+            f"{'is' if len(self._pending_moves) == 1 else 'are'} also in "
+            "the official repos</b> — switch for signed builds.")
+        mt.setObjectName("banner-body")
+        mt.setWordWrap(True)
+        mb.addWidget(mt, 1)
+        review_btn = QPushButton("Review")
+        review_btn.setObjectName("secondary-small")
+        review_btn.setFixedHeight(_sp(28))
+        review_btn.clicked.connect(self._open_moves_dialog)
+        mb.addWidget(review_btn)
+        self._slot_moves.layout().addWidget(mv)
+        self._slot_moves.setVisible(True)
+
+    def _refresh_view_banners(self, recompute_moves: bool = False) -> None:
+        self._rebuild_security_banner()
+        self._rebuild_moves_banner(recompute=recompute_moves)
 
     def _start_recheck_fetcher(self) -> None:
         """Fetch release notes for the fresh rows (generation-stamped)."""
@@ -6168,6 +6254,9 @@ class UpdateWindow(QMainWindow):
         view.setModel(model)
         delegate = TrackedDelegate(view)
         view.setItemDelegate(delegate)
+        # Fixed rows carry their own width: re-measure when the viewport
+        # narrows (log panel, window resize) or the cards clip.
+        view.viewport().installEventFilter(_ViewResizeHook(view))
         view.setSelectionMode(
             QAbstractItemView.SelectionMode.NoSelection)
         view.setVerticalScrollMode(

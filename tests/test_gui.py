@@ -4,7 +4,7 @@ import time
 import pytest
 
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel
 
 from conftest import load_app
 
@@ -1534,9 +1534,9 @@ class TestNoLayoutShifts:
     STRUCTURE = ("_stats_row", "_list_header", "_list", "_log_preview",
                  "_progress")
 
-    def _snap(self, window):
+    def _snap(self, window, skip=()):
         snap = {name: getattr(window, name).geometry()
-                for name in self.STRUCTURE}
+                for name in self.STRUCTURE if name not in skip}
         # Footer buttons may resize with their label, but their baseline
         # and right edge must not move.
         snap["_update_btn"] = (window._update_btn.geometry().right(),
@@ -1580,21 +1580,32 @@ class TestNoLayoutShifts:
         assert self._snap(window) == before
 
         # Empty list, then refresh: the box itself says it is loading…
+        # The two view banners may appear/disappear here (AGENTS.md allows
+        # exactly that shift), so their followers _list_header/_list are
+        # out of scope for this phase — and must land back on `before`
+        # when the check returns rows (asserted below, strongest form).
+        rows_snapshot = {k: v for k, v in before.items()
+                         if k not in ("_list_header", "_list")}
         window._on_recheck_empty()
         qapp.processEvents()
         assert window._empty_title.text() == "You're up to date"
-        assert self._snap(window) == before
+        assert not window._slot_security.isVisible()
+        assert not window._slot_moves.isVisible()
+        assert self._snap(window, skip=("_list_header", "_list")) \
+            == rows_snapshot
         window._recheck_updates()
         qapp.processEvents()
         assert window._empty_state.isVisible()
         assert window._empty_title.text() == "Loading…"
         assert window._empty_label.text() == "Checking for updates…"
-        assert self._snap(window) == before
+        assert self._snap(window, skip=("_list_header", "_list")) \
+            == rows_snapshot
 
-        # …and lands back on rows, in the same place.
+        # …and lands back on rows, in the same place — banners restored.
         window._on_recheck_found(_updates())
         qapp.processEvents()
         assert not window._empty_state.isVisible()
+        assert window._slot_security.isVisible()
         assert self._snap(window) == before
 
     def test_log_line_does_not_move_the_list(self, window, qapp):
@@ -1626,6 +1637,102 @@ class TestNoLayoutShifts:
                    for r in range(window._model.rowCount())}
         assert len(heights) == 1
         assert window._list.resizeMode() == app.QListView.ResizeMode.Fixed
+
+
+class TestViewBanners:
+    """The two view banners mirror the current check's facts.
+
+    The security banner and the AUR→official prompt are rebuilt by every
+    model swap; a fresh empty list must not keep the stale warning. They
+    are the only shells allowed to appear/disappear (see AGENTS.md).
+    """
+
+    def _banner_text(self, slot):
+        out = []
+        lay = slot.layout()
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if w is None:
+                continue
+            for lbl in w.findChildren(QLabel):
+                out.append(lbl.text())
+        return "\n".join(out)
+
+    def test_empty_list_has_no_stale_banners(self, window, qapp):
+        window._swap_updates_model([], {})
+        window._mark_checked()
+        window._refresh_empty_state()
+        qapp.processEvents()
+        assert not window._slot_security.isVisible()
+        assert not window._slot_moves.isVisible()
+
+    def test_banner_counts_follow_the_list(self, window, qapp):
+        window._swap_updates_model(_updates(4), {})
+        qapp.processEvents()
+        assert window._slot_security.isVisible()
+        assert "1 compromised" in self._banner_text(window._slot_security)
+        window._swap_updates_model(_updates(8), {})
+        qapp.processEvents()
+        assert "2 compromised" in self._banner_text(window._slot_security)
+
+    def test_moves_banner_filters_to_current_list(self, window, qapp):
+        window._pending_moves = [{"name": "yakuake", "installed": "1-1",
+                                  "official": "1.1-1", "relation": "upgrade"}]
+        window._swap_updates_model(
+            [{"name": "yakuake", "old": "1-1", "new": "1.1-1",
+              "repo": "aur"}], {})
+        qapp.processEvents()
+        assert window._slot_moves.isVisible()
+        # The package left the list → the prompt goes with it.
+        window._swap_updates_model(
+            [{"name": "konsole", "old": "1-1", "new": "2-1",
+              "repo": "official"}], {})
+        qapp.processEvents()
+        assert not window._slot_moves.isVisible()
+
+
+class TestCardListRemeasure:
+    """Fixed-mode rows re-measure when the viewport narrows.
+
+    Opening the log panel (or any resize) narrows the lists after the
+    model is placed; without re-measurement the cards clip on the right
+    and a horizontal scrollbar appears.
+    """
+
+    def test_rows_follow_viewport_narrowing(self, window, qapp):
+        window.resize(1280, 800)
+        qapp.processEvents()
+        # Real-world trigger: open the log panel, which narrows the list.
+        window._log_btn.setChecked(True)
+        qapp.processEvents()
+        new_w = window._list.viewport().width()
+        d = window._list.itemDelegate()
+        assert new_w < 1230  # actually narrowed
+        assert new_w in {key[1] for key in d._geo}
+        assert not window._list.horizontalScrollBar().isVisible()
+
+    def test_tracked_list_remeasures(self, window, qapp):
+        window.resize(1280, 800)
+        qapp.processEvents()
+        window._switch_view("tracked")
+        qapp.processEvents()
+        # One real row so sizeHint is exercised, then narrow via log panel.
+        window._unapp_model.set_items([
+            app._tracked_row("zed", "1.0-1", "aur")])
+        window._log_btn.setChecked(True)
+        qapp.processEvents()
+        new_w = window._track_list.viewport().width()
+        d = window._track_list.itemDelegate()
+        assert d is not window._list.itemDelegate()
+        idx = window._unapp_model.index(0)
+        if idx.isValid():
+            from PyQt6.QtWidgets import QStyleOptionViewItem
+            from PyQt6.QtCore import QRect
+            opt = QStyleOptionViewItem()
+            opt.rect = QRect(0, 0, 1000, 100)
+            hint = d.sizeHint(opt, idx)
+            assert hint.width() == new_w
+        assert not window._track_list.horizontalScrollBar().isVisible()
 
 
 class TestEmptyState:
