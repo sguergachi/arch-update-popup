@@ -4990,6 +4990,8 @@ class UpdateWindow(QMainWindow):
         self._sec_empty = _ListPlaceholder()
         self._sec_lay.addWidget(self._sec_empty)
         self._sec_lay.addWidget(self._sec_stretch)
+        # Before the first scan the box explains what a scan is for.
+        self._sec_placeholder_ready()
         self._sec_scroll.setWidget(self._sec_inner)
         se.addWidget(self._sec_scroll, 1)
         self._content_stack.addWidget(self._sec_page)
@@ -5175,6 +5177,9 @@ class UpdateWindow(QMainWindow):
         left.addWidget(self._footer_stack)
         self._update_view_badges()
         self._refresh_selection_ui()
+        # Every list box explains itself from the first frame — the tracked
+        # page starts loading, so its placeholder says so.
+        self._refresh_tracked_summary()
         # Preload the obsolete list in the background so the Obsolete
         # tab (and its badge) is instant when first opened. The tracked
         # list chains after it (see _on_obs_preload_done) — strictly one
@@ -5325,7 +5330,12 @@ class UpdateWindow(QMainWindow):
         if key == "untracked" and not self._untracked_loaded \
                 and self._untracked_loader is None:
             # Same lazy pattern: scan only when first opened.
+            self._un_loading = True
             self._un_summary.setText("Scanning for untracked software…")
+            self._unapp_empty.show_loading(
+                "Looking for applications pacman doesn't own…")
+            self._unpkg_empty.show_loading(
+                "Looking for dependency packages…")
             self._untracked_loader = UntrackedLoader()
             self._untracked_loader.done.connect(self._on_untracked_loaded)
             self._untracked_loader.start()
@@ -5686,6 +5696,12 @@ class UpdateWindow(QMainWindow):
 
     def _load_obsolete_async(self) -> None:
         """(Re)compute the obsolete list in the background."""
+        if not self._obs_cards:
+            # Never a blank box — and this must come first: opening the tab
+            # while the initial scan is still running takes the early
+            # return below, which would otherwise leave the box empty.
+            self._obs_empty.show_loading(
+                "Looking for packages no repository provides…")
         old = self._obs_checker
         if old is not None and old.isRunning():
             return  # already loading; its done signal fills the view
@@ -5763,6 +5779,14 @@ class UpdateWindow(QMainWindow):
         self._start_obsolete_removal(list(self._obs_names))
 
     # ── Security view ────────────────────────────────────────────────────────
+    def _sec_placeholder_ready(self) -> None:
+        """Before the first scan: say what a scan is for, in the box."""
+        self._sec_empty.show_state(
+            "Not scanned yet",
+            "Run a scan to check every installed package against known "
+            "supply-chain attacks.",
+            icon="search", colour="muted")
+
     def _run_security_scan(self) -> None:
         if self._sec_scanner is not None and self._sec_scanner.isRunning():
             return
@@ -5876,7 +5900,9 @@ class UpdateWindow(QMainWindow):
                 "No explicitly installed packages were found.",
                 icon="box", colour="muted")
         else:
-            self._track_empty.hide_state()
+            # Not loaded yet: this is a load in progress, not an empty list.
+            self._track_empty.show_loading("Reading the installed package "
+                                           "list…")
         if n == 0 and not self._track_loaded:
             self._track_summary.setText("Loading tracked packages…")
         elif movable:

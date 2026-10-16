@@ -1735,6 +1735,58 @@ class TestCardListRemeasure:
         assert not window._track_list.horizontalScrollBar().isVisible()
 
 
+class TestPlaceholdersEverywhere:
+    """No list box is ever blank: every one explains itself, in place."""
+
+    def test_obsolete_says_it_is_scanning_on_first_open(self, window, qapp):
+        # Deterministic: the loading state is set when the scan starts,
+        # before the stubbed thread can report back.
+        window._switch_view("obsolete")
+        window._obs_loaded = False
+        window._obs_empty.hide_state()
+        window._load_obsolete_async()
+        qapp.processEvents()
+        assert window._obs_empty.isVisible()
+        assert window._obs_empty.title.text() == "Loading…"
+        # And when it reports, the same box swaps its text.
+        window._on_obs_preload_done([])
+        assert window._obs_empty.title.text() == "Nothing to clean up"
+
+    def test_tracked_says_it_is_loading_before_data_arrives(self, qapp):
+        w = app.UpdateWindow([], {}, None)
+        w.resize(1280, 800)
+        w.show()
+        qapp.processEvents()
+        # Not hidden (the page itself is off-screen, hence isHidden()).
+        assert not w._track_empty.isHidden()
+        w._track_loaded = False
+        w._refresh_tracked_summary()
+        assert w._track_empty.title.text() == "Loading…"
+        w._on_tracked_loaded([], [])
+        qapp.processEvents()
+        assert w._track_empty.title.text() == "Nothing tracked"
+        w.close()
+
+    def test_untracked_says_it_is_scanning_on_first_open(self, qapp):
+        w = app.UpdateWindow([], {}, None)
+        w.resize(1280, 800)
+        w.show()
+        qapp.processEvents()
+        w._switch_view("untracked")
+        qapp.processEvents()
+        for holder in (w._unapp_empty, w._unpkg_empty):
+            assert not holder.isHidden()   # never a blank box
+        w.close()
+
+    def test_security_explains_itself_before_the_first_scan(self, window,
+                                                           qapp):
+        window._switch_view("security")
+        qapp.processEvents()
+        assert window._sec_empty.isVisible()
+        assert window._sec_empty.title.text() == "Not scanned yet"
+        assert "Run a scan" in window._sec_empty.body.text()
+
+
 class TestEmptyState:
     """An empty window still reads as a composed screen."""
 
