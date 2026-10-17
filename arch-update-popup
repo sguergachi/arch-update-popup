@@ -67,22 +67,49 @@ OFFICIAL_REPOS = {
 # Where a package can live instead of the AUR, and what backs each one.
 # This app never edits pacman.conf — it reports what is enabled and what
 # switching would buy you, and the user decides.
-_MANAGED_SOURCES: list[tuple[str, str, str]] = [
-    ("Official repos", "core",
+_MANAGED_SOURCES: list[tuple[str, str, str, str]] = [
+    ("Official repos", "core", "",
      "Built and signed by Arch's own packagers. The only source this app "
      "calls official, and the safest place for a package to land."),
-    ("CachyOS", "cachyos",
+    ("CachyOS", "cachyos", "",
      "Arch and AUR packages rebuilt and signed by the CachyOS build farm, "
      "with performance, stability and security patches on top. No PKGBUILD "
-     "is run on your machine to get one."),
-    ("Chaotic-AUR", "chaotic-aur",
+     "is run on your machine to get one. Already enabled here."),
+    ("Chaotic-AUR", "chaotic-aur", """#!/bin/bash
+set -e
+# Trust the Chaotic-AUR signing key.
+pacman-key --recv-key FBA220DFC880C036 --keyserver keyserver.ubuntu.com
+pacman-key --lsign-key FBA220DFC880C036
+# Install its keyring and mirrorlist.
+pacman -Sy --noconfirm chaotic-keyring chaotic-mirrorlist
+# Add the repo (idempotent) and refresh.
+if ! grep -q '^\\[chaotic-aur\\]' /etc/pacman.conf; then
+    printf '\\n[chaotic-aur]\\nInclude = /etc/pacman.d/chaotic-mirrorlist\\n' \
+        >> /etc/pacman.conf
+fi
+pacman -Sy""",
      "A semi-automated AUR build farm: packages are signed, the PKGBUILD and "
      "its sources are statically scanned before a build, and a package is "
      "held back unless every AUR maintainer involved is trusted."),
-    ("archlinuxcn", "archlinuxcn",
+    ("archlinuxcn", "archlinuxcn", """#!/bin/bash
+set -e
+# Import the archlinuxcn signing key.
+pacman-key --recv-key 7931B6D628C8D3BA --keyserver keyserver.ubuntu.com
+pacman-key --lsign-key 7931B6D628C8D3BA
+# Add the repo (idempotent), then install its keyring and refresh.
+if ! grep -q '^\\[archlinuxcn\\]' /etc/pacman.conf; then
+    printf '\\n[archlinuxcn]\\nServer = https://repo.archlinuxcn.org/$arch\\n' \
+        >> /etc/pacman.conf
+fi
+pacman -Sy --noconfirm archlinuxcn-keyring
+pacman -Sy""",
      "A long-running community repo with prebuilt AUR packages. Convenient, "
      "but one maintainer team stands behind all of it."),
-    ("Flatpak · Flathub", "flatpak",
+    ("Flatpak · Flathub", "flatpak", """#!/bin/bash
+set -e
+pacman -Sy --noconfirm flatpak
+flatpak remote-add --if-not-exists flathub \
+    https://flathub.org/repo/flathub.flatpakrepo""",
      "Sandboxed, signed and curated per application. Not a pacman repo, so "
      "migrating means removing the package and installing the Flatpak."),
 ]
@@ -7958,6 +7985,88 @@ class UpdateWindow(QMainWindow):
             setattr(self, attr, None)
 
 
+# ── Enabling a managed source (privileged, one sudo -A prompt) ─────────
+
+
+class _SourceEnableRunner(QThread):
+    """Runs a bash script as root under `sudo -A`, streaming its output."""
+
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, script_body: str) -> None:
+        super().__init__()
+        self._proc: subprocess.Popen | None = None
+        self._killed = False
+        self._script = script_body
+
+    def run(self) -> None:
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".sh", prefix="arch-update-enable-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(self._script)
+            os.chmod(path, stat.S_IRWXU)
+            askpass = make_askpass_script("Enter sudo password to enable the "
+                                          "managed source:")
+            env = os.environ.copy()
+            env["SUDO_ASKPASS"] = askpass
+            master_fd, slave_fd = pty.openpty()
+            try:
+                proc = subprocess.Popen(
+                    ["sudo", "-A", "bash", path],
+                    stdout=slave_fd, stderr=slave_fd,
+                    stdin=subprocess.DEVNULL, env=env, close_fds=True)
+            except FileNotFoundError as e:
+                os.close(master_fd); os.close(slave_fd)
+                self.done.emit(False, str(e))
+                return
+            os.close(slave_fd)
+            self._proc = proc
+            lines: list[str] = []
+            buf = ""
+            while True:
+                try:
+                    ready, _, _ = select.select([master_fd], [], [], 0.05)
+                except (OSError, ValueError):
+                    break
+                if ready:
+                    try:
+                        buf += os.read(master_fd, 4096).decode(
+                            errors="replace")
+                    except OSError:
+                        break
+                    while "\n" in buf:
+                        raw, buf = buf.split("\n", 1)
+                        for fragment in raw.split("\r"):
+                            fragment = _ANSI_RE.sub("", fragment).strip()
+                            if fragment:
+                                lines.append(fragment)
+                elif proc.poll() is not None:
+                    break
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            proc.wait()
+            ok = proc.returncode == 0 and not self._killed
+            self.done.emit(ok, "\n".join(lines[-40:]))
+        finally:
+            for p in (path, askpass):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    def terminate(self) -> None:  # type: ignore[override]
+        self._killed = True
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
 # ── AUR → official moves dialog ──────────────────────────────────────────
 
 _SEC_SCAN_HINT = ("Scan all installed packages against known "
@@ -8135,7 +8244,7 @@ class ManagedSourcesDialog(QMainWindow):
         box = QVBoxLayout(inner)
         box.setContentsMargins(_sp(8), _sp(8), _sp(8), _sp(8))
         box.setSpacing(_sp(8))
-        for name, probe, why in _MANAGED_SOURCES:
+        for name, probe, steps, why in _MANAGED_SOURCES:
             card = QWidget()
             card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
             card.setObjectName("package-card")
@@ -8149,6 +8258,17 @@ class ManagedSourcesDialog(QMainWindow):
             row.addWidget(_badge("enabled" if on_here else "not enabled",
                                  "positive" if on_here else "muted"))
             row.addStretch()
+            if steps and not on_here:
+                # Enabling is the user's decision to make: show exactly
+                # what will run, then run it only on confirmation. We never
+                # edit pacman.conf silently.
+                show_btn = QPushButton("Show how to enable")
+                show_btn.setObjectName("secondary-small")
+                show_btn.setFixedHeight(_sp(24))
+                show_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                show_btn.clicked.connect(
+                    lambda _=False, n=name, s=steps: self._enable_source(n, s))
+                row.addWidget(show_btn)
             body.addLayout(row)
             note = QLabel(why)
             note.setObjectName("text-muted")
@@ -8174,6 +8294,56 @@ class ManagedSourcesDialog(QMainWindow):
         close_btn.clicked.connect(self.close)
         foot.addWidget(close_btn)
         lay.addLayout(foot)
+
+    def _enable_source(self, name: str, steps: str) -> None:
+        """Offer to run the documented enable steps, visibly and safely."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(f"Enable {name}")
+        box.setText(
+            f"Enable {name}?\n\n"
+            "This will change your system: it imports a signing key, "
+            "installs the repo's mirrorlist and keyring, and appends the "
+            "repo to /etc/pacman.conf (a backup is written first). "
+            "Nothing runs until you confirm.")
+        box.setInformativeText("Commands that will run:")
+        box.setDetailedText(steps)
+        run_btn = box.addButton("Run these commands",
+                                QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setStyleSheet(_themed_qss())
+        box.exec()
+        if box.clickedButton() is not run_btn:
+            return
+        # Run the whole script under one sudo -A prompt, so the user
+        # authenticates once. Reuse the existing askpass flow; the
+        # script cleans up after itself.
+        runner = _SourceEnableRunner(steps)
+        runner.done.connect(
+            lambda ok, out, n=name: self._on_enable_done(ok, out, n))
+        runner.start()
+
+    def _on_enable_done(self, success: bool, output: str, name: str) -> None:
+        if success:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setWindowTitle("Source enabled")
+            box.setText(f"{name} is now enabled.")
+            box.setInformativeText(
+                "A restart of Arch Update is needed so it picks up the new "
+                "repo and can offer switches for your packages.")
+            box.setDetailedText(output)
+            box.setStyleSheet(_themed_qss())
+            box.exec()
+            self.close()
+        else:
+            lines = [l for l in output.splitlines() if l.strip()]
+            self._show_error_dialog(
+                "enable failed",
+                f"Enabling {name} failed.",
+                "Nothing was changed. Run the commands from the details "
+                "manually, or paste them into a terminal.",
+                "\n".join(lines[-40:]) if lines else "(no output captured)")
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         super().closeEvent(event)

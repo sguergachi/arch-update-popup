@@ -504,10 +504,10 @@ class TestManagedSources:
         assert app.enabled_repos() == {"cachyos-v3", "extra"}
 
     def test_sources_table_covers_the_known_good_ones(self):
-        probes = {probe for _name, probe, _why in app._MANAGED_SOURCES}
+        probes = {probe for _name, probe, _steps, _why in app._MANAGED_SOURCES}
         assert {"core", "cachyos", "chaotic-aur", "archlinuxcn",
                 "flatpak"} <= probes
-        for name, _probe, why in app._MANAGED_SOURCES:
+        for name, _probe, _steps, why in app._MANAGED_SOURCES:
             assert name and len(why) > 40, name
 
 
