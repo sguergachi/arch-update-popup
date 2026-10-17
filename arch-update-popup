@@ -2874,18 +2874,8 @@ class _ListHeader(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(_sp(8))
 
-        self.check: QCheckBox | None = None
-        if with_select:
-            self.check = QCheckBox("Select all")
-            self.check.setObjectName("select-all")
-            self.check.setTristate(True)
-            self.check.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.check.clicked.connect(self._on_click)
-            lay.addWidget(self.check, 0, Qt.AlignmentFlag.AlignVCenter)
-
-        # The filter sits with the row controls on the left, where the eye
-        # starts and where the rows' own checkboxes are — one cluster
-        # instead of two stranded controls with a void between them.
+        # The filter leads the strip, at the far left, where the eye
+        # starts; the row controls and their count close it on the right.
         self.search: QLineEdit | None = None
         if with_search:
             self.search = QLineEdit()
@@ -2901,14 +2891,24 @@ class _ListHeader(QWidget):
 
         lay.addStretch()
 
-        # What the controls are producing, on the far side: the selection,
-        # then how much of the list the filter is hiding.
+        # What the controls are producing: the selection, then how much of
+        # the list the filter is hiding — then the control itself, far
+        # right, so the strip is anchored at both ends.
         self.count = QLabel("")
         self.count.setObjectName("meta")
         lay.addWidget(self.count, 0, Qt.AlignmentFlag.AlignVCenter)
         self.filtered = QLabel("")
         self.filtered.setObjectName("meta")
         lay.addWidget(self.filtered, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.check: QCheckBox | None = None
+        if with_select:
+            self.check = QCheckBox("Select all")
+            self.check.setObjectName("select-all")
+            self.check.setTristate(True)
+            self.check.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.check.clicked.connect(self._on_click)
+            lay.addWidget(self.check, 0, Qt.AlignmentFlag.AlignVCenter)
 
     def _on_click(self) -> None:
         # Ask for the opposite of what we last showed; the window then
