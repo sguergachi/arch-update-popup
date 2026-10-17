@@ -8259,15 +8259,16 @@ class ManagedSourcesDialog(QMainWindow):
                                  "positive" if on_here else "muted"))
             row.addStretch()
             if steps and not on_here:
-                # Enabling is the user's decision to make: show exactly
-                # what will run, then run it only on confirmation. We never
-                # edit pacman.conf silently.
-                show_btn = QPushButton("Show how to enable")
-                show_btn.setObjectName("secondary-small")
+                # One button, one job: the app enables the source for them.
+                # What it will run is shown for review before anything
+                # runs — we never edit pacman.conf silently.
+                show_btn = QPushButton("Enable")
+                show_btn.setObjectName("primary")
                 show_btn.setFixedHeight(_sp(24))
+                show_btn.setMinimumWidth(_sp(72))
                 show_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 show_btn.clicked.connect(
-                    lambda _=False, n=name, s=steps: self._enable_source(n, s))
+                    lambda _=False, n=name, st=steps: self._enable_source(n, st))
                 row.addWidget(show_btn)
             body.addLayout(row)
             note = QLabel(why)
@@ -8306,8 +8307,9 @@ class ManagedSourcesDialog(QMainWindow):
             "installs the repo's mirrorlist and keyring, and appends the "
             "repo to /etc/pacman.conf. Nothing runs until you confirm.")
         box.setDetailedText(steps)
-        run_btn = box.addButton("Run these commands",
-                                QMessageBox.ButtonRole.AcceptRole)
+        # The single action the user asked for: Enable. The commands are
+        # behind "Show Details" for anyone who wants to review them.
+        run_btn = box.addButton("Enable", QMessageBox.ButtonRole.AcceptRole)
         copy_btn = box.addButton("Copy commands",
                                  QMessageBox.ButtonRole.ActionRole)
         box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
