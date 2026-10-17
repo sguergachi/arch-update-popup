@@ -773,9 +773,9 @@ class TestWindow:
 class TestMovesDialog:
     def _moves(self):
         return [
-            {"name": "graduated", "installed": "1.0-1", "official": "1.1-1",
+            {"name": "graduated", "installed": "1.0-1", "target": "1.1-1", "source": "extra",
              "relation": "upgrade"},
-            {"name": "shiny", "installed": "2.0-1", "official": "1.9-1",
+            {"name": "shiny", "installed": "2.0-1", "target": "1.9-1", "source": "extra",
              "relation": "downgrade"},
         ]
 
@@ -1107,7 +1107,7 @@ class TestViews:
         window._on_tracked_loaded(
             [{"name": "b-aur", "version": "1-1", "repo": "aur"},
              {"name": "a-off", "version": "2-1", "repo": "official"}],
-            [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+            [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
               "relation": "upgrade"}])
         qapp.processEvents()
         assert window._track_model.rowCount() == 2
@@ -1126,7 +1126,7 @@ class TestViews:
         self._settle_track_loader(window, qapp)
         window._on_tracked_loaded(
             [{"name": "b-aur", "version": "1-1", "repo": "aur"}],
-            [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+            [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
               "relation": "upgrade"}])
         window._request_track_switch("b-aur")
         assert isinstance(window._track_runner, FakeRunner)
@@ -1143,7 +1143,7 @@ class TestViews:
         self._settle_track_loader(window, qapp)
         window._on_tracked_loaded(
             [{"name": "b-aur", "version": "1-1", "repo": "aur"}],
-            [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+            [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
               "relation": "upgrade"}])
         window._request_track_switch("b-aur")
         window._track_runner.done.emit(False, "boom")
@@ -1157,7 +1157,8 @@ class TestViews:
              {"name": "b-aur", "version": "1-1", "repo": "aur"}],
             [])
         qapp.processEvents()
-        assert "none in the official repos" in window._track_summary.text()
+        assert "none available from a managed repo" in \
+            window._track_summary.text()
         assert "nothing to move" in window._track_footer_label.text()
         assert not window._track_move_all_btn.isEnabled()
 
@@ -1193,7 +1194,7 @@ class TestViews:
         self._settle_track_loader(window, qapp)
         window._on_tracked_loaded(
             [{"name": "old", "version": "3-1", "repo": "aur"}],
-            [{"name": "old", "installed": "3-1", "official": "2-1",
+            [{"name": "old", "installed": "3-1", "target": "2-1", "source": "extra",
               "relation": "downgrade"}])
         window._request_track_switch("old")  # confirm auto-dismissed
         assert window._track_queue == []
@@ -1205,7 +1206,7 @@ class TestViews:
         self._settle_track_loader(window, qapp)
         window._on_tracked_loaded(
             [{"name": "b", "version": "1-1", "repo": "aur"}],
-            [{"name": "b", "installed": "1-1", "official": "1.1-1",
+            [{"name": "b", "installed": "1-1", "target": "1.1-1", "source": "extra",
               "relation": "upgrade"}])
         window._request_track_switch("b")
         assert window._track_queue == []
@@ -1218,9 +1219,9 @@ class TestViews:
         window._on_tracked_loaded(
             [{"name": "a", "version": "1-1", "repo": "aur"},
              {"name": "d", "version": "3-1", "repo": "aur"}],
-            [{"name": "a", "installed": "1-1", "official": "1.1-1",
+            [{"name": "a", "installed": "1-1", "target": "1.1-1", "source": "extra",
               "relation": "upgrade"},
-             {"name": "d", "installed": "3-1", "official": "2-1",
+             {"name": "d", "installed": "3-1", "target": "2-1", "source": "extra",
               "relation": "downgrade"}])
         window._move_all_tracked()
         # 'a' starts immediately; 'd' needs individual confirmation
@@ -1417,7 +1418,7 @@ class TestViews:
             [])
         qapp.processEvents()
         # No selection → move-all offering (nothing movable here).
-        assert window._track_move_all_btn.text() == "Move all to official"
+        assert window._track_move_all_btn.text() == "Move to managed repos"
         assert not window._track_move_all_btn.isEnabled()
         # Check one row → main button becomes the uninstall action.
         window._track_model.set_all(True)
@@ -1431,7 +1432,7 @@ class TestViews:
             Qt.CheckState.Checked
         assert "All 2 packages selected" in window._track_sel_label.text()
         window._select_tracked_all(False)
-        assert window._track_move_all_btn.text() == "Move all to official"
+        assert window._track_move_all_btn.text() == "Move to managed repos"
 
     def test_tracked_batch_uninstall_success(self, window, qapp, monkeypatch):
         monkeypatch.setattr(app, "QMessageBox", self._AcceptBox)
@@ -1466,7 +1467,7 @@ class TestViews:
         self._settle_track_loader(window, qapp)
         window._on_tracked_loaded(
             [{"name": "b-aur", "version": "1-1", "repo": "aur"}],
-            [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+            [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
               "relation": "upgrade"}])
         window._request_track_switch("b-aur")
         assert window._track_model.item(0)["state"] == "switching"
@@ -1503,7 +1504,7 @@ class TestViews:
         self._settle_track_loader(window, qapp)
         window._on_tracked_loaded(
             [{"name": "b-aur", "version": "1-1", "repo": "aur"}],
-            [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+            [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
               "relation": "upgrade"}])
         monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
         window._on_track_main_clicked()
@@ -1806,7 +1807,7 @@ class TestViewBanners:
 
     def test_moves_banner_filters_to_current_list(self, window, qapp):
         window._pending_moves = [{"name": "yakuake", "installed": "1-1",
-                                  "official": "1.1-1", "relation": "upgrade"}]
+                                  "target": "1.1-1", "source": "extra", "relation": "upgrade"}]
         window._swap_updates_model(
             [{"name": "yakuake", "old": "1-1", "new": "1.1-1",
               "repo": "aur"}], {})

@@ -51,7 +51,67 @@ from PyQt6.QtWidgets import (
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-OFFICIAL_REPOS = {"core", "extra", "multilib", "core-testing", "extra-testing"}
+# Repos whose packages are built and signed by Arch's own packagers.
+# Anything else that carries a package the AUR also has is a *managed
+# source*: somebody else compiles and signs it, so you are not running an
+# unreviewed PKGBUILD on your own machine. CachyOS and Chaotic-AUR are the
+# common ones; the label always names the repo that actually provides it.
+OFFICIAL_REPOS = {
+    "core", "extra", "multilib",
+    "core-testing", "extra-testing", "multilib-testing",
+    "community", "community-testing", "testing", "staging",
+    "gnome-unstable", "kde-unstable",
+}
+
+
+# Where a package can live instead of the AUR, and what backs each one.
+# This app never edits pacman.conf — it reports what is enabled and what
+# switching would buy you, and the user decides.
+_MANAGED_SOURCES: list[tuple[str, str, str]] = [
+    ("Official repos", "core",
+     "Built and signed by Arch's own packagers. The only source this app "
+     "calls official, and the safest place for a package to land."),
+    ("CachyOS", "cachyos",
+     "Arch and AUR packages rebuilt and signed by the CachyOS build farm, "
+     "with performance, stability and security patches on top. No PKGBUILD "
+     "is run on your machine to get one."),
+    ("Chaotic-AUR", "chaotic-aur",
+     "A semi-automated AUR build farm: packages are signed, the PKGBUILD and "
+     "its sources are statically scanned before a build, and a package is "
+     "held back unless every AUR maintainer involved is trusted."),
+    ("archlinuxcn", "archlinuxcn",
+     "A long-running community repo with prebuilt AUR packages. Convenient, "
+     "but one maintainer team stands behind all of it."),
+    ("Flatpak · Flathub", "flatpak",
+     "Sandboxed, signed and curated per application. Not a pacman repo, so "
+     "migrating means removing the package and installing the Flatpak."),
+]
+
+
+def enabled_repos() -> set[str]:
+    """Repo names enabled in pacman.conf (read only — never written to)."""
+    names: set[str] = set()
+    try:
+        with open("/etc/pacman.conf", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if (line.startswith("[") and line.endswith("]")
+                        and line.lower() != "[options]"):
+                    names.add(line[1:-1])
+    except OSError:
+        pass
+    return names
+
+
+def _repo_kind(repo: str) -> str:
+    """'official', or 'managed' for a third-party binary source."""
+    return "official" if (repo or "").lower() in OFFICIAL_REPOS else "managed"
+
+
+def _repo_label(repo: str) -> str:
+    """Human name for a providing repo ('official' reads better than a list)."""
+    kind = _repo_kind(repo)
+    return "official" if kind == "official" else (repo or "third-party")
 
 GITLAB_HOSTS = [
     "gitlab.gnome.org",
@@ -1074,17 +1134,34 @@ def get_foreign_packages() -> dict[str, str]:
     return out
 
 
-def parse_sync_versions(output: str) -> dict[str, str]:
-    """Parse `pacman -Si` batch output into {name: version}."""
-    found: dict[str, str] = {}
+def parse_sync_info(output: str) -> dict[str, tuple[str, str]]:
+    """Parse `pacman -Si` batch output into {name: (version, repo)}.
+
+    `pacman -Si` searches every *enabled* repo, so the Repository field is
+    how we learn which one actually provides a package the AUR also has —
+    an official repo, or a managed binary source like cachyos or
+    chaotic-aur.
+    """
+    found: dict[str, tuple[str, str]] = {}
     name = ""
+    repo = ""
     for line in (output or "").splitlines():
-        if line.startswith("Name"):
+        # `pacman -Si` prints Repository *before* Name, so remember it and
+        # attach it when the package's Name arrives.
+        if line.startswith("Repository"):
+            repo = line.split(":", 1)[1].strip()
+        elif line.startswith("Name"):
             name = line.split(":", 1)[1].strip()
         elif line.startswith("Version") and name:
-            found[name] = line.split(":", 1)[1].strip()
+            found.setdefault(name, (line.split(":", 1)[1].strip(), repo))
             name = ""
     return found
+
+
+def parse_sync_versions(output: str) -> dict[str, str]:
+    """Parse `pacman -Si` batch output into {name: version}."""
+    return {name: version
+            for name, (version, _repo) in parse_sync_info(output).items()}
 
 
 def compare_versions(a: str, b: str) -> int:
@@ -1098,11 +1175,15 @@ def compare_versions(a: str, b: str) -> int:
 
 
 def find_repo_moves(names: list[str] | None = None) -> list[dict]:
-    """Find foreign packages also provided by the official repos.
+    """Find foreign packages that an enabled repo also provides.
 
-    Returns [{name, installed, official, relation}] where relation is
-    'upgrade' (official newer), 'same', or 'downgrade' (needs confirm).
-    Pass `names` to check only those packages (faster for banners).
+    That is the whole "get off the AUR" story: if a managed repo carries
+    the package, switching means a signed, prebuilt package instead of
+    compiling an unreviewed PKGBUILD here.
+
+    Returns [{name, installed, target, source, relation}] where relation
+    is 'upgrade' (the repo build is newer), 'same', or 'downgrade' (needs
+    confirming). Pass `names` to check only those packages (faster).
     """
     foreign = get_foreign_packages()
     if not foreign:
@@ -1119,14 +1200,16 @@ def find_repo_moves(names: list[str] | None = None) -> list[dict]:
                            capture_output=True, text=True, timeout=60)
     except Exception:
         return []
-    sync = parse_sync_versions(r.stdout or "")
+    sync = parse_sync_info(r.stdout or "")
     moves: list[dict] = []
     for name, inst in foreign.items():
         if name not in sync:
             continue
-        cmp = compare_versions(inst, sync[name])
+        target, repo = sync[name]
+        cmp = compare_versions(inst, target)
         moves.append({
-            "name": name, "installed": inst, "official": sync[name],
+            "name": name, "installed": inst, "target": target,
+            "source": repo, "source_kind": _repo_kind(repo),
             "relation": "upgrade" if cmp < 0 else (
                 "same" if cmp == 0 else "downgrade"),
         })
@@ -1592,7 +1675,8 @@ def _tracked_row(name: str, version: str, repo: str, title: str = "",
                  desktop: str = "", desc: str = "") -> dict:
     """A complete TrackedModel-compatible row dict."""
     return {"name": name, "title": title, "version": version, "repo": repo,
-            "official": "", "relation": "", "state": "idle", "failed_op": "",
+            "target": "", "source": "", "relation": "",
+            "state": "idle", "failed_op": "",
             "desktop": desktop or None, "desc": desc, "checked": False}
 
 
@@ -3832,7 +3916,8 @@ class TrackedModel(_FilterableModel, QAbstractListModel):
             items.append({
                 "name": pkg["name"], "version": pkg.get("version", ""),
                 "repo": pkg.get("repo", ""),
-                "official": m["official"] if m else "",
+                "target": m["target"] if m else "",
+                "source": m["source"] if m else "",
                 "relation": m["relation"] if m else "",
                 "state": "idle",
                 "failed_op": "",
@@ -3846,7 +3931,7 @@ class TrackedModel(_FilterableModel, QAbstractListModel):
                 "checked": False,
             })
         # Movable packages float to the top, then alphabetical.
-        items.sort(key=lambda it: (not it["official"], it["name"].lower()))
+        items.sort(key=lambda it: (not it["target"], it["name"].lower()))
         self.beginResetModel()
         self._items = items
         self._reapply_filter()
@@ -3957,7 +4042,7 @@ class TrackedModel(_FilterableModel, QAbstractListModel):
 
     def movable_names(self) -> list[str]:
         """Movable packages in the current view (drives Select all)."""
-        return [it["name"] for it in self.visible_items() if it["official"]]
+        return [it["name"] for it in self.visible_items() if it["target"]]
 
 
 class TrackedDelegate(QStyledItemDelegate):
@@ -4026,10 +4111,13 @@ class TrackedDelegate(QStyledItemDelegate):
         name_w = min(fm_name.horizontalAdvance(title) + 14, name_avail)
         title_txt = fm_name.elidedText(title, Qt.TextElideMode.ElideRight,
                                        name_w)
-        # Metadata line: installed version, or "installed → official" when
-        # an official build exists (mirrors the Updates old → new line),
-        # followed by the description when there is room for it.
-        official = item["official"] or ""
+        # Metadata line: installed version, or "installed → cachyos" when
+        # a managed repo carries it (mirrors the Updates old → new line),
+        # followed by the description when there is room for it. The repo
+        # is named, because "some other source has this" is the whole
+        # point of switching off the AUR.
+        target = item["target"] or ""
+        source = item["source"] or ""
         # Untracked app rows show the human application name as their
         # title — the *package* name (what Uninstall removes) must stay
         # visible, so it rides on the version line.
@@ -4037,11 +4125,11 @@ class TrackedDelegate(QStyledItemDelegate):
         if (item.get("title") or "").strip() and item["title"] != item["name"]:
             pkg_txt = item["name"] if not item["version"] \
                 else f" · {item['name']}"
-        if official:
+        if target:
             ver_left = f"{item['version']} → " if item["version"] else ""
             ver_left_w = fm.horizontalAdvance(ver_left)
             ver_right = fm_bold.elidedText(
-                official, Qt.TextElideMode.ElideRight,
+                f"{_repo_label(source)} {target}", Qt.TextElideMode.ElideRight,
                 max(20, cw - ver_left_w))
         else:
             ver_left = fm.elidedText(item["version"],
@@ -4054,7 +4142,7 @@ class TrackedDelegate(QStyledItemDelegate):
         h_name, h_line, h_pill = self._rows()
         ver_top = y + h_name + self.GAP
         desc_avail = max(0, cw - ver_left_w
-                         - (fm_bold.horizontalAdvance(ver_right) if official
+                         - (fm_bold.horizontalAdvance(ver_right) if target
                             else fm.horizontalAdvance(ver_left)))
         desc_txt = (fm.elidedText(item.get("desc") or "",
                                   Qt.TextElideMode.ElideRight, desc_avail)
@@ -4070,7 +4158,7 @@ class TrackedDelegate(QStyledItemDelegate):
         switch_failed = (item["state"] == "failed"
                          and item.get("failed_op", "switch") == "switch")
         pills_w = 0
-        if official:
+        if target:
             if item["state"] == "switching":
                 txt = "Switching…"
             elif item["state"] == "done":
@@ -4106,13 +4194,20 @@ class TrackedDelegate(QStyledItemDelegate):
         # Row = card + CDY on both sides, so cards keep an 8px gap and
         # the card itself always has PBOT below its last element.
         total = ycur + self.PBOT + self.CDY
-        # Bottom-line hint: official-switch note or AUR-only verdict.
-        # Official packages already on their build get no label at all.
-        # Only an actionable hint earns a line: the AUR badge already says
-        # "AUR", so repeating "not in the official repos" was just noise.
-        if official:
-            hint_txt = (f"Official {official} available"
-                        " — switch for signed builds")
+        # Bottom-line hint: what switching would buy you. The source is
+        # named and the two kinds read differently — an official build is
+        # Arch's own, a managed source is somebody else's build farm, which
+        # is still a signed, prebuilt package rather than a PKGBUILD run
+        # here. Only an actionable hint earns a line: the AUR badge already
+        # says "AUR", so "not in the official repos" was just noise.
+        if target:
+            label = _repo_label(source)
+            if _repo_kind(source) == "official":
+                hint_txt = (f"{label.capitalize()} {target} available"
+                            " — switch for signed builds")
+            else:
+                hint_txt = (f"{label} {target} available — switch for a"
+                            " prebuilt, signed package")
             hint_col = _positive_hex()
         else:
             hint_txt = ""
@@ -4240,8 +4335,8 @@ class TrackedDelegate(QStyledItemDelegate):
                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                    lay["link_txt"])
         p.setFont(self._f_text)
-        # Version line: installed version, or installed → official when
-        # an official build exists (mirrors Updates' old → new line).
+        # Version line: installed version, or installed → <repo> when a
+        # managed repo carries it (mirrors Updates' old → new line).
         p.setPen(QPen(QColor(_secondary_hex())))
         vr = move(lay["ver"])
         if lay["ver_right"]:
@@ -4499,6 +4594,7 @@ class UpdateWindow(QMainWindow):
         self._popover: NotesPopover | None = None
         self._orphans: set = set()  # parked threads (see _park_thread)
         self._moves_dialog: MovesDialog | None = None
+        self._sources_dialog: ManagedSourcesDialog | None = None
         # Buttons whose icons bake the theme's grey: re-resolved live in
         # _apply_theme(). Registered via _icon_btn(), keyed by button so a
         # repeat registration never accumulates duplicates.
@@ -5100,11 +5196,21 @@ class UpdateWindow(QMainWindow):
         ft.addWidget(self._track_footer_label, 0,
                      Qt.AlignmentFlag.AlignVCenter)
         ft.addStretch()
+        self._track_sources_btn = QPushButton("Sources")
+        self._track_sources_btn.setObjectName("secondary-small")
+        self._track_sources_btn.setFixedHeight(_sp(28))
+        self._track_sources_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._icon_btn(self._track_sources_btn, "info-circle", 14)
+        self._track_sources_btn.setToolTip(
+            "Where these packages can go instead of the AUR, and what backs "
+            "each source")
+        self._track_sources_btn.clicked.connect(self._open_sources_dialog)
+        ft.addWidget(self._track_sources_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         self._track_refresh_btn = self._refresh_button(
             "Reload the list of installed packages",
             self._refresh_tracked)
         ft.addWidget(self._track_refresh_btn)
-        self._track_move_all_btn = QPushButton("Move all to official")
+        self._track_move_all_btn = QPushButton("Move to managed repos")
         self._track_move_all_btn.setObjectName("primary")
         self._track_move_all_btn.setFixedHeight(_sp(34))
         self._track_move_all_btn.setMinimumWidth(190)
@@ -5592,7 +5698,7 @@ class UpdateWindow(QMainWindow):
         self._slot_security.setVisible(True)
 
     def _rebuild_moves_banner(self, recompute: bool = False) -> None:
-        """AUR→official banner inside its slot, mirroring the current list.
+        """AUR→managed banner inside its slot, mirroring the current list.
 
         `recompute` (construction only) asks pacman for the candidate set;
         afterwards the set is just filtered to the names the fresh check
@@ -5628,7 +5734,8 @@ class UpdateWindow(QMainWindow):
         mt = QLabel(
             f"<b>{len(self._pending_moves)} of these AUR packages "
             f"{'is' if len(self._pending_moves) == 1 else 'are'} also in "
-            "the official repos</b> — switch for signed builds.")
+            "a managed repo</b> — switch for a signed, prebuilt "
+            "package.")
         mt.setObjectName("banner-body")
         mt.setWordWrap(True)
         mb.addWidget(mt, 1)
@@ -5917,12 +6024,12 @@ class UpdateWindow(QMainWindow):
         elif movable:
             self._track_summary.setText(
                 f"<b>{n}</b> tracked packages · "
-                f"<b>{len(movable)}</b> also in official repos")
+                f"<b>{len(movable)}</b> available from a managed repo")
         elif n_aur:
             self._track_summary.setText(
-                f"<b>{n}</b> tracked packages · checked "
-                f"{n_aur} AUR package{'s' if n_aur != 1 else ''} — "
-                "none in the official repos")
+                f"<b>{n}</b> tracked packages · "
+                f"{n_aur} AUR package{'s' if n_aur != 1 else ''} — none "
+                "available from a managed repo")
         else:
             self._track_summary.setText(
                 f"<b>{n}</b> tracked packages — all on official builds.")
@@ -5951,7 +6058,7 @@ class UpdateWindow(QMainWindow):
         """
         if not getattr(self, "_track_loaded", False):
             self._track_footer_label.setText("Loading…")
-            self._track_move_all_btn.setText("Move all to official")
+            self._track_move_all_btn.setText("Move to managed repos")
             self._track_move_all_btn.setEnabled(False)
             return
         n = self._track_model.rowCount()
@@ -5979,20 +6086,21 @@ class UpdateWindow(QMainWindow):
             return
         if movable:
             self._track_footer_label.setText(
-                f"{len(movable)} can move to official")
-            self._track_move_all_btn.setText("Move all to official")
+                f"{len(movable)} can move off the AUR")
+            self._track_move_all_btn.setText("Move to managed repos")
             self._track_move_all_btn.setToolTip(
-                "Switch every movable package to official builds, one by one")
+                "Switch every movable package to the signed build from its "
+                "repo, one by one")
             self._track_move_all_btn.setEnabled(True)
         elif n:
             self._track_footer_label.setText(f"{n} tracked · nothing to move")
-            self._track_move_all_btn.setText("Move all to official")
+            self._track_move_all_btn.setText("Move to managed repos")
             self._track_move_all_btn.setToolTip(
                 "Switch every movable package to official builds, one by one")
             self._track_move_all_btn.setEnabled(False)
         else:
             self._track_footer_label.setText("Nothing tracked")
-            self._track_move_all_btn.setText("Move all to official")
+            self._track_move_all_btn.setText("Move to managed repos")
             self._track_move_all_btn.setEnabled(False)
 
     def _on_track_toggled(self, row: int) -> None:
@@ -6044,7 +6152,7 @@ class UpdateWindow(QMainWindow):
         if r is None:
             return
         item = self._track_model.item(r)
-        if not item["official"] or name in self._track_queue \
+        if not item["target"] or name in self._track_queue \
                 or name == self._track_current:
             return
         if item["relation"] == "downgrade" and item["state"] != "failed":
@@ -6052,7 +6160,8 @@ class UpdateWindow(QMainWindow):
             box.setWindowTitle(f"Switch {name}?")
             box.setIcon(QMessageBox.Icon.Warning)
             box.setText(
-                f"The official build ({item['official']}) is OLDER than your "
+                f"The {_repo_label(item['source'])} build "
+                f"({item['target']}) is OLDER than your "
                 f"installed AUR build ({item['version']}).\n\n"
                 "Switching will downgrade the package. Proceed?")
             go_btn = box.addButton("Switch anyway",
@@ -6080,11 +6189,11 @@ class UpdateWindow(QMainWindow):
         self._run_next_track_switch()
         self._set_status(
             f"Queued {len(self._track_queue)} move"
-            f"{'s' if len(self._track_queue) != 1 else ''} to official builds…",
+            f"{'s' if len(self._track_queue) != 1 else ''} to managed repos…",
             "info")
         self._log_action(
             f"Queued {len(self._track_queue)} move"
-            f"{'s' if len(self._track_queue) != 1 else ''} to official builds")
+            f"{'s' if len(self._track_queue) != 1 else ''} to managed repos")
 
     def _run_next_track_switch(self) -> None:
         if self._track_runner is not None or not self._track_queue:
@@ -6098,8 +6207,12 @@ class UpdateWindow(QMainWindow):
         name = self._track_queue.pop(0)
         self._track_current = name
         self._track_model.set_state(name, "switching")
-        self._set_status(f"Switching {name} to the official build…", "info")
-        self._log_action(f"Switching {name} to the official build…")
+        row = self._track_model.row_of(name)
+        source = (self._track_model.item(row)["source"]
+                  if row is not None else "")
+        label = _repo_label(source)
+        self._set_status(f"Switching {name} to the {label} build…", "info")
+        self._log_action(f"Switching {name} to the {label} build…")
         self._track_runner = UpdateRunner(None, [name])
         self._track_runner.done.connect(self._on_track_switch_done)
         self._track_runner.start()
@@ -6115,7 +6228,7 @@ class UpdateWindow(QMainWindow):
         item = self._track_model.item(r)
         verified = False
         if success:
-            verified = not verify_upgraded({name: item["official"]})
+            verified = not verify_upgraded({name: item["target"]})
         if not success and classify_update_failure(output)[0] == "cancelled":
             # Circuit breaker: auth dismissed — nothing ran.
             self._track_model.set_state(name, "idle")
@@ -6128,11 +6241,12 @@ class UpdateWindow(QMainWindow):
             return
         if success and verified:
             self._track_model.set_state(name, "done")
-            self._set_status(f"{name} now tracks the official build ✓", "ok")
-            self._log_action(f"{name} now tracks the official build ✓")
+            label = _repo_label(item["source"])
+            self._set_status(f"{name} now tracks the {label} build ✓", "ok")
+            self._log_action(f"{name} now tracks the {label} build ✓")
         else:
             if success:
-                output += (f"\n{name}: still not at {item['official']} — "
+                output += (f"\n{name}: still not at {item['target']} — "
                            "was not upgraded (stale sync database)")
             self._track_model.set_state(name, "failed", op="switch")
             self._log_action(f"Switching {name} failed")
@@ -6141,7 +6255,8 @@ class UpdateWindow(QMainWindow):
             lines = [l for l in output.splitlines() if l.strip()]
             self._show_error_dialog(
                 "switch failed",
-                f"Switching {name} to the official build failed.",
+                f"Switching {name} to the "
+                f"{_repo_label(item['source'])} build failed.",
                 "Use Retry on its row, or open the log panel for the full "
                 "output.",
                 "\n".join(lines[-40:]) if lines else "(no output captured)")
@@ -7328,6 +7443,21 @@ class UpdateWindow(QMainWindow):
         self.show_popover(row)
 
     # — AUR → official moves —
+    def _open_sources_dialog(self) -> None:
+        """Explain the managed sources — read-only, never edits pacman.conf."""
+        if self._sources_dialog is not None:
+            self._sources_dialog.raise_()
+            self._sources_dialog.activateWindow()
+            return
+        self._sources_dialog = ManagedSourcesDialog()
+        self._sources_dialog.closed.connect(self._on_sources_closed)
+        self._sources_dialog.show()
+        self._sources_dialog.raise_()
+        self._sources_dialog.activateWindow()
+
+    def _on_sources_closed(self) -> None:
+        self._sources_dialog = None
+
     def _open_moves_dialog(self) -> None:
         if self._moves_dialog is not None:
             self._moves_dialog.raise_()
@@ -7346,7 +7476,7 @@ class UpdateWindow(QMainWindow):
 
     def _on_moves_changed(self) -> None:
         self._set_status(
-            "Switched to official builds — press Check Now (tray) or "
+            "Switched to managed repos — press Check Now (tray) or "
             "reopen this window to refresh the list.", "ok")
 
     def show_popover(self, row: int) -> None:
@@ -7787,13 +7917,14 @@ _SEC_SCAN_HINT = ("Scan all installed packages against known "
                   "supply-chain attacks.")
 
 
-def _relation_pill(relation: str) -> str:
-    """Pill label for a switch candidate."""
+def _relation_pill(relation: str, source: str = "") -> str:
+    """Pill label for a switch candidate: which source, and how it compares."""
+    label = _repo_label(source)
     return {
-        "upgrade": "official newer",
+        "upgrade": f"{label} newer",
         "same": "same version",
-        "downgrade": "official older",
-    }.get(relation, "official")
+        "downgrade": f"{label} older",
+    }.get(relation, label)
 
 
 def _relation_tint(relation: str) -> str:
@@ -7827,7 +7958,8 @@ class _MoveRow(QWidget):
         name = QLabel(move["name"])
         name.setObjectName("package-name")
         name_row.addWidget(name)
-        name_row.addWidget(_badge(_relation_pill(move["relation"]),
+        name_row.addWidget(_badge(_relation_pill(move["relation"],
+                                                 move["source"]),
                                   _relation_tint(move["relation"])))
         name_row.addStretch()
         left.addLayout(name_row)
@@ -7837,7 +7969,7 @@ class _MoveRow(QWidget):
         was = QLabel(f"AUR {move['installed']}  →")
         was.setObjectName("text-muted")
         ver.addWidget(was)
-        now = QLabel(f"official {move['official']}")
+        now = QLabel(f"{_repo_label(move['source'])} {move['target']}")
         now.setObjectName("text-positive")
         ver.addWidget(now)
         ver.addStretch()
@@ -7849,7 +7981,8 @@ class _MoveRow(QWidget):
         self._switch_btn.setObjectName("secondary-small")
         self._switch_btn.setFixedHeight(_sp(28))
         self._switch_btn.setToolTip(
-            "Replace the AUR build with the official repository package")
+            "Replace the AUR build with the signed package from "
+            f"{_repo_label(move['source'])}")
         self._switch_btn.clicked.connect(lambda: on_switch(self.move_name))
         top.addWidget(self._switch_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         body.addLayout(top)
@@ -7899,6 +8032,112 @@ class _MoveRow(QWidget):
         self.style().polish(self)
 
 
+class ManagedSourcesDialog(QMainWindow):
+    """Where a package can go instead of the AUR, and what backs each one.
+
+    Read-only guidance: the app never edits pacman.conf. It does say which
+    sources are already enabled, so the answer to "can I switch this off
+    the AUR today?" is visible without leaving the app.
+    """
+
+    closed = pyqtSignal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Managed sources")
+        self.setMinimumSize(_sp(720), _sp(560))
+        self.setStyleSheet(_themed_qss())
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        lay = QVBoxLayout(root)
+        lay.setContentsMargins(_sp(24), _sp(24), _sp(24), _sp(24))
+        lay.setSpacing(_sp(16))
+
+        head = QHBoxLayout()
+        head.setSpacing(_sp(16))
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(_app_icon().pixmap(_sp(36), _sp(36)))
+        head.addWidget(icon_lbl, 0, Qt.AlignmentFlag.AlignTop)
+        tb = QVBoxLayout()
+        tb.setSpacing(_sp(4))
+        eyebrow = QLabel("MANAGED SOURCES")
+        eyebrow.setObjectName("eyebrow")
+        tb.addWidget(eyebrow)
+        title = QLabel("Getting off the AUR")
+        title.setObjectName("title")
+        tb.addWidget(title)
+        sub = QLabel(
+            "An AUR package is a recipe that runs on your machine, signed by "
+            "nobody. These sources hand you a signed, prebuilt package built "
+            "from the same recipe on someone else's hardware.")
+        sub.setObjectName("subtitle")
+        sub.setWordWrap(True)
+        tb.addWidget(sub)
+        head.addLayout(tb, 1)
+        lay.addLayout(head)
+        lay.addWidget(_divider())
+
+        enabled = enabled_repos()
+        scroll = QScrollArea()
+        scroll.setObjectName("package-list")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        inner.setObjectName("list-inner")
+        box = QVBoxLayout(inner)
+        box.setContentsMargins(_sp(8), _sp(8), _sp(8), _sp(8))
+        box.setSpacing(_sp(8))
+        for name, probe, why in _MANAGED_SOURCES:
+            card = QWidget()
+            card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            card.setObjectName("package-card")
+            body = _card_layout(card, None, spacing=4)
+            row = QHBoxLayout()
+            row.setSpacing(_sp(8))
+            label = QLabel(name)
+            label.setObjectName("package-name")
+            row.addWidget(label)
+            on_here = probe in enabled
+            row.addWidget(_badge("enabled" if on_here else "not enabled",
+                                 "positive" if on_here else "muted"))
+            row.addStretch()
+            body.addLayout(row)
+            note = QLabel(why)
+            note.setObjectName("text-muted")
+            note.setWordWrap(True)
+            body.addWidget(note)
+            box.addWidget(card)
+        box.addStretch()
+        scroll.setWidget(inner)
+        lay.addWidget(scroll, 1)
+
+        foot = QHBoxLayout()
+        foot.setSpacing(_sp(8))
+        hint = QLabel(
+            "Adding a repo is your call, in /etc/pacman.conf — this app "
+            "never changes it.")
+        hint.setObjectName("meta")
+        hint.setWordWrap(True)
+        foot.addWidget(hint, 1)
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("primary")
+        close_btn.setFixedHeight(_sp(34))
+        close_btn.setMinimumWidth(_sp(120))
+        close_btn.clicked.connect(self.close)
+        foot.addWidget(close_btn)
+        lay.addLayout(foot)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        super().closeEvent(event)
+        self.closed.emit()
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if event.type() in _THEME_CHANGE_TYPES:
+            self.setStyleSheet(_themed_qss())
+
+
 class MovesDialog(QMainWindow):
     """Review foreign packages available in official repos; switch them."""
 
@@ -7918,7 +8157,7 @@ class MovesDialog(QMainWindow):
 
         n = len(moves)
         self.setWindowTitle(
-            f"Switch to Official Packages — {n} candidate"
+            f"Switch to Managed Packages — {n} candidate"
             f"{'s' if n != 1 else ''}")
         self.setMinimumSize(760, 480)
         self.setStyleSheet(_themed_qss())
@@ -7936,15 +8175,18 @@ class MovesDialog(QMainWindow):
         head.addWidget(icon_lbl, 0, Qt.AlignmentFlag.AlignTop)
         tb = QVBoxLayout()
         tb.setSpacing(2)
-        eyebrow = QLabel("REPOSITORY MOVES")
+        eyebrow = QLabel("MANAGED SOURCES")
         eyebrow.setObjectName("eyebrow")
         tb.addWidget(eyebrow)
-        title = QLabel("Switch to Official Packages")
+        title = QLabel("Switch off the AUR")
         title.setObjectName("title")
         tb.addWidget(title)
+        sources = sorted({_repo_label(m["source"]) for m in moves})
         sub = QLabel(
-            "These installed AUR packages are also in the official repos. "
-            "Switching gives you signed builds and updates.")
+            "These installed AUR packages are also carried by a managed "
+            "repo: <b>" + ", ".join(sources) + "</b>. Switching replaces "
+            "your locally-built AUR package with that repo's signed, "
+            "prebuilt one — no PKGBUILD of yours is run to get it.")
         sub.setObjectName("subtitle")
         sub.setWordWrap(True)
         tb.addWidget(sub)
@@ -7996,7 +8238,8 @@ class MovesDialog(QMainWindow):
             box.setWindowTitle(f"Switch {name}?")
             box.setIcon(QMessageBox.Icon.Warning)
             box.setText(
-                f"The official build ({move['official']}) is OLDER than your "
+                f"The {_repo_label(move['source'])} build "
+                f"({move['target']}) is OLDER than your "
                 f"installed AUR build ({move['installed']}).\n\n"
                 "Switching will downgrade the package. Proceed?")
             go_btn = box.addButton("Switch anyway",
@@ -8044,7 +8287,7 @@ class MovesDialog(QMainWindow):
         move = self._moves.get(name, {})
         verified = False
         if success and move:
-            verified = not verify_upgraded({name: move["official"]})
+            verified = not verify_upgraded({name: move["target"]})
         if not success and classify_update_failure(output)[0] == "cancelled":
             # Circuit breaker: auth dismissed — nothing ran.
             self._rows[name].set_row_state("idle")
@@ -8056,14 +8299,17 @@ class MovesDialog(QMainWindow):
             return
         if success and verified:
             self._rows[name].set_row_state(
-                "done", f"Now tracking official {move['official']} ✓")
+                "done",
+                f"Now tracking {_repo_label(move['source'])} "
+                f"{move['target']} ✓")
             self._changed = True
             self.logged.emit(f"{name} now tracks the official build ✓")
             self.moves_done.emit()
         else:
             if success:
                 # Exit 0 but version didn't land (stale DB edge).
-                output += (f"\n{name}: still not at {move.get('official', '?')} — "
+                output += (f"\n{name}: still not at "
+                           f"{move.get('target', '?')} — "
                            "was not upgraded (stale sync database)")
             lines = [l for l in output.splitlines() if l.strip()]
             hint = " · ".join(lines[-2:]) if lines else "No output captured"

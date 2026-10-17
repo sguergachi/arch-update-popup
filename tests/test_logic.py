@@ -440,6 +440,77 @@ class TestIcons:
             assert name in app._ICON_SVGS
 
 
+class TestManagedSources:
+    """Getting a package off the AUR: detection and classification."""
+
+    def test_official_repos_are_recognised(self):
+        for repo in ("core", "extra", "multilib", "extra-testing"):
+            assert app._repo_kind(repo) == "official"
+            assert app._repo_label(repo) == "official"
+
+    def test_binary_aur_repos_are_managed_and_named(self):
+        for repo in ("cachyos", "chaotic-aur", "archlinuxcn", "alhp",
+                     "garuda"):
+            assert app._repo_kind(repo) == "managed"
+            # Named, not swallowed into "official": which farm built it
+            # matters when you are deciding what to trust.
+            assert app._repo_label(repo) == repo
+
+    def test_parse_sync_info_reads_the_repo(self):
+        out = (
+            "Repository      : cachyos\n"
+            "Name            : brave-bin\n"
+            "Version         : 1.80.0-1\n"
+            "\n"
+            "Repository      : extra\n"
+            "Name            : discord\n"
+            "Version         : 0.0.100-1\n")
+        info = app.parse_sync_info(out)
+        assert info["brave-bin"] == ("1.80.0-1", "cachyos")
+        assert info["discord"] == ("0.0.100-1", "extra")
+        # The old name→version view still works.
+        assert app.parse_sync_versions(out) == {
+            "brave-bin": "1.80.0-1", "discord": "0.0.100-1"}
+
+    def test_moves_carry_the_providing_repo(self, monkeypatch):
+        monkeypatch.setattr(app, "get_foreign_packages",
+                            lambda: {"brave-bin": "1.79.1-1"})
+        monkeypatch.setattr(app, "compare_versions", lambda a, b: -1)
+        monkeypatch.setattr(app, "_run", lambda *a, **k: type(
+            "R", (), {"stdout": "Repository      : cachyos\n"
+                                "Name            : brave-bin\n"
+                                "Version         : 1.80.0-1\n",
+                      "returncode": 0})())
+        moves = app.find_repo_moves(["brave-bin"])
+        assert moves == [{"name": "brave-bin", "installed": "1.79.1-1",
+                          "target": "1.80.0-1", "source": "cachyos",
+                          "source_kind": "managed", "relation": "upgrade"}]
+
+    def test_enabled_repos_are_read_from_pacman_conf(self, tmp_path,
+                                                    monkeypatch):
+        conf = tmp_path / "pacman.conf"
+        conf.write_text("[options]\nHoldPkg = pacman\n\n[cachyos-v3]\n"
+                        "Include = /etc/pacman.d/cachyos-v3-mirrorlist\n"
+                        "\n[extra]\n")
+        # Point the reader at the fixture without touching the real file.
+        real_open = open
+
+        def fake_open(path, *a, **k):
+            if str(path) == "/etc/pacman.conf":
+                return real_open(conf, *a, **k)
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        assert app.enabled_repos() == {"cachyos-v3", "extra"}
+
+    def test_sources_table_covers_the_known_good_ones(self):
+        probes = {probe for _name, probe, _why in app._MANAGED_SOURCES}
+        assert {"core", "cachyos", "chaotic-aur", "archlinuxcn",
+                "flatpak"} <= probes
+        for name, _probe, why in app._MANAGED_SOURCES:
+            assert name and len(why) > 40, name
+
+
 class TestDesignSystem:
     def test_type_scale_is_ordered(self):
         sizes = [app._sp(n) for n in (11, 12, 13, 20, 22)]

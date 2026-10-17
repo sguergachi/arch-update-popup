@@ -280,7 +280,7 @@ class TestTrackedModel:
             [{"name": "b-aur", "version": "1-1", "repo": "aur"},
              {"name": "a-off", "version": "2-1", "repo": "official"},
              {"name": "c-aur", "version": "3-1", "repo": "aur"}],
-            [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+            [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
               "relation": "upgrade"}])
         return m
 
@@ -314,7 +314,7 @@ def tracked_view(qapp):
     m.set_packages(
         [{"name": "b-aur", "version": "1-1", "repo": "aur"},
          {"name": "a-off", "version": "2-1", "repo": "official"}],
-        [{"name": "b-aur", "installed": "1-1", "official": "1.1-1",
+        [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
           "relation": "upgrade"}])
     v = QListView()
     v.resize(900, 400)
@@ -516,8 +516,9 @@ class TestTrackedDelegate:
         assert card.left() <= lay["link"].left()
         # Version line splits installed → official for movable rows.
         assert lay["ver_left"].startswith("1-1")
-        assert lay["ver_right"] == "1.1-1"
-        # Movable row: official-switch hint on the bottom line.
+        # The target names its source: an official repo reads as
+        # "official", a third-party one by name.
+        assert lay["ver_right"] == "official 1.1-1"
         assert "switch for signed builds" in lay["hint_txt"]
         # Non-movable official row: no label at all.
         m = tracked_view.model()
@@ -709,7 +710,7 @@ class TestUntrackedScan:
     def test_tracked_row_complete(self):
         row = app._tracked_row("p", "1-1", "official", title="T")
         assert row == {"name": "p", "title": "T", "version": "1-1",
-                       "repo": "official", "official": "",
+                       "repo": "official", "target": "", "source": "",
                        "relation": "", "state": "idle", "failed_op": "",
                        "desktop": None, "desc": "", "checked": False}
 
