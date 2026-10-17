@@ -8300,18 +8300,24 @@ class ManagedSourcesDialog(QMainWindow):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle(f"Enable {name}")
-        box.setText(
-            f"Enable {name}?\n\n"
+        box.setText(f"Enable {name}?")
+        box.setInformativeText(
             "This will change your system: it imports a signing key, "
             "installs the repo's mirrorlist and keyring, and appends the "
-            "repo to /etc/pacman.conf (a backup is written first). "
-            "Nothing runs until you confirm.")
-        box.setInformativeText("Commands that will run:")
+            "repo to /etc/pacman.conf. Nothing runs until you confirm.")
         box.setDetailedText(steps)
         run_btn = box.addButton("Run these commands",
                                 QMessageBox.ButtonRole.AcceptRole)
+        copy_btn = box.addButton("Copy commands",
+                                 QMessageBox.ButtonRole.ActionRole)
         box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         box.setStyleSheet(_themed_qss())
+
+        def _copy() -> None:
+            QApplication.clipboard().setText(steps)
+            copy_btn.setText("Copied ✓")
+
+        copy_btn.clicked.connect(_copy)
         box.exec()
         if box.clickedButton() is not run_btn:
             return
