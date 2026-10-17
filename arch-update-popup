@@ -1478,6 +1478,14 @@ def pick_desktop_file(pkgname: str, paths: list[str]) -> str:
     return ""
 
 
+def _desktop_title(path: str) -> str:
+    """The human-readable Name from a .desktop entry, or ""."""
+    if not path:
+        return ""
+    entry = _desktop_entry(path)
+    return entry.get("Name", "") if entry else ""
+
+
 def _desktop_entry(path: str) -> dict[str, str]:
     """Parse the [Desktop Entry] keys of a .desktop file."""
     entry: dict[str, str] = {}
@@ -1548,7 +1556,13 @@ class TrackedEnricher(QThread):
     Pure compute — safe to interrupt + park on shutdown.
     """
     found = pyqtSignal(str, str)      # (name, desktop_path)
+    titled = pyqtSignal(str, str)    # (name, human title)
     described = pyqtSignal(str, str)  # (name, description)
+
+    @staticmethod
+    def _resolve_title(desktop_path: str) -> str:
+        entry = _desktop_entry(desktop_path)
+        return entry.get("Name", "") if entry else ""
 
     def __init__(self, names: list[str]) -> None:
         super().__init__()
@@ -1562,6 +1576,9 @@ class TrackedEnricher(QThread):
                 desktop = self._resolve_desktop(name)
                 if desktop:
                     self.found.emit(name, desktop)
+                    title = _desktop_title(desktop)
+                    if title:
+                        self.titled.emit(name, title)
                 if self.isInterruptionRequested():
                     return
                 desc = self._resolve_desc(name)
@@ -1607,9 +1624,15 @@ def scan_desktop_files(dirs: list[str] | None = None) -> list[dict]:
     """
     if dirs is None:
         home = os.path.expanduser("~")
+        # Flatpak apps ship their launchers here; if we don't scan them,
+        # a Flatpak-installed Heroic Games Launcher (and every other
+        # Flatpak GUI app) is invisible to the app — which reads as "apps
+        # don't show up here".
         dirs = [os.path.join(home, ".local/share/applications"),
                 "/usr/local/share/applications",
-                "/usr/share/applications"]
+                "/usr/share/applications",
+                "/var/lib/flatpak/exports/share/applications",
+                os.path.join(home, ".local/share/flatpak/exports/share/applications")]
     found: dict[str, dict] = {}
     for d in dirs:
         try:
@@ -1658,6 +1681,15 @@ def _installed_version_map() -> dict[str, str]:
         if len(parts) >= 2:
             out[parts[0]] = parts[1]
     return out
+
+
+def _explicit_package_set() -> set[str]:
+    """Packages the user explicitly installed (pacman -Qe)."""
+    try:
+        r = _run(["pacman", "-Qqe"], capture_output=True, text=True, timeout=30)
+    except Exception:
+        return set()
+    return set(r.stdout.split()) if r.returncode == 0 else set()
 
 
 def _foreign_pkg_set() -> set[str]:
@@ -1734,9 +1766,16 @@ class UntrackedLoader(QThread):
         foreign = _foreign_pkg_set()
         rows = []
         seen: set[tuple[str, str]] = set()
+        explicit = _explicit_package_set()
         for a in found:
             owner, ver = owners.get(a["file"], (None, ""))
             if owner:
+                # Genuinely untracked means "not in your explicit set":
+                # an app whose package you deliberately installed belongs
+                # to the Tracked tab, not here. Showing it in both places
+                # is what made this tab read as "stuff that's also tracked".
+                if owner in explicit:
+                    continue
                 name, version = owner, ver or versions.get(owner, "")
             else:
                 # Not owned by any package (manual install): identify by
@@ -5977,6 +6016,7 @@ class UpdateWindow(QMainWindow):
             [self._track_model.item(r)["name"]
              for r in range(self._track_model.rowCount())])
         self._track_apps.found.connect(self._on_track_app_found)
+        self._track_apps.titled.connect(self._on_track_app_titled)
         self._track_apps.described.connect(self._on_track_app_described)
         self._track_apps.start()
 
@@ -5985,6 +6025,13 @@ class UpdateWindow(QMainWindow):
 
     def _on_track_app_described(self, name: str, desc: str) -> None:
         self._track_model.set_desc(name, desc)
+
+    def _on_track_app_titled(self, name: str, title: str) -> None:
+        r = self._track_model.row_of(name)
+        if r is not None and not self._track_model.item(r).get("title"):
+            self._track_model.item(r)["title"] = title
+            idx = self._track_model.index(r)
+            self._track_model.dataChanged.emit(idx, idx, [])
 
     def _open_tracked_app(self, name: str) -> None:
         r = self._track_model.row_of(name)
