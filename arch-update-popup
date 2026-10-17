@@ -4695,6 +4695,9 @@ class UpdateWindow(QMainWindow):
         self._status_active = False
         # Single-flight guard for the failure dialog (see _show_error_dialog).
         self._error_dialog_open = False
+        # Set when a change (e.g. enabling a source) needs a restart to
+        # take effect; drives the "Restart to apply" button.
+        self._restart_needed = False
         # The full status sentence, whatever the one-line label shows.
         self._status_full = ""
         # Per-list "working" flags: a loading placeholder must never cover
@@ -5078,6 +5081,20 @@ class UpdateWindow(QMainWindow):
         self._cancel_btn.clicked.connect(self._on_skip_or_cancel)
         self._cancel_btn.setVisible(False)
         footer.addWidget(self._cancel_btn)
+
+        # "Restart to apply" — shown after a source is enabled (or any
+        # other change that needs a fresh process to take effect). It is
+        # the only thing that matters at that moment, so it is primary.
+        self._restart_btn = QPushButton("Restart to apply")
+        self._restart_btn.setObjectName("primary")
+        self._restart_btn.setFixedHeight(_sp(34))
+        self._restart_btn.setMinimumWidth(_sp(150))
+        self._restart_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._restart_btn.setToolTip(
+            "Restart Arch Update so it picks up the new configuration")
+        self._restart_btn.clicked.connect(lambda: self._restart_app())
+        self._restart_btn.setVisible(False)
+        footer.addWidget(self._restart_btn)
 
         self._update_btn = QPushButton("Update All")
         self._update_btn.setObjectName("primary")
@@ -7998,7 +8015,8 @@ class UpdateWindow(QMainWindow):
 class _SourceEnableRunner(QThread):
     """Runs a bash script as root under `sudo -A`, streaming its output."""
 
-    done = pyqtSignal(bool, str)
+    line = pyqtSignal(str)           # one output line, as it arrives
+    done = pyqtSignal(bool, str)    # success, tail of output
 
     def __init__(self, script_body: str) -> None:
         super().__init__()
@@ -8052,6 +8070,7 @@ class _SourceEnableRunner(QThread):
                             fragment = _ANSI_RE.sub("", fragment).strip()
                             if fragment:
                                 lines.append(fragment)
+                                self.line.emit(fragment)
                 elif proc.poll() is not None:
                     break
             try:
@@ -8347,9 +8366,38 @@ class ManagedSourcesDialog(QMainWindow):
         # the whole process ("QThread: Destroyed while thread is still
         # running"). Released in _on_enable_done, like every other runner.
         self._enable_runner = _SourceEnableRunner(steps)
+        self._enable_runner.line.connect(
+            lambda line, n=name: self._set_status(
+                f"Enabling {n} — {line}", "info"))
+        self._enable_runner.line.connect(self._log_action)
+        self._show_log()
+        self._set_status(f"Enabling {name}…", "info")
         self._enable_runner.done.connect(
             lambda ok, out, n=name: self._on_enable_done(ok, out, n))
         self._enable_runner.start()
+
+    def _restart_app(self) -> None:
+        """Restart the app in place (same PID, fresh state)."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Restart Arch Update?")
+        box.setText("Restart to apply the changes?")
+        box.setInformativeText(
+            "The app will quit and relaunch immediately. Your window "
+            "position and the current update list are not preserved, but "
+            "the next check runs on its own schedule.")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes |
+                               QMessageBox.StandardButton.Cancel)
+        box.setStyleSheet(_themed_qss())
+        box.exec()
+        if box.clickedButton() != box.button(
+                QMessageBox.StandardButton.Yes):
+            return
+        # Close the window cleanly first (saves geometry), then replace the
+        # process in place. execv keeps the PID, so systemd's tracking
+        # stays intact.
+        self.close()
+        os.execv(sys.argv[0], sys.argv)
 
     def _on_enable_done(self, success: bool, output: str, name: str) -> None:
         runner = getattr(self, "_enable_runner", None)
@@ -8357,17 +8405,20 @@ class ManagedSourcesDialog(QMainWindow):
         if runner is not None:
             runner.wait(5000)
         if success:
+            self._restart_needed = True
+            self._restart_btn.setVisible(True)
+            self._log_action(f"{name} enabled — restart to apply")
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Information)
             box.setWindowTitle("Source enabled")
             box.setText(f"{name} is now enabled.")
             box.setInformativeText(
-                "A restart of Arch Update is needed so it picks up the new "
-                "repo and can offer switches for your packages.")
+                "Arch Update needs to restart to pick up the new repo and "
+                'offer switches for your packages. Click "Restart to apply" '
+                "in the footer, or restart it yourself.")
             box.setDetailedText(output)
             box.setStyleSheet(_themed_qss())
             box.exec()
-            self.close()
         else:
             lines = [l for l in output.splitlines() if l.strip()]
             self._show_error_dialog(
