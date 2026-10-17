@@ -4523,6 +4523,8 @@ class UpdateWindow(QMainWindow):
         # True while _sub carries a live message rather than the resting
         # summary (see _set_status / _refresh_empty_state).
         self._status_active = False
+        # Single-flight guard for the failure dialog (see _show_error_dialog).
+        self._error_dialog_open = False
         # The full status sentence, whatever the one-line label shows.
         self._status_full = ""
         # Per-list "working" flags: a loading placeholder must never cover
@@ -6129,6 +6131,13 @@ class UpdateWindow(QMainWindow):
             self._log_action(f"Switching {name} failed")
             self._set_status(
                 f"Switching {name} failed — use Retry on its row.", "error")
+            lines = [l for l in output.splitlines() if l.strip()]
+            self._show_error_dialog(
+                "switch failed",
+                f"Switching {name} to the official build failed.",
+                "Use Retry on its row, or open the log panel for the full "
+                "output.",
+                "\n".join(lines[-40:]) if lines else "(no output captured)")
         self._refresh_tracked_summary()
         self._update_view_badges()
         self._run_next_track_switch()
@@ -6265,6 +6274,13 @@ class UpdateWindow(QMainWindow):
             self._set_status(
                 f"Removing {label} failed: {hint} — use Retry on "
                 f"{'its' if len(failed) == 1 else 'their'} row.", "error")
+            self._show_error_dialog(
+                "removal failed",
+                f"Removing {label} failed.",
+                f"{hint}\n\nUse Retry on "
+                f"{'its' if len(failed) == 1 else 'their'} row, or open the "
+                "log panel for the full output.",
+                output)
         self._refresh_tracked_summary()
         self._update_view_badges()
 
@@ -6601,6 +6617,13 @@ class UpdateWindow(QMainWindow):
             self._set_status(
                 f"Removing {label} failed: {hint} — use Retry on "
                 f"{'its' if len(failed) == 1 else 'their'} row.", "error")
+            self._show_error_dialog(
+                "removal failed",
+                f"Removing {label} failed.",
+                f"{hint}\n\nUse Retry on "
+                f"{'its' if len(failed) == 1 else 'their'} row, or open the "
+                "log panel for the full output.",
+                output)
         self._refresh_untracked_summary()
         self._update_view_badges()
 
@@ -6609,6 +6632,49 @@ class UpdateWindow(QMainWindow):
     # summaries, install progress, auth prompts, errors, success notes.
     # Color-coded with a glyph prefix; empty text restores the idle
     # summary instead of leaving a hole.
+
+    def _show_error_dialog(self, title: str, headline: str,
+                           advice: str = "", detail: str = "") -> None:
+        """Show a failure in a dialog, not only as a line in the header.
+
+        The header line is elided to one line and the details panel has to
+        be opened by hand, so a failure the user did not ask for deserves
+        to be seen. The raw output lives behind "Show Details", and one
+        dialog is open at a time (an exec() is modal, so a second call
+        cannot stack behind it anyway).
+        """
+        if self._error_dialog_open:
+            return
+        box = self._build_error_dialog(title, headline, advice, detail)
+        self._error_dialog_open = True
+        try:
+            box.exec()
+        finally:
+            self._error_dialog_open = False
+
+    def _build_error_dialog(self, title: str, headline: str, advice: str,
+                            detail: str) -> QMessageBox:
+        """Build (do not show) the failure dialog — see _show_error_dialog."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle(f"Arch Update — {title}")
+        box.setText(headline)
+        if advice:
+            box.setInformativeText(advice)
+        detail = (detail or "").strip()
+        if detail:
+            box.setDetailedText(detail)
+        copy_btn = box.addButton("Copy error",
+                                 QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.setStyleSheet(_themed_qss())
+
+        def _copy() -> None:
+            QApplication.clipboard().setText(detail or headline)
+            copy_btn.setText("Copied ✓")
+
+        copy_btn.clicked.connect(_copy)
+        return box
 
     def _fit_status_line(self, text: str) -> str:
         """Keep the status line to one line, eliding rather than wrapping.
@@ -7186,6 +7252,21 @@ class UpdateWindow(QMainWindow):
 
         if kind == "cancelled":
             return  # dismissing auth is not a failure — stay silent
+
+        # Say it in a dialog too: the header line is one elided line and
+        # the details panel has to be opened by hand. Only the first time
+        # for a given failure — the repeat guard above exists precisely so
+        # an identical failure stops throwing dialogs at the user.
+        if self._fail_streak == 1:
+            self._show_error_dialog(
+                "update failed",
+                f"{title} — {who} could not be installed.",
+                f"{advice} "
+                f"{n_pending} package{'s' if n_pending != 1 else ''} still "
+                "pending: use Retry on the affected rows, or open the log "
+                "panel for the full output.",
+                manual_cmd + self._last_error)
+
         body = f"{title}: {who}"
         if self._fail_streak >= 2:
             body += f"\nFailure #{self._fail_streak} — same issue repeated"
@@ -7382,6 +7463,12 @@ class UpdateWindow(QMainWindow):
         self._scroll_to_failed()
         self._show_log()
         self._log_action(f"{name} failed: {title}")
+        self._show_error_dialog(
+            "install failed",
+            f"Installing {name} failed — {title}.",
+            f"{advice} Use Retry on its row, or open the log panel for the "
+            "full output.",
+            self._last_error)
         self._fail_notif_id = _notify_update(
             "Arch Update Failed", f"{title}: {name}",
             replaces_id=self._fail_notif_id)
@@ -7471,6 +7558,12 @@ class UpdateWindow(QMainWindow):
             hint = " · ".join(last) if last else "No output captured"
             self._log_action(f"Obsolete removal failed: {hint}")
             self._set_status(f"Obsolete removal failed: {hint}", "error")
+            self._show_error_dialog(
+                "removal failed",
+                "Removing the obsolete packages failed.",
+                f"{hint}\n\nUse Retry on the affected rows, or open the log "
+                "panel for the full output.",
+                output)
             self._update_btn.setEnabled(True)
             self._cancel_btn.setEnabled(True)
             return

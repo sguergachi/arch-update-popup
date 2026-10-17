@@ -1232,13 +1232,21 @@ class TestViews:
         from PyQt6.QtWidgets import QMessageBox as _MB
         Icon = _MB.Icon
         ButtonRole = _MB.ButtonRole
+        StandardButton = _MB.StandardButton
+
+        class _Btn(QObject):
+            """Stands in for a QPushButton: the app connects `clicked`."""
+            clicked = pyqtSignal()
 
         def __init__(self, *a, **k):
-            self._accept = object()
+            self._accept = self._Btn()
 
         def setWindowTitle(self, *a): pass
         def setIcon(self, *a): pass
         def setText(self, *a): pass
+        def setInformativeText(self, *a): pass
+        def setDetailedText(self, *a): pass
+        def setStyleSheet(self, *a): pass
         def addButton(self, *a, **k): return self._accept
         def exec(self): return None
         def clickedButton(self): return self._accept
@@ -1522,6 +1530,127 @@ class TestNotifyHelper:
                             lambda *a, **k: seen.append(a[0]))
         assert app._notify_update("t", "b") == 0
         assert seen and seen[0][0] == "notify-send"
+
+
+class _RecordingBox:
+    """QMessageBox stub that records what the app would have shown."""
+    from PyQt6.QtWidgets import QMessageBox as _MB
+    Icon = _MB.Icon
+    ButtonRole = _MB.ButtonRole
+    StandardButton = _MB.StandardButton
+
+    shown: list = []
+
+    class _Btn(QObject):
+        clicked = pyqtSignal()
+
+    def __init__(self, *a, **k):
+        self.title = ""
+        self.text = ""
+        self.info = ""
+        self.detail = ""
+        self._btn = self._Btn()
+        _RecordingBox.shown.append(self)
+
+    def setWindowTitle(self, text):
+        self.title = text
+
+    def setIcon(self, *a):
+        pass
+
+    def setText(self, text):
+        self.text = text
+
+    def setInformativeText(self, text):
+        self.info = text
+
+    def setDetailedText(self, text):
+        self.detail = text
+
+    def setStyleSheet(self, *a):
+        pass
+
+    def addButton(self, *a, **k):
+        return self._btn
+
+    def exec(self):
+        return None
+
+    def clickedButton(self):
+        return self._btn
+
+
+class TestFailureDialog:
+    """A failure the user did not ask for must be visible, not just logged."""
+
+    def _record(self, monkeypatch):
+        monkeypatch.setattr(app, "QMessageBox", _RecordingBox)
+        _RecordingBox.shown = []
+        return _RecordingBox.shown
+
+    def test_update_failure_shows_the_error_in_a_dialog(self, window,
+                                                       monkeypatch):
+        shown = self._record(monkeypatch)
+        window._safe_names = ["konsole"]
+        window._on_update_done(False, "konsole: boom happened")
+        assert shown, "no dialog was shown"
+        box = shown[0]
+        assert "Arch Update" in box.title
+        assert "could not be installed" in box.text
+        assert "konsole" in box.text
+        # The raw output is one click away, not hidden in the panel only.
+        assert "boom happened" in box.detail
+        assert "Retry" in box.info
+
+    def test_dismissed_authentication_is_not_a_dialog(self, window,
+                                                     monkeypatch):
+        # The exact error the user hit: pkexec with no tty. Nothing ran, so
+        # shouting about it in a dialog would be wrong.
+        shown = self._record(monkeypatch)
+        window._safe_names = ["perplexity"]
+        window._on_update_done(
+            False,
+            "Error creating textual authentication agent: Error opening "
+            "current controlling terminal for the process (`/dev/tty'): "
+            "No such device or address")
+        assert shown == []
+        # And it says so calmly instead: nothing ran, nothing changed.
+        assert "nothing was changed" in window._status_full.lower()
+
+    def test_removal_failure_shows_the_error(self, window, qapp, monkeypatch):
+        shown = self._record(monkeypatch)
+        monkeypatch.setattr(app, "ObsoleteRemover", FakeRunner)
+        monkeypatch.setattr(app, "find_blocked_obsolete_packages",
+                            lambda pkgs: [])
+        self._stage = None
+        if window._obs_checker is not None:
+            window._obs_checker.wait(25000)
+        qapp.processEvents()
+        if window._track_loader is not None:
+            window._track_loader.wait(25000)
+        qapp.processEvents()
+        window._on_tracked_loaded(
+            [{"name": "perplexity", "version": "1.6.0-1", "repo": "aur"}], [])
+        qapp.processEvents()
+        window._request_track_uninstall("perplexity")
+        window._track_uninstaller.done.emit(
+            False, "perplexity: cannot remove — file conflict")
+        qapp.processEvents()
+        assert shown, "no dialog for a failed removal"
+        box = shown[-1]
+        assert "Removing perplexity failed" in box.text
+        assert "file conflict" in box.detail or "file conflict" in box.info
+
+    def test_single_install_failure_shows_the_error(self, window, qapp,
+                                                   monkeypatch):
+        shown = self._record(monkeypatch)
+        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
+        window._run_single("konsole")
+        window._single.done.emit(False, "konsole: nope")
+        qapp.processEvents()
+        assert shown, "no dialog for a failed single install"
+        assert "Installing konsole failed" in shown[0].text
+        assert "nope" in shown[0].detail
 
 
 class TestNoLayoutShifts:
