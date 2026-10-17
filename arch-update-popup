@@ -2883,17 +2883,9 @@ class _ListHeader(QWidget):
             self.check.clicked.connect(self._on_click)
             lay.addWidget(self.check, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        self.count = QLabel("")
-        self.count.setObjectName("meta")
-        lay.addWidget(self.count, 0, Qt.AlignmentFlag.AlignVCenter)
-        lay.addStretch()
-
-        # How much of the list the filter is hiding, right beside the box
-        # that is doing the hiding.
-        self.filtered = QLabel("")
-        self.filtered.setObjectName("meta")
-        lay.addWidget(self.filtered, 0, Qt.AlignmentFlag.AlignVCenter)
-
+        # The filter sits with the row controls on the left, where the eye
+        # starts and where the rows' own checkboxes are — one cluster
+        # instead of two stranded controls with a void between them.
         self.search: QLineEdit | None = None
         if with_search:
             self.search = QLineEdit()
@@ -2906,6 +2898,17 @@ class _ListHeader(QWidget):
                                   QLineEdit.ActionPosition.LeadingPosition)
             self.search.textChanged.connect(self.filter_changed)
             lay.addWidget(self.search, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        lay.addStretch()
+
+        # What the controls are producing, on the far side: the selection,
+        # then how much of the list the filter is hiding.
+        self.count = QLabel("")
+        self.count.setObjectName("meta")
+        lay.addWidget(self.count, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.filtered = QLabel("")
+        self.filtered.setObjectName("meta")
+        lay.addWidget(self.filtered, 0, Qt.AlignmentFlag.AlignVCenter)
 
     def _on_click(self) -> None:
         # Ask for the opposite of what we last showed; the window then
@@ -2929,10 +2932,11 @@ class _ListHeader(QWidget):
             self.check.setEnabled(total > 0)
             self._shown = self.check.checkState()
             self.check.blockSignals(False)
-        # The text is always kept current (screen readers, tests); it is
-        # only shown when the box alone can't say it — a partial selection.
+        # The count is always on show: the box says the state, this says
+        # the number, and together they balance the strip against the
+        # controls on the left.
         self.count.setText(self._count_text(selected, total))
-        self.count.setVisible(0 < selected < total)
+        self.count.setVisible(True)
 
     @staticmethod
     def _count_text(selected: int, total: int) -> str:
@@ -2945,9 +2949,13 @@ class _ListHeader(QWidget):
         return f"{selected} of {total} selected"
 
     def set_filter_info(self, shown: int, total: int) -> None:
-        """Say how much is hidden, but only when something actually is."""
+        """Say how much is hidden, but only when something actually is.
+
+        The leading separator keeps it readable next to the selection
+        count, which shares this end of the strip.
+        """
         hidden = total - shown
-        self.filtered.setText(f"{shown} of {total}" if hidden > 0 else "")
+        self.filtered.setText(f"·  {shown} of {total}" if hidden > 0 else "")
         self.filtered.setVisible(hidden > 0)
 
     def filter_text(self) -> str:
