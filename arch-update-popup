@@ -2874,26 +2874,21 @@ class _ListHeader(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(_sp(8))
 
-        # The filter leads the strip, at the far left, and fills it: a full
-        # width filter bar with the row controls closing it on the right.
+        # The filter leads the strip, at the far left, at a fixed width —
+        # a full-width bar dwarfed the count it sits next to.
         self.search: QLineEdit | None = None
         if with_search:
             self.search = QLineEdit()
             self.search.setObjectName("search")
             self.search.setPlaceholderText(placeholder)
             self.search.setClearButtonEnabled(True)
-            self.search.setMinimumWidth(_sp(160))
-            self.search.setSizePolicy(QSizePolicy.Policy.Expanding,
-                                      QSizePolicy.Policy.Fixed)
+            self.search.setFixedWidth(_sp(240))
             self.search.setToolTip("Filter this list by name or description")
             self.search.addAction(app_icon("search", 14),
                                   QLineEdit.ActionPosition.LeadingPosition)
             self.search.textChanged.connect(self.filter_changed)
-            # Stretch factor 1: the field takes the free width. A spacer
-            # here instead would split it with the field.
-            lay.addWidget(self.search, 1, Qt.AlignmentFlag.AlignVCenter)
-        else:
-            lay.addStretch()
+            lay.addWidget(self.search, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addStretch()
 
         # What the controls are producing: the selection, then how much of
         # the list the filter is hiding — then the control itself, far
