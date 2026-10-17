@@ -2874,22 +2874,26 @@ class _ListHeader(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(_sp(8))
 
-        # The filter leads the strip, at the far left, where the eye
-        # starts; the row controls and their count close it on the right.
+        # The filter leads the strip, at the far left, and fills it: a full
+        # width filter bar with the row controls closing it on the right.
         self.search: QLineEdit | None = None
         if with_search:
             self.search = QLineEdit()
             self.search.setObjectName("search")
             self.search.setPlaceholderText(placeholder)
             self.search.setClearButtonEnabled(True)
-            self.search.setFixedWidth(_sp(240))
+            self.search.setMinimumWidth(_sp(160))
+            self.search.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                      QSizePolicy.Policy.Fixed)
             self.search.setToolTip("Filter this list by name or description")
             self.search.addAction(app_icon("search", 14),
                                   QLineEdit.ActionPosition.LeadingPosition)
             self.search.textChanged.connect(self.filter_changed)
-            lay.addWidget(self.search, 0, Qt.AlignmentFlag.AlignVCenter)
-
-        lay.addStretch()
+            # Stretch factor 1: the field takes the free width. A spacer
+            # here instead would split it with the field.
+            lay.addWidget(self.search, 1, Qt.AlignmentFlag.AlignVCenter)
+        else:
+            lay.addStretch()
 
         # What the controls are producing: the selection, then how much of
         # the list the filter is hiding — then the control itself, far
@@ -6434,16 +6438,18 @@ class UpdateWindow(QMainWindow):
         self._refresh_untracked_footer()
 
     def _refresh_untracked_footer(self) -> None:
+        sel = self._un_selected_names()
+        n_sel = len(sel)
+        n = (self._unapp_model.rowCount() + self._unpkg_model.rowCount())
+        # The header's count is kept current even while the scan runs, so
+        # that strip never looks half-empty.
+        self._un_header.set_state(n_sel, n)
         if not getattr(self, "_untracked_loaded", False):
             self._un_footer_label.setText("Loading…")
             self._un_uninstall_btn.setText("Uninstall selected")
             self._un_uninstall_btn.setEnabled(False)
             return
-        sel = self._un_selected_names()
-        n_sel = len(sel)
         running = self._untracked_uninstaller is not None
-        n = (self._unapp_model.rowCount() + self._unpkg_model.rowCount())
-        self._un_header.set_state(n_sel, n)
         if running:
             self._un_footer_label.setText(
                 f"Removing {len(self._untracked_uninstall_names)} "
