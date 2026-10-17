@@ -4661,6 +4661,7 @@ class UpdateWindow(QMainWindow):
         self._orphans: set = set()  # parked threads (see _park_thread)
         self._moves_dialog: MovesDialog | None = None
         self._sources_dialog: ManagedSourcesDialog | None = None
+        self._enable_runner: _SourceEnableRunner | None = None
         # Buttons whose icons bake the theme's grey: re-resolved live in
         # _apply_theme(). Registered via _icon_btn(), keyed by button so a
         # repeat registration never accumulates duplicates.
@@ -7897,6 +7898,12 @@ class UpdateWindow(QMainWindow):
         # Stopping first also kills the child installer, so closing the
         # window mid-update is an explicit cancel.
         self._stop_runners()
+        runner = getattr(self, "_enable_runner", None)
+        if runner is not None:
+            if runner.isRunning():
+                runner.terminate()
+                runner.wait(8000)
+            self._enable_runner = None
         self._save_ui_state()
         super().closeEvent(event)
         self.closed.emit()
@@ -8001,10 +8008,14 @@ class _SourceEnableRunner(QThread):
 
     def run(self) -> None:
         import tempfile
-        fd, path = tempfile.mkstemp(suffix=".sh", prefix="arch-update-enable-")
+        path = ""
+        askpass = None
+        fd = -1
         try:
+            fd, path = tempfile.mkstemp(suffix=".sh", prefix="arch-update-enable-")
             with os.fdopen(fd, "w") as f:
                 f.write(self._script)
+            fd = -1
             os.chmod(path, stat.S_IRWXU)
             askpass = make_askpass_script("Enter sudo password to enable the "
                                           "managed source:")
@@ -8051,11 +8062,17 @@ class _SourceEnableRunner(QThread):
             ok = proc.returncode == 0 and not self._killed
             self.done.emit(ok, "\n".join(lines[-40:]))
         finally:
-            for p in (path, askpass):
+            if fd >= 0:
                 try:
-                    os.unlink(p)
+                    os.close(fd)
                 except OSError:
                     pass
+            for p in (path, askpass):
+                if p:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
 
     def terminate(self) -> None:  # type: ignore[override]
         self._killed = True
@@ -8326,12 +8343,19 @@ class ManagedSourcesDialog(QMainWindow):
         # Run the whole script under one sudo -A prompt, so the user
         # authenticates once. Reuse the existing askpass flow; the
         # script cleans up after itself.
-        runner = _SourceEnableRunner(steps)
-        runner.done.connect(
+        # Keep the reference: a QThread destroyed while running aborts
+        # the whole process ("QThread: Destroyed while thread is still
+        # running"). Released in _on_enable_done, like every other runner.
+        self._enable_runner = _SourceEnableRunner(steps)
+        self._enable_runner.done.connect(
             lambda ok, out, n=name: self._on_enable_done(ok, out, n))
-        runner.start()
+        self._enable_runner.start()
 
     def _on_enable_done(self, success: bool, output: str, name: str) -> None:
+        runner = getattr(self, "_enable_runner", None)
+        self._enable_runner = None
+        if runner is not None:
+            runner.wait(5000)
         if success:
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Information)
