@@ -1,4 +1,4 @@
-"""Shared loader for the extensionless arch-update-popup script."""
+"""Shared loader for the extensionless upkeep script."""
 import importlib.util
 import os
 import sys
@@ -6,7 +6,7 @@ import sys
 import pytest
 
 APP_PATH = os.path.realpath(
-    os.path.join(os.path.dirname(__file__), "..", "arch-update-popup")
+    os.path.join(os.path.dirname(__file__), "..", "upkeep")
 )
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

@@ -1,4 +1,4 @@
-# arch-update-popup — agent notes
+# upkeep — agent notes
 
 ## UI law: no layout shifts
 

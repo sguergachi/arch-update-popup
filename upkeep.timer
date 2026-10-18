@@ -1,6 +1,6 @@
 [Unit]
-Description=Start Arch Linux update tray notifier after login
-Requires=arch-update-popup.service
+Description=Start Upkeep after login
+Requires=upkeep.service
 
 [Timer]
 # Start 5 minutes after the graphical session starts

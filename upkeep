@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-arch-update-popup: System tray updater for Arch Linux.
+upkeep: system tray updater, inspector and remover for Arch Linux.
 
 Runs persistently in the system tray. Checks for updates every 30 minutes
 (official repos via checkupdates, AUR via paru/yay) and pre-fetches release
@@ -320,7 +320,7 @@ CHANGELOG_FILENAMES = [
     "ReleaseNotes.md", "releasenotes.md",
 ]
 
-_UA = {"User-Agent": "arch-update-popup/1.0"}
+_UA = {"User-Agent": "upkeep/1.0"}
 
 # App mark: a rounded accent tile holding a download-into-an-arch glyph.
 # Drawn as geometry (no font, no network) and colored from the design
@@ -903,7 +903,7 @@ def _notify_update(title: str, body: str, icon: str = "dialog-error",
                  "--dest", "org.freedesktop.Notifications",
                  "--object-path", "/org/freedesktop/Notifications",
                  "--method", "org.freedesktop.Notifications.Notify",
-                 "arch-update-popup", f"{replaces_id:d}", icon,
+                 "upkeep", f"{replaces_id:d}", icon,
                  title, body, "[]",
                  f"{{'urgency': <byte {urgency:d}>}}",
                  f"{timeout_ms:d}"],
@@ -953,7 +953,7 @@ _CACHE_MAX_AGE_S = 30 * 24 * 3600   # drop entries older than 30 days
 
 def _cache_file() -> str:
     cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    return os.path.join(cache_home, "arch-update-popup", "info.json")
+    return os.path.join(cache_home, "upkeep", "info.json")
 
 
 def load_pkg_info_cache() -> dict[str, dict]:
@@ -1008,6 +1008,30 @@ def save_settings(data: dict) -> None:
         pass
 
 
+def _migrate_old_state() -> None:
+    """Adopt the state kept under the app's old name, exactly once.
+
+    The info cache and the window geometry are worth keeping across a
+    rename; only the directories are new. An existing new directory always
+    wins — this never overwrites, and never reports a failed move.
+    """
+    cache_home = (os.environ.get("XDG_CACHE_HOME")
+                  or os.path.expanduser("~/.cache"))
+    share_home = (os.environ.get("XDG_DATA_HOME")
+                  or os.path.expanduser("~/.local/share"))
+    for old, new in (
+        (os.path.join(cache_home, "arch-update-popup"),
+         os.path.join(cache_home, "upkeep")),
+        (os.path.join(share_home, "arch-update-popup"),
+         os.path.join(share_home, "upkeep")),
+    ):
+        try:
+            if os.path.isdir(old) and not os.path.exists(new):
+                shutil.move(old, new)
+        except Exception:
+            pass
+
+
 def reboot_required() -> bool:
     """True when a kernel update has landed but the old one is still running.
 
@@ -1056,7 +1080,7 @@ def _find_data_dirs() -> list[str]:
     if os.path.isdir(neighbor):
         dirs.append(os.path.normpath(neighbor))
 
-    local_share = os.path.expanduser("~/.local/share/arch-update-popup/campaigns")
+    local_share = os.path.expanduser("~/.local/share/upkeep/campaigns")
     if os.path.isdir(local_share):
         dirs.append(local_share)
 
@@ -2744,10 +2768,10 @@ def make_askpass_script(prompt: str) -> str:
         '# no controlling TTY, so authentication needs a GUI dialog.\n'
         f'prompt="${{1:-{safe}}}"\n'
         'if command -v kdialog >/dev/null 2>&1; then\n'
-        '  exec kdialog --title "Arch Update" --password "$prompt" 2>/dev/null\n'
+        '  exec kdialog --title "Upkeep" --password "$prompt" 2>/dev/null\n'
         'fi\n'
         'if command -v zenity >/dev/null 2>&1; then\n'
-        '  exec zenity --title "Arch Update" --password 2>/dev/null\n'
+        '  exec zenity --title "Upkeep" --password 2>/dev/null\n'
         'fi\n'
         'exit 1\n'
     )
@@ -5829,7 +5853,7 @@ class UpdateWindow(QMainWindow):
         # readout of the header's progress track (see Zone 1).
         n_cached = sum(1 for i in range(n) if i in cached_info)
 
-        self.setWindowTitle(f"Arch Update — {n} package{'s' if n != 1 else ''} available")
+        self.setWindowTitle(f"Upkeep — {n} package{'s' if n != 1 else ''} available")
         self.setMinimumSize(_sp(1040), _sp(620))
         # Record the theme before the first stylesheet call: setStyleSheet
         # fires a StyleChange that would otherwise run _apply_theme() on a
@@ -5856,7 +5880,7 @@ class UpdateWindow(QMainWindow):
 
         title_block = QVBoxLayout()
         title_block.setSpacing(_sp(4))
-        self._title = QLabel("Arch Update")
+        self._title = QLabel("Upkeep")
         self._title.setObjectName("title")
         title_block.addWidget(self._title)
         self._sub = QLabel()
@@ -6233,7 +6257,7 @@ class UpdateWindow(QMainWindow):
         self._restart_btn.setMinimumWidth(_sp(150))
         self._restart_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._restart_btn.setToolTip(
-            "Restart Arch Update so it picks up the new configuration")
+            "Restart Upkeep so it picks up the new configuration")
         self._restart_btn.clicked.connect(lambda: self._restart_app())
         self._restart_btn.setVisible(False)
         footer.addWidget(self._restart_btn)
@@ -7018,7 +7042,7 @@ class UpdateWindow(QMainWindow):
             self._progress.setRange(0, max(n, 1))
             self._progress.setValue(n_cached)
         self.setWindowTitle(
-            f"Arch Update — {n} package{'s' if n != 1 else ''} available")
+            f"Upkeep — {n} package{'s' if n != 1 else ''} available")
         self._refresh_empty_state()
         self._refresh_selection_ui()
         self._refresh_reboot_chip()
@@ -8288,7 +8312,7 @@ class UpdateWindow(QMainWindow):
         """Build (do not show) the failure dialog — see _show_error_dialog."""
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Critical)
-        box.setWindowTitle(f"Arch Update — {title}")
+        box.setWindowTitle(f"Upkeep — {title}")
         box.setText(headline)
         if advice:
             box.setInformativeText(advice)
@@ -8827,7 +8851,7 @@ class UpdateWindow(QMainWindow):
             msg += f" <span style='color:{_secondary_hex()}'>· closing…</span>"
             self._set_status(msg, "ok")
             subprocess.Popen([
-                "notify-send", "Arch Update Complete",
+                "notify-send", "Upkeep Complete",
                 f"Successfully updated {n_selected} package{'s' if n_selected != 1 else ''}."
                 + (f" {n_comp} compromised skipped." if n_comp else ""),
                 "-i", "system-software-update", "-t", "9000",
@@ -8989,7 +9013,7 @@ class UpdateWindow(QMainWindow):
         if self._fail_streak >= 2:
             body += f"\nFailure #{self._fail_streak} — same issue repeated"
         self._fail_notif_id = _notify_update(
-            "Arch Update Failed", body,
+            "Upkeep Failed", body,
             replaces_id=self._fail_notif_id)
 
         if self._fail_streak >= 2:
@@ -9153,7 +9177,7 @@ class UpdateWindow(QMainWindow):
             self._sub.setText(f"<b>{name}</b> installed ✓")
             self._log_action(f"{name} installed ✓")
             subprocess.Popen([
-                "notify-send", "Arch Update", f"{name} installed.",
+                "notify-send", "Upkeep", f"{name} installed.",
                 "-i", "system-software-update", "-t", "6000",
             ])
             return
@@ -9190,7 +9214,7 @@ class UpdateWindow(QMainWindow):
             "full output.",
             self._last_error)
         self._fail_notif_id = _notify_update(
-            "Arch Update Failed", f"{title}: {name}",
+            "Upkeep Failed", f"{title}: {name}",
             replaces_id=self._fail_notif_id)
         if self._offer_open:
             return
@@ -9761,7 +9785,7 @@ class ManagedSourcesDialog(QMainWindow):
         self._restart_btn.setMinimumWidth(_sp(150))
         self._restart_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._restart_btn.setToolTip(
-            "Restart Arch Update so it picks up the new configuration")
+            "Restart Upkeep so it picks up the new configuration")
         self._restart_btn.clicked.connect(self.restart_needed.emit)
         self._restart_btn.setVisible(False)
         foot.addWidget(self._restart_btn)
@@ -9906,7 +9930,7 @@ class TrayApp(QObject):
 
         # ── Tray icon ──────────────────────────────────────────────────────────
         self._tray = QSystemTrayIcon(icon, self)
-        self._tray.setToolTip("Arch Update")
+        self._tray.setToolTip("Upkeep")
         self._tray.activated.connect(self._on_tray_activated)
         self._tray.messageClicked.connect(self._open_window)
 
@@ -9987,12 +10011,12 @@ class TrayApp(QObject):
                 12000,
             )
         else:
-            self._tray.setToolTip(f"Arch Update  —  {n} update{'s' if n != 1 else ''} available")
+            self._tray.setToolTip(f"Upkeep  —  {n} update{'s' if n != 1 else ''} available")
             self._status_act.setText(f"{n} update{'s' if n != 1 else ''} available")
             self._show_act.setEnabled(True)
 
             self._tray.showMessage(
-                "Arch Update",
+                "Upkeep",
                 f"{n} package{'s' if n != 1 else ''} available — click to update",
                 QSystemTrayIcon.MessageIcon.Information,
                 6000,
@@ -10007,7 +10031,7 @@ class TrayApp(QObject):
         self._stop_fetcher()
         self._updates = []
         self._cached_info = {}
-        self._tray.setToolTip("Arch Update  —  system up to date")
+        self._tray.setToolTip("Upkeep  —  system up to date")
         self._status_act.setText("System is up to date")
         self._show_act.setEnabled(True)
 
@@ -10114,7 +10138,7 @@ class TrayApp(QObject):
         self._updates = []
         self._cached_info = {}
         self._stop_fetcher()
-        self._tray.setToolTip("Arch Update  —  system up to date")
+        self._tray.setToolTip("Upkeep  —  system up to date")
         self._status_act.setText("System is up to date")
         self._show_act.setEnabled(True)
         QTimer.singleShot(5000, self.check_now)
@@ -10144,9 +10168,13 @@ def main() -> None:
     # from a terminal, and it makes the app scriptable from a launcher).
     show_now = any(arg in ("--show", "-s") for arg in sys.argv[1:])
 
+    # The app's name changed once: bring the old cache and settings along
+    # before anything reads them (see _migrate_old_state).
+    _migrate_old_state()
+
     app = QApplication(sys.argv)
-    app.setApplicationName("arch-update-popup")
-    app.setApplicationDisplayName("Arch Update")
+    app.setApplicationName("upkeep")
+    app.setApplicationDisplayName("Upkeep")
     app.setQuitOnLastWindowClosed(False)   # keep alive in tray after window closes
 
     icon = _app_icon()

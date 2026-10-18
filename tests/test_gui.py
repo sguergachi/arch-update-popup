@@ -1545,7 +1545,7 @@ class TestFailureDialog:
         window._on_update_done(False, "konsole: boom happened")
         assert shown, "no dialog was shown"
         box = shown[0]
-        assert "Arch Update" in box.title
+        assert "Upkeep" in box.title
         assert "could not be installed" in box.text
         assert "konsole" in box.text
         # The raw output is one click away, not hidden in the panel only.
