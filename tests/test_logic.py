@@ -660,3 +660,36 @@ class TestManagedSourceProbe:
 
         monkeypatch.setattr(app.subprocess, "run", boom)
         assert app._flatpak_ready() is False
+
+
+class TestPacmanLock:
+    """A locked database must be recognised before a removal is launched."""
+
+    def test_lock_file_is_the_signal(self, monkeypatch, tmp_path):
+        lock = tmp_path / "db.lck"
+        monkeypatch.setattr(app, "_PACMAN_LOCK", str(lock))
+        assert app.pacman_lock_held() is False
+        lock.write_text("")
+        assert app.pacman_lock_held() is True
+        lock.unlink()
+        assert app.pacman_lock_held() is False
+
+    def test_lock_failure_is_classified_as_busy(self):
+        kind, title, advice = app.classify_update_failure(
+            "error: failed to init transaction (unable to lock database)\n"
+            "  if you're sure a package manager is not already\n"
+            "  running, you can remove /var/lib/pacman/db.lck")
+        assert kind == "busy"
+        assert "package manager" in title.lower()
+        assert "nothing was changed" in advice.lower()
+
+    def test_a_plain_lock_message_is_busy_too(self):
+        # Some pacman builds only print the lock line.
+        kind, _title, _advice = app.classify_update_failure(
+            "error: could not lock database: File exists")
+        assert kind == "busy"
+
+    def test_busy_is_not_confused_with_a_real_package_failure(self):
+        kind, _t, _a = app.classify_update_failure(
+            "error: failed to commit transaction (conflicting files)")
+        assert kind != "busy"

@@ -2211,11 +2211,19 @@ class _AcceptingBox:
 
     class Icon:
         Question = 0
+        Warning = 1
+        Information = 2
+        Critical = 3
 
     class ButtonRole:
         AcceptRole = 0
         ActionRole = 1
         RejectRole = 2
+
+    class StandardButton:
+        Close = 0
+        Ok = 1
+        Cancel = 2
 
     def __init__(self, parent=None):
         self._accept = None
@@ -2239,7 +2247,9 @@ class _AcceptingBox:
     def setStyleSheet(self, *_a):
         pass
 
-    def addButton(self, text, role):
+    def addButton(self, text, role=0):
+        if not isinstance(text, str):
+            text = "Close"      # StandardButton overload
         btn = _FakeBtn(text)
         self.buttons.append(btn)
         if role == self.ButtonRole.AcceptRole:
@@ -2412,3 +2422,149 @@ class TestAutoRowText:
             "Added automatically as a dependency while installing — "
             "it wasn't in the update list.")
         assert "No changelog for auto-added packages." == item["notes"]
+
+
+class FakeRemover(QObject):
+    """ObsoleteRemover stub that records being started, never runs."""
+    line = pyqtSignal(str)
+    done = pyqtSignal(bool, str)
+
+    started: list = []
+
+    def __init__(self, packages=None, force=False, *a, **k):
+        super().__init__()
+        self.packages = list(packages or [])
+        self.force = force
+        FakeRemover.started.append(self)
+
+    def isRunning(self):
+        return False
+
+    def start(self):
+        pass
+
+    def terminate(self):
+        pass
+
+    def wait(self, ms=0):
+        return True
+
+
+@pytest.fixture()
+def busy_window(qapp, monkeypatch):
+    """A window with one tracked package, no real removals."""
+    FakeRemover.started = []
+    monkeypatch.setattr(app, "_notify_update", lambda *a, **k: 0)
+    monkeypatch.setattr(app, "_notify_close", lambda *a, **k: None)
+    monkeypatch.setattr(app, "ObsoleteRemover", FakeRemover)
+    monkeypatch.setattr(app, "pacman_lock_held", lambda: False)
+    w = app.UpdateWindow(_updates(), {}, None)
+    w.resize(1280, 800)
+    w.show()
+    w._on_tracked_loaded([{"name": "konsole", "version": "25.08.1-1",
+                           "repo": "official"}], [])
+    qapp.processEvents()
+    yield w
+    w.close()
+
+
+def _accept_box(monkeypatch, label=None):
+    """Make every confirmation dialog report 'the user pressed the button
+    whose text contains `label`' (any button when label is None)."""
+    class Box(_AcceptingBox):
+        def clickedButton(self):
+            if label is None:
+                return self._accept
+            for b in self.buttons:
+                if label in b.text():
+                    return b
+            return None
+
+    monkeypatch.setattr(app, "QMessageBox", Box)
+
+
+class TestRemovalWhileBusy:
+    """The bug the user hit: uninstall during an update did nothing."""
+
+    def test_uninstall_during_an_update_queues_instead_of_failing(
+            self, busy_window, monkeypatch):
+        w = busy_window
+        _accept_box(monkeypatch, "Remove when it finishes")
+        w._updating = True
+
+        w._start_track_uninstall(["konsole"])
+
+        assert FakeRemover.started == [], "a doomed removal was launched"
+        assert w._pending_removals == [("track", ["konsole"])]
+        assert "when the update finishes" in w._sub.text()
+
+    def test_declining_the_queue_changes_nothing(self, busy_window,
+                                                 monkeypatch):
+        w = busy_window
+        _accept_box(monkeypatch, "Cancel")
+        w._updating = True
+
+        w._start_track_uninstall(["konsole"])
+
+        assert w._pending_removals == []
+        assert FakeRemover.started == []
+
+    def test_queued_removal_runs_when_the_update_ends(self, busy_window,
+                                                      monkeypatch):
+        w = busy_window
+        _accept_box(monkeypatch, "Remove when it finishes")
+        w._updating = True
+        w._start_track_uninstall(["konsole"])
+
+        w._updating = False
+        w._drain_pending_removals()
+
+        assert w._pending_removals == []
+        assert len(FakeRemover.started) == 1
+        assert FakeRemover.started[0].packages == ["konsole"]
+
+    def test_a_locked_database_refuses_before_the_password_prompt(
+            self, busy_window, monkeypatch):
+        w = busy_window
+        _accept_box(monkeypatch)
+        monkeypatch.setattr(app, "pacman_lock_held", lambda: True)
+
+        w._start_track_uninstall(["konsole"])
+
+        assert FakeRemover.started == []
+        assert w._pending_removals == []
+        assert "locked" in w._sub.text()
+
+    def test_update_will_not_start_while_a_removal_runs(self, busy_window):
+        w = busy_window
+        w._track_uninstaller = FakeRemover(["konsole"])
+        w._safe_names = ["konsole"]
+        w.start_update()
+        assert w._updating is False
+        assert "removal is still running" in w._sub.text()
+
+    def test_close_stops_an_untracked_removal(self, busy_window):
+        # A live QThread destroyed by close is a hard abort — the untracked
+        # remover must be in the shutdown list like the others.
+        w = busy_window
+        remover = FakeRemover(["konsole"])
+        w._untracked_uninstaller = remover
+        w._stop_runners()
+        assert w._untracked_uninstaller is None
+
+    def test_a_failed_update_still_runs_the_queued_removal(
+            self, busy_window, monkeypatch):
+        # The exact shape of the user's report: uninstall during an update,
+        # update fails, package must still be removed afterwards.
+        w = busy_window
+        _accept_box(monkeypatch, "Remove when it finishes")
+        w._updating = True
+        w._safe_names = ["konsole"]
+        w._start_track_uninstall(["konsole"])
+        assert w._pending_removals == [("track", ["konsole"])]
+
+        w._on_update_done(False, "error: boom")
+
+        assert w._pending_removals == []
+        assert len(FakeRemover.started) == 1
+        assert FakeRemover.started[0].packages == ["konsole"]

@@ -160,6 +160,22 @@ def _managed_source_ready(probe: str, enabled: set[str]) -> bool:
     return probe in enabled
 
 
+_PACMAN_LOCK = "/var/lib/pacman/db.lck"
+
+
+def pacman_lock_held() -> bool:
+    """True while a package transaction holds pacman's database.
+
+    The lock file is pacman's own signal. A removal started while it is
+    held prints an error and changes nothing — which reads to the user as
+    "uninstall doesn't work", so every removal path checks this first.
+    """
+    try:
+        return os.path.exists(_PACMAN_LOCK)
+    except OSError:
+        return False
+
+
 def _repo_kind(repo: str) -> str:
     """'official', or 'managed' for a third-party binary source."""
     return "official" if (repo or "").lower() in OFFICIAL_REPOS else "managed"
@@ -1310,6 +1326,12 @@ _FAILURE_HINTS: list[tuple[str, str, str]] = [
      "The package database was out of date, so the old versions were "
      "reinstalled. Retry now — databases refresh automatically before "
      "each install — or run a full system update."),
+    ("busy",
+     "Another package manager is running",
+     "pacman's database was locked by another package transaction, so "
+     "nothing was changed. Wait for it to finish and try again. If no "
+     "package manager is running, the lock is stale: delete "
+     "/var/lib/pacman/db.lck."),
 ]
 
 
@@ -1338,6 +1360,13 @@ def classify_update_failure(output: str) -> tuple[str, str, str]:
             return _FAILURE_HINTS[0]
     if "exists in filesystem" in low:
         return _FAILURE_HINTS[1]
+    # pacman refused to even start: its database was held by another
+    # transaction (this app's own update, a terminal pacman, Discover…).
+    # Nothing ran, so this is never a package problem.
+    if ("unable to lock database" in low or "failed to init transaction" in low
+            or "could not lock database" in low or "lock database" in low
+            or "db.lck" in low):
+        return _FAILURE_HINTS[7]
     if "was not upgraded (stale sync database)" in low:
         return _FAILURE_HINTS[6]
     for needle in ("signature", "invalid or corrupted", "pgp", "keyring"):
@@ -5287,6 +5316,9 @@ class UpdateWindow(QMainWindow):
         self._track_uninstaller: ObsoleteRemover | None = None
         self._track_uninstall_current: str | None = None
         self._track_uninstall_names: list[str] = []
+        # Removals the user asked for while an update was running, as
+        # (kind, names) — drained by _drain_pending_removals().
+        self._pending_removals: list[tuple[str, list[str]]] = []
 
         self._foot_security = QWidget()
         fs = QHBoxLayout(self._foot_security)
@@ -5993,6 +6025,8 @@ class UpdateWindow(QMainWindow):
     def _remove_obsolete_from_view(self) -> None:
         if not self._obs_names or self._remover is not None:
             return
+        if self._removal_can_wait("obsolete", list(self._obs_names)):
+            return
         names = "\n".join(f"  • {pkg}" for pkg in self._obs_names)
         box = QMessageBox(self)
         box.setWindowTitle("Remove obsolete packages")
@@ -6391,6 +6425,81 @@ class UpdateWindow(QMainWindow):
         self._run_next_track_switch()
 
     # — Per-package uninstall (Tracked tab) —
+    def _busy_with_update(self) -> bool:
+        """An install/update run is holding pacman's database."""
+        return self._updating or self._single is not None
+
+    def _removal_can_wait(self, kind: str, names: list[str]) -> bool:
+        """Stop a removal that cannot run now; offer to do it afterwards.
+
+        Returns True when the caller must stop. A run this app started is
+        known to end, so those removals queue and run by themselves; a
+        database locked by something else is refused with the reason and
+        what to do about it. Either way nothing is launched that would
+        print an error and change nothing.
+        """
+        label = names[0] if len(names) == 1 else f"{len(names)} packages"
+        if self._busy_with_update():
+            box = QMessageBox(self)
+            box.setWindowTitle("An update is running")
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setText(
+                f"<b>{label}</b> can't be removed while the update is "
+                "running — pacman's database is busy, so a removal now "
+                "would do nothing.<br><br>"
+                "Remove it as soon as the update finishes?")
+            later_btn = box.addButton("Remove when it finishes",
+                                      QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is not later_btn:
+                return True
+            self._pending_removals.append((kind, list(names)))
+            self._set_status(
+                f"{label} will be removed when the update finishes.", "info")
+            self._log_action(f"Queued {label} for removal after the update")
+            return True
+        if pacman_lock_held():
+            box = QMessageBox(self)
+            box.setWindowTitle("Another package manager is running")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(
+                "pacman's database is locked, so a removal right now would "
+                "do nothing.<br><br>"
+                "Wait for the other package manager to finish and try "
+                "again. If nothing else is running, the lock is stale — "
+                "delete <b>/var/lib/pacman/db.lck</b> and retry.")
+            box.exec()
+            self._set_status(
+                "Nothing was changed — pacman's database is locked by "
+                "another package manager.", "info")
+            self._log_action(f"Removing {label} refused: pacman's database "
+                             "is locked")
+            return True
+        return False
+
+    def _drain_pending_removals(self) -> bool:
+        """Run the removals queued while an update was running.
+
+        Returns True when at least one removal was started (the caller
+        must then keep the window alive: closing stops the runners)."""
+        if self._busy_with_update() or not self._pending_removals:
+            return False
+        queued, self._pending_removals = self._pending_removals, []
+        started = False
+        for kind, names in queued:
+            if kind == "track":
+                self._start_track_uninstall(names, confirmed=True)
+                started = True
+            elif kind == "untracked":
+                self._start_untracked_uninstall(names, confirmed=True)
+                started = True
+            elif kind == "obsolete":
+                self._obsolete_ctx = "obsolete"
+                self._start_obsolete_removal(list(names))
+                started = True
+        return started
+
     def _request_track_uninstall(self, name: str) -> None:
         self._start_track_uninstall([name])
 
@@ -6400,7 +6509,8 @@ class UpdateWindow(QMainWindow):
             return
         self._start_track_uninstall(names)
 
-    def _start_track_uninstall(self, names: list[str]) -> None:
+    def _start_track_uninstall(self, names: list[str],
+                               confirmed: bool = False) -> None:
         names = [n for n in names if self._track_model.row_of(n) is not None]
         if not names:
             return
@@ -6408,31 +6518,35 @@ class UpdateWindow(QMainWindow):
             self._set_status(
                 "A removal is already running — please wait…", "info")
             return
-        single = len(names) == 1
-        box = QMessageBox(self)
-        box.setWindowTitle(
-            f"Remove {names[0]}?" if single
-            else f"Remove {len(names)} packages?")
-        box.setIcon(QMessageBox.Icon.Warning)
-        if single:
-            box.setText(
-                f"Remove <b>{names[0]}</b> and any dependencies that become "
-                "unneeded (pacman -Rns)?\n\n"
-                "Configuration files in your home directory are kept.")
-        else:
-            listed = "<br>".join(f"  • <b>{n}</b>" for n in names[:12])
-            more = (f"<br>  • …and {len(names) - 12} more"
-                    if len(names) > 12 else "")
-            box.setText(
-                f"Remove <b>{len(names)}</b> packages and any dependencies "
-                "that become unneeded (pacman -Rns)?<br><br>"
-                f"{listed}{more}<br><br>"
-                "Configuration files in your home directory are kept.")
-        go_btn = box.addButton("Remove", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        box.exec()
-        if box.clickedButton() is not go_btn:
+        if self._removal_can_wait("track", names):
             return
+        single = len(names) == 1
+        if not confirmed:
+            box = QMessageBox(self)
+            box.setWindowTitle(
+                f"Remove {names[0]}?" if single
+                else f"Remove {len(names)} packages?")
+            box.setIcon(QMessageBox.Icon.Warning)
+            if single:
+                box.setText(
+                    f"Remove <b>{names[0]}</b> and any dependencies that "
+                    "become unneeded (pacman -Rns)?\n\n"
+                    "Configuration files in your home directory are kept.")
+            else:
+                listed = "<br>".join(f"  • <b>{n}</b>" for n in names[:12])
+                more = (f"<br>  • …and {len(names) - 12} more"
+                        if len(names) > 12 else "")
+                box.setText(
+                    f"Remove <b>{len(names)}</b> packages and any "
+                    "dependencies that become unneeded (pacman -Rns)?"
+                    f"<br><br>{listed}{more}<br><br>"
+                    "Configuration files in your home directory are kept.")
+            go_btn = box.addButton("Remove",
+                                   QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is not go_btn:
+                return
         force = False
         blocked = find_blocked_obsolete_packages(names)
         if blocked:
@@ -6740,7 +6854,8 @@ class UpdateWindow(QMainWindow):
             return
         self._start_untracked_uninstall(names)
 
-    def _start_untracked_uninstall(self, names: list[str]) -> None:
+    def _start_untracked_uninstall(self, names: list[str],
+                                   confirmed: bool = False) -> None:
         known = [n for n in names
                  if any(m.row_of(n) is not None for m in self._un_models())
                  and self._un_owned(n)]
@@ -6755,33 +6870,37 @@ class UpdateWindow(QMainWindow):
             self._set_status(
                 "A removal is already running — please wait…", "info")
             return
-        single = len(known) == 1
-        box = QMessageBox(self)
-        box.setWindowTitle(
-            f"Remove {known[0]}?" if single
-            else f"Remove {len(known)} packages?")
-        box.setIcon(QMessageBox.Icon.Warning)
-        if single:
-            box.setText(
-                f"Remove <b>{known[0]}</b> and any dependencies that become "
-                "unneeded (pacman -Rns)?\n\n"
-                "Configuration files in your home directory are kept.")
-        else:
-            listed = "<br>".join(f"  • <b>{n}</b>" for n in known[:12])
-            more = (f"<br>  • …and {len(known) - 12} more"
-                    if len(known) > 12 else "")
-            skip_note = (f"<br><br>Skipped {len(skipped)} not owned by any "
-                         "package." if skipped else "")
-            box.setText(
-                f"Remove <b>{len(known)}</b> packages and any dependencies "
-                "that become unneeded (pacman -Rns)?<br><br>"
-                f"{listed}{more}{skip_note}<br><br>"
-                "Configuration files in your home directory are kept.")
-        go_btn = box.addButton("Remove", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        box.exec()
-        if box.clickedButton() is not go_btn:
+        if self._removal_can_wait("untracked", known):
             return
+        single = len(known) == 1
+        if not confirmed:
+            box = QMessageBox(self)
+            box.setWindowTitle(
+                f"Remove {known[0]}?" if single
+                else f"Remove {len(known)} packages?")
+            box.setIcon(QMessageBox.Icon.Warning)
+            if single:
+                box.setText(
+                    f"Remove <b>{known[0]}</b> and any dependencies that "
+                    "become unneeded (pacman -Rns)?\n\n"
+                    "Configuration files in your home directory are kept.")
+            else:
+                listed = "<br>".join(f"  • <b>{n}</b>" for n in known[:12])
+                more = (f"<br>  • …and {len(known) - 12} more"
+                        if len(known) > 12 else "")
+                skip_note = (f"<br><br>Skipped {len(skipped)} not owned by "
+                             "any package." if skipped else "")
+                box.setText(
+                    f"Remove <b>{len(known)}</b> packages and any "
+                    "dependencies that become unneeded (pacman -Rns)?"
+                    f"<br><br>{listed}{more}{skip_note}<br><br>"
+                    "Configuration files in your home directory are kept.")
+            go_btn = box.addButton("Remove",
+                                   QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is not go_btn:
+                return
         force = False
         blocked = find_blocked_obsolete_packages(known)
         if blocked:
@@ -7052,6 +7171,14 @@ class UpdateWindow(QMainWindow):
         if self._rechecker is not None and self._rechecker.isRunning():
             self._set_status(
                 "A check is still running — please wait…", "info")
+            return
+        # A removal holds pacman's database just like an install does:
+        # starting now would only produce a lock error.
+        if any(getattr(self, attr, None) is not None
+               for attr in ("_track_uninstaller", "_untracked_uninstaller",
+                            "_remover")):
+            self._set_status(
+                "A removal is still running — please wait…", "info")
             return
         safe_names = self._model.checked_names()
         if not safe_names:
@@ -7376,7 +7503,10 @@ class UpdateWindow(QMainWindow):
             self._log_action(
                 f"Updated {n_selected} package"
                 f"{'s' if n_selected != 1 else ''} ✓")
-            QTimer.singleShot(2000, self.close)
+            # A removal the user queued during the update runs now, and it
+            # needs the window to stay: closing stops the runners.
+            if not self._drain_pending_removals():
+                QTimer.singleShot(2000, self.close)
             return
 
         # ── Failure path ──────────────────────────────────────────────
@@ -7411,6 +7541,7 @@ class UpdateWindow(QMainWindow):
             self._cancel_btn.setEnabled(True)
             self._recheck_btn.setEnabled(True)
             self._refresh_selection_ui()
+            self._drain_pending_removals()
             return
         self._updating = False
         self._release_thread("_runner")
@@ -7499,6 +7630,10 @@ class UpdateWindow(QMainWindow):
         self._show_cancel(False)
         self._recheck_btn.setEnabled(True)
         self._refresh_selection_ui()
+        # The database is free again: run whatever the user queued while
+        # this update was going. Done before the failure dialogs below so
+        # a queued removal never stacks behind them.
+        self._drain_pending_removals()
 
         if kind == "cancelled":
             return  # dismissing auth is not a failure — stay silent
@@ -7751,6 +7886,7 @@ class UpdateWindow(QMainWindow):
             self._maybe_offer_overwrite_retry(kind, output, single_name=name)
         finally:
             self._offer_open = False
+        self._drain_pending_removals()
 
     def _maybe_offer_obsolete_cleanup(self, output: str) -> None:
         """If the failed update looks blocked by dropped packages, offer to remove them."""
@@ -8028,7 +8164,7 @@ class UpdateWindow(QMainWindow):
                 self._park_thread(thread)
             setattr(self, attr, None)
         for attr in ("_runner", "_single", "_remover", "_track_runner",
-                     "_track_uninstaller"):
+                     "_track_uninstaller", "_untracked_uninstaller"):
             thread = getattr(self, attr, None)
             if thread is not None:
                 if thread.isRunning():
