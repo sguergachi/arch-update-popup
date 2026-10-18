@@ -799,90 +799,6 @@ class TestWindow:
         assert window._model.item(1)["state"] == "installing"
 
 
-class TestMovesDialog:
-    def _moves(self):
-        return [
-            {"name": "graduated", "installed": "1.0-1", "target": "1.1-1", "source": "extra",
-             "relation": "upgrade"},
-            {"name": "shiny", "installed": "2.0-1", "target": "1.9-1", "source": "extra",
-             "relation": "downgrade"},
-        ]
-
-    def test_builds_rows(self, qapp):
-        dlg = app.MovesDialog(self._moves())
-        dlg.resize(760, 480)
-        dlg.show()
-        qapp.processEvents()
-        assert set(dlg._rows) == {"graduated", "shiny"}
-        assert dlg._rows["graduated"]._switch_btn.text() == "Switch"
-        dlg.close()
-
-    def test_switch_runs_and_verifies(self, qapp, monkeypatch):
-        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
-        monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
-        dlg = app.MovesDialog(self._moves())
-        dlg.resize(760, 480)
-        dlg.show()
-        qapp.processEvents()
-        dlg.request_switch("graduated")
-        assert isinstance(dlg._runner, FakeRunner)
-        dlg._runner.done.emit(True, "")
-        qapp.processEvents()
-        assert dlg._rows["graduated"]._switch_btn.text() == "Switched ✓"
-        assert dlg._runner is None  # queue drained
-        dlg.close()
-
-    def test_switch_failure_retries(self, qapp, monkeypatch):
-        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
-        dlg = app.MovesDialog(self._moves())
-        dlg.resize(760, 480)
-        dlg.show()
-        qapp.processEvents()
-        dlg.request_switch("graduated")
-        dlg._runner.done.emit(False, "boom")
-        qapp.processEvents()
-        assert dlg._rows["graduated"]._switch_btn.text() == "Retry"
-        dlg.close()
-
-    def test_switch_cancel_resets_row(self, qapp, monkeypatch):
-        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
-        dlg = app.MovesDialog(self._moves())
-        dlg.resize(760, 480)
-        dlg.show()
-        qapp.processEvents()
-        dlg.request_switch("graduated")
-        dlg._runner.done.emit(False, "Request dismissed")
-        qapp.processEvents()
-        assert dlg._rows["graduated"]._switch_btn.text() == "Switch"
-        assert dlg._runner is None
-        dlg.close()
-
-    def test_downgrade_cancel_leaves_queue_empty(self, qapp, monkeypatch):
-        # window fixture patches QMessageBox.exec/clickedButton only for
-        # window tests; replicate the auto-dismiss stub here.
-        monkeypatch.setattr(app.QMessageBox, "exec", lambda self: None)
-        monkeypatch.setattr(app.QMessageBox, "clickedButton", lambda self: None)
-        dlg = app.MovesDialog(self._moves())
-        dlg.resize(760, 480)
-        dlg.show()
-        qapp.processEvents()
-        dlg.request_switch("shiny")  # downgrade → confirm → auto-dismiss
-        assert dlg._queue == []
-        assert dlg._runner is None
-        dlg.close()
-
-    def test_lock_blocks_switch(self, qapp, monkeypatch):
-        import os as _os
-        monkeypatch.setattr(_os.path, "exists", lambda p: True)
-        dlg = app.MovesDialog(self._moves())
-        dlg.resize(760, 480)
-        dlg.show()
-        qapp.processEvents()
-        dlg.request_switch("graduated")
-        assert dlg._queue == []
-        assert "Another package operation" in dlg._status.text()
-        dlg.close()
-
 
 class TestViews:
     def test_empty_window_opens(self, qapp):
@@ -1122,6 +1038,30 @@ class TestViews:
         qapp.processEvents()
         assert b not in window._orphans
 
+    class _AcceptBox:
+        """QMessageBox stub that always picks the first AcceptRole button."""
+        from PyQt6.QtWidgets import QMessageBox as _MB
+        Icon = _MB.Icon
+        ButtonRole = _MB.ButtonRole
+        StandardButton = _MB.StandardButton
+
+        class _Btn(QObject):
+            """Stands in for a QPushButton: the app connects `clicked`."""
+            clicked = pyqtSignal()
+
+        def __init__(self, *a, **k):
+            self._accept = self._Btn()
+
+        def setWindowTitle(self, *a): pass
+        def setIcon(self, *a): pass
+        def setText(self, *a): pass
+        def setInformativeText(self, *a): pass
+        def setDetailedText(self, *a): pass
+        def setStyleSheet(self, *a): pass
+        def addButton(self, *a, **k): return self._accept
+        def exec(self): return None
+        def clickedButton(self): return self._accept
+
     def _settle_track_loader(self, window, qapp):
         if window._obs_checker is not None:
             window._obs_checker.wait(25000)
@@ -1135,61 +1075,15 @@ class TestViews:
         self._settle_track_loader(window, qapp)
         window._on_tracked_loaded(
             [{"name": "b-aur", "version": "1-1", "repo": "aur"},
-             {"name": "a-off", "version": "2-1", "repo": "official"}],
-            [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
-              "relation": "upgrade"}])
+             {"name": "a-off", "version": "2-1", "repo": "official"}])
         qapp.processEvents()
         assert window._track_model.rowCount() == 2
-        # movable floats first
-        assert window._track_model.item(0)["name"] == "b-aur"
-        assert window._track_model.movable_names() == ["b-aur"]
+        # Alphabetical by the name on screen.
+        assert window._track_model.item(0)["name"] == "a-off"
         assert window._view_buttons["tracked"].text() == "Tracked (2)"
         window._switch_view("tracked")
         assert window._content_stack.currentIndex() == 1
         assert window._footer_stack.currentIndex() == 1
-
-    def test_tracked_switch_runs_and_verifies(
-            self, window, qapp, monkeypatch):
-        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
-        monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
-        self._settle_track_loader(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "b-aur", "version": "1-1", "repo": "aur"}],
-            [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
-              "relation": "upgrade"}])
-        window._request_track_switch("b-aur")
-        assert isinstance(window._track_runner, FakeRunner)
-        assert window._track_model.item(0)["state"] == "switching"
-        window._track_runner.done.emit(True, "")
-        qapp.processEvents()
-        assert window._track_model.item(0)["state"] == "done"
-        assert window._track_runner is None
-        assert "official build" in window._sub.text()
-
-    def test_tracked_switch_failure_retries(
-            self, window, qapp, monkeypatch):
-        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
-        self._settle_track_loader(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "b-aur", "version": "1-1", "repo": "aur"}],
-            [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
-              "relation": "upgrade"}])
-        window._request_track_switch("b-aur")
-        window._track_runner.done.emit(False, "boom")
-        qapp.processEvents()
-        assert window._track_model.item(0)["state"] == "failed"
-
-    def test_tracked_nothing_movable_reported(self, window, qapp):
-        self._settle_track_loader(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "a-off", "version": "2-1", "repo": "official"},
-             {"name": "b-aur", "version": "1-1", "repo": "aur"}],
-            [])
-        qapp.processEvents()
-        assert "none available from a managed repo" in \
-            window._track_summary.text()
-        assert "nothing to move" in window._track_footer_label.text()
-        assert not window._track_move_all_btn.isEnabled()
 
     def test_activity_log_records_actions(self, window, qapp):
         window._log_action("Removing foo…")
@@ -1217,75 +1111,10 @@ class TestViews:
         assert window._dismiss_btn.isHidden()
         assert window._details.toPlainText() == ""
 
-    def test_tracked_downgrade_cancel(self, window, qapp, monkeypatch):
-        monkeypatch.setattr(app.QMessageBox, "exec", lambda self: None)
-        monkeypatch.setattr(app.QMessageBox, "clickedButton", lambda self: None)
-        self._settle_track_loader(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "old", "version": "3-1", "repo": "aur"}],
-            [{"name": "old", "installed": "3-1", "target": "2-1", "source": "extra",
-              "relation": "downgrade"}])
-        window._request_track_switch("old")  # confirm auto-dismissed
-        assert window._track_queue == []
-        assert window._track_runner is None
-
-    def test_tracked_lock_blocks(self, window, qapp, monkeypatch):
-        import os as _os
-        monkeypatch.setattr(_os.path, "exists", lambda p: True)
-        self._settle_track_loader(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "b", "version": "1-1", "repo": "aur"}],
-            [{"name": "b", "installed": "1-1", "target": "1.1-1", "source": "extra",
-              "relation": "upgrade"}])
-        window._request_track_switch("b")
-        assert window._track_queue == []
-        assert "Another package operation" in window._sub.text()
-
-    def test_tracked_move_all_skips_downgrades(
-            self, window, qapp, monkeypatch):
-        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
-        self._settle_track_loader(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "a", "version": "1-1", "repo": "aur"},
-             {"name": "d", "version": "3-1", "repo": "aur"}],
-            [{"name": "a", "installed": "1-1", "target": "1.1-1", "source": "extra",
-              "relation": "upgrade"},
-             {"name": "d", "installed": "3-1", "target": "2-1", "source": "extra",
-              "relation": "downgrade"}])
-        window._move_all_tracked()
-        # 'a' starts immediately; 'd' needs individual confirmation
-        assert window._track_queue == []
-        assert isinstance(window._track_runner, FakeRunner)
-
-    class _AcceptBox:
-        """QMessageBox stub that always picks the first AcceptRole button."""
-        from PyQt6.QtWidgets import QMessageBox as _MB
-        Icon = _MB.Icon
-        ButtonRole = _MB.ButtonRole
-        StandardButton = _MB.StandardButton
-
-        class _Btn(QObject):
-            """Stands in for a QPushButton: the app connects `clicked`."""
-            clicked = pyqtSignal()
-
-        def __init__(self, *a, **k):
-            self._accept = self._Btn()
-
-        def setWindowTitle(self, *a): pass
-        def setIcon(self, *a): pass
-        def setText(self, *a): pass
-        def setInformativeText(self, *a): pass
-        def setDetailedText(self, *a): pass
-        def setStyleSheet(self, *a): pass
-        def addButton(self, *a, **k): return self._accept
-        def exec(self): return None
-        def clickedButton(self): return self._accept
-
     def _stage_tracked(self, window, qapp):
         self._settle_track_loader(window, qapp)
         window._on_tracked_loaded(
-            [{"name": "del-me", "version": "1-1", "repo": "aur"}],
-            [])
+            [{"name": "del-me", "version": "1-1", "repo": "aur"}])
         qapp.processEvents()
 
     def test_tracked_uninstall_success(self, window, qapp, monkeypatch):
@@ -1332,8 +1161,7 @@ class TestViews:
     def test_tracked_uninstall_busy(self, window, qapp):
         self._settle_track_loader(window, qapp)
         window._on_tracked_loaded(
-            [{"name": "del-me", "version": "1-1", "repo": "aur"}],
-            [])
+            [{"name": "del-me", "version": "1-1", "repo": "aur"}])
         window._track_uninstaller = FakeRunner()
         window._request_track_uninstall("del-me")
         assert "already running" in window._sub.text()
@@ -1445,25 +1273,25 @@ class TestViews:
         self._settle_track_loader(window, qapp)
         window._on_tracked_loaded(
             [{"name": "a", "version": "1", "repo": "aur"},
-             {"name": "b", "version": "1", "repo": "extra"}],
-            [])
+             {"name": "b", "version": "1", "repo": "extra"}])
         qapp.processEvents()
-        # No selection → move-all offering (nothing movable here).
-        assert window._track_move_all_btn.text() == "Move to managed repos"
-        assert not window._track_move_all_btn.isEnabled()
-        # Check one row → main button becomes the uninstall action.
+        # Nothing checked: the button says what it is and is off.
+        assert window._track_uninstall_btn.text() == "Uninstall selected"
+        assert not window._track_uninstall_btn.isEnabled()
+        # Check rows → the button names the action it will take.
         window._track_model.set_all(True)
         window._refresh_tracked_footer()
         qapp.processEvents()
-        assert window._track_move_all_btn.text() == "Uninstall 2 selected"
-        assert window._track_move_all_btn.isEnabled()
+        assert window._track_uninstall_btn.text() == "Uninstall 2 selected"
+        assert window._track_uninstall_btn.isEnabled()
         # The list header carries the selection: ticked when everything
         # in view is selected, and it says so in words too.
         assert window._track_header.check.checkState() == \
             Qt.CheckState.Checked
         assert "All 2 packages selected" in window._track_sel_label.text()
         window._select_tracked_all(False)
-        assert window._track_move_all_btn.text() == "Move to managed repos"
+        assert window._track_uninstall_btn.text() == "Uninstall selected"
+        assert not window._track_uninstall_btn.isEnabled()
 
     def test_tracked_batch_uninstall_success(self, window, qapp, monkeypatch):
         monkeypatch.setattr(app, "QMessageBox", self._AcceptBox)
@@ -1479,34 +1307,17 @@ class TestViews:
         self._settle_track_loader(window, qapp)
         window._on_tracked_loaded(
             [{"name": "a", "version": "1", "repo": "aur"},
-             {"name": "b", "version": "1", "repo": "extra"}],
-            [])
+             {"name": "b", "version": "1", "repo": "extra"}])
         window._track_model.set_all(True)
         window._refresh_tracked_footer()
-        assert window._track_move_all_btn.text() == "Uninstall 2 selected"
-        window._on_track_main_clicked()
+        assert window._track_uninstall_btn.text() == "Uninstall 2 selected"
+        window._track_uninstall_btn.click()
         assert isinstance(window._track_uninstaller, FakeRunner)
         assert window._track_uninstall_names == ["a", "b"]
         window._track_uninstaller.done.emit(True, "")
         qapp.processEvents()
         assert window._track_model.rowCount() == 0
         assert "uninstalled" in window._sub.text()
-
-    def test_tracked_switch_cancel_aborts_cleanly(
-            self, window, qapp, monkeypatch):
-        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
-        self._settle_track_loader(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "b-aur", "version": "1-1", "repo": "aur"}],
-            [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
-              "relation": "upgrade"}])
-        window._request_track_switch("b-aur")
-        assert window._track_model.item(0)["state"] == "switching"
-        window._track_runner.done.emit(False, "Request dismissed")
-        qapp.processEvents()
-        assert window._track_model.item(0)["state"] == "idle"
-        assert window._track_runner is None
-        assert "cancelled" in window._sub.text().lower()
 
     def test_tracked_uninstall_cancel_aborts_cleanly(
             self, window, qapp, monkeypatch):
@@ -1529,19 +1340,6 @@ class TestViews:
         assert "dismissed" in window._sub.text().lower()
         assert "nothing was changed" in window._sub.text().lower()
         assert window._update_btn.isEnabled()
-
-    def test_tracked_main_click_moves_when_unselected(
-            self, window, qapp, monkeypatch):
-        self._settle_track_loader(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "b-aur", "version": "1-1", "repo": "aur"}],
-            [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
-              "relation": "upgrade"}])
-        monkeypatch.setattr(app, "UpdateRunner", FakeRunner)
-        window._on_track_main_clicked()
-        assert isinstance(window._track_runner, FakeRunner)
-        assert window._track_current == "b-aur"
-
 
 class TestNotifyHelper:
     def test_parses_gdbus_id(self, monkeypatch):
@@ -1662,7 +1460,7 @@ class TestFailureDialog:
             window._track_loader.wait(25000)
         qapp.processEvents()
         window._on_tracked_loaded(
-            [{"name": "perplexity", "version": "1.6.0-1", "repo": "aur"}], [])
+            [{"name": "perplexity", "version": "1.6.0-1", "repo": "aur"}])
         qapp.processEvents()
         window._request_track_uninstall("perplexity")
         window._track_uninstaller.done.emit(
@@ -1751,7 +1549,6 @@ class TestNoLayoutShifts:
         qapp.processEvents()
         assert window._empty_title.text() == "You're up to date"
         assert not window._slot_security.isVisible()
-        assert not window._slot_moves.isVisible()
         assert self._snap(window, skip=("_list_header", "_list")) \
             == rows_snapshot
         window._recheck_updates()
@@ -1825,7 +1622,6 @@ class TestViewBanners:
         window._refresh_empty_state()
         qapp.processEvents()
         assert not window._slot_security.isVisible()
-        assert not window._slot_moves.isVisible()
 
     def test_banner_counts_follow_the_list(self, window, qapp):
         window._swap_updates_model(_updates(4), {})
@@ -1835,22 +1631,6 @@ class TestViewBanners:
         window._swap_updates_model(_updates(8), {})
         qapp.processEvents()
         assert "2 compromised" in self._banner_text(window._slot_security)
-
-    def test_moves_banner_filters_to_current_list(self, window, qapp):
-        window._pending_moves = [{"name": "yakuake", "installed": "1-1",
-                                  "target": "1.1-1", "source": "extra", "relation": "upgrade"}]
-        window._swap_updates_model(
-            [{"name": "yakuake", "old": "1-1", "new": "1.1-1",
-              "repo": "aur"}], {})
-        qapp.processEvents()
-        assert window._slot_moves.isVisible()
-        # The package left the list → the prompt goes with it.
-        window._swap_updates_model(
-            [{"name": "konsole", "old": "1-1", "new": "2-1",
-              "repo": "official"}], {})
-        qapp.processEvents()
-        assert not window._slot_moves.isVisible()
-
 
 class TestCardListRemeasure:
     """Fixed-mode rows re-measure when the viewport narrows.
@@ -1923,7 +1703,7 @@ class TestPlaceholdersEverywhere:
         w._track_loaded = False
         w._refresh_tracked_summary()
         assert w._track_empty.title.text() == "Loading…"
-        w._on_tracked_loaded([], [])
+        w._on_tracked_loaded([])
         qapp.processEvents()
         assert w._track_empty.title.text() == "Nothing tracked"
         w.close()
@@ -2101,7 +1881,7 @@ class TestListHeaderAndFilter:
         qapp.processEvents()
         window._on_tracked_loaded(
             [{"name": "hyprland", "version": "1", "repo": "aur"},
-             {"name": "firefox", "version": "2", "repo": "official"}], [])
+             {"name": "firefox", "version": "2", "repo": "official"}])
         qapp.processEvents()
         window._track_header.search.setText("hypr")
         qapp.processEvents()
@@ -2464,7 +2244,7 @@ def busy_window(qapp, monkeypatch):
     w.resize(1280, 800)
     w.show()
     w._on_tracked_loaded([{"name": "konsole", "version": "25.08.1-1",
-                           "repo": "official"}], [])
+                           "repo": "official"}])
     qapp.processEvents()
     yield w
     w.close()
@@ -2665,7 +2445,7 @@ class TestStatStripFilters:
         window._on_tracked_loaded(
             [{"name": "konsole", "version": "1-1", "repo": "official"},
              {"name": "aur-pkg", "version": "1-1", "repo": "aur"},
-             {"name": "cachy", "version": "1-1", "repo": "cachyos-v3"}], [])
+             {"name": "cachy", "version": "1-1", "repo": "cachyos-v3"}])
         qapp.processEvents()
         cells = window._track_stat_cards
         assert {k: c._value.text() for k, c in cells.items()} == {
@@ -2760,12 +2540,11 @@ class TestFlatpakRows:
         monkeypatch.setattr(app, "get_installed_packages",
                             lambda: [{"name": "konsole", "version": "1-1",
                                       "repo": "official"}])
-        monkeypatch.setattr(app, "find_repo_moves", lambda names=None: [])
         monkeypatch.setattr(app, "appimage_rows", lambda: [])
         monkeypatch.setattr(app, "_flatpak_apps",
                             lambda: {"com.discordapp.Discord":
                                      ("1.0.151", "system")})
-        installed, _moves = app.load_tracked()
+        installed = app.load_tracked()
         names = {r["name"] for r in installed}
         assert names == {"konsole", "com.discordapp.Discord"}
 
@@ -2775,13 +2554,12 @@ class TestFlatpakRows:
                             lambda: [{"name": "konsole", "version": "1-1",
                                       "repo": "official"}])
         monkeypatch.setattr(app, "appimage_rows", lambda: [])
-        monkeypatch.setattr(app, "find_repo_moves", lambda names=None: [])
 
         def boom():
             raise OSError("flatpak exploded")
 
         monkeypatch.setattr(app, "flatpak_tracked_rows", boom)
-        installed, _moves = app.load_tracked()
+        installed = app.load_tracked()
         assert [r["name"] for r in installed] == ["konsole"]
 
     def test_untracked_leaves_flatpak_apps_to_tracked(self, monkeypatch,
@@ -3101,7 +2879,7 @@ class TestAppImageRows:
         window._on_tracked_loaded(
             [{"name": "Claude", "version": "", "repo": "appimage",
               "title": "Claude", "path": "/home/s/Applications/Claude.AppImage",
-              "desktop": ""}], [])
+              "desktop": ""}])
         qapp.processEvents()
         assert window._track_source("Claude") == "appimage"
 
@@ -3123,7 +2901,7 @@ class TestViewPackageLinks:
         _settle_loaders(window, qapp)
         window._on_tracked_loaded(
             [{"name": "com.discordapp.Discord", "version": "1",
-              "repo": "flatpak", "title": "Discord", "desktop": ""}], [])
+              "repo": "flatpak", "title": "Discord", "desktop": ""}])
         qapp.processEvents()
         url = app._package_url("com.discordapp.Discord", "flatpak")
         assert url == "https://flathub.org/apps/com.discordapp.Discord"
@@ -3134,7 +2912,7 @@ class TestViewPackageLinks:
         _settle_loaders(window, qapp)
         window._on_tracked_loaded(
             [{"name": "Claude", "version": "", "repo": "appimage",
-              "title": "Claude", "path": "/x/Claude.AppImage"}], [])
+              "title": "Claude", "path": "/x/Claude.AppImage"}])
         qapp.processEvents()
         assert self._link_rect(window, 0).isNull(), "link offered, no page"
 
@@ -3144,14 +2922,14 @@ class TestViewPackageLinks:
         window._on_tracked_loaded(
             [{"name": "Paper", "version": "0.1.10", "repo": "appimage",
               "title": "Paper", "url": "https://paper.example/",
-              "path": "/x/Paper.AppImage"}], [])
+              "path": "/x/Paper.AppImage"}])
         qapp.processEvents()
         assert not self._link_rect(window, 0).isNull()
 
     def test_a_pacman_row_keeps_its_link(self, window, qapp, monkeypatch):
         _settle_loaders(window, qapp)
         window._on_tracked_loaded(
-            [{"name": "konsole", "version": "1", "repo": "official"}], [])
+            [{"name": "konsole", "version": "1", "repo": "official"}])
         qapp.processEvents()
         assert not self._link_rect(window, 0).isNull()
 
@@ -3163,7 +2941,7 @@ class TestViewPackageLinks:
         _settle_loaders(window, qapp)
         window._on_tracked_loaded(
             [{"name": "Claude", "version": "", "repo": "appimage",
-              "title": "Claude", "path": "/x/Claude.AppImage"}], [])
+              "title": "Claude", "path": "/x/Claude.AppImage"}])
         qapp.processEvents()
         d = window._track_list.itemDelegate()
         lay = d._geom(0, window._track_model.item(0), 1240)

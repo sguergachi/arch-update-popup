@@ -279,33 +279,28 @@ class TestTrackedModel:
         m.set_packages(
             [{"name": "b-aur", "version": "1-1", "repo": "aur"},
              {"name": "a-off", "version": "2-1", "repo": "official"},
-             {"name": "c-aur", "version": "3-1", "repo": "aur"}],
-            [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
-              "relation": "upgrade"}])
+             {"name": "c-aur", "version": "3-1", "repo": "aur"}])
         return m
 
-    def test_sort_movable_first(self):
+    def test_sorted_by_the_name_on_screen(self):
         m = self._model()
         assert m.rowCount() == 3
-        assert m.item(0)["name"] == "b-aur"
-        assert [m.item(r)["name"] for r in (1, 2)] == ["a-off", "c-aur"]
-
-    def test_movable_names(self):
-        assert self._model().movable_names() == ["b-aur"]
+        assert [m.item(r)["name"] for r in range(3)] == \
+            ["a-off", "b-aur", "c-aur"]
 
     def test_state_signal(self):
         m = self._model()
         seen = []
         m.dataChanged.connect(lambda *a: seen.append(a))
-        m.set_state("b-aur", "switching")
+        m.set_state("b-aur", "uninstalling")
         assert len(seen) == 1
-        assert m.item(0)["state"] == "switching"
+        assert m.item(m.row_of("b-aur"))["state"] == "uninstalling"
         m.set_state("nope", "done")  # unknown: silent no-op
         assert len(seen) == 1
 
     def test_display_role(self):
         m = self._model()
-        assert m.data(m.index(0)) == "b-aur"
+        assert m.data(m.index(0)) == "a-off"
 
 
 @pytest.fixture()
@@ -313,9 +308,7 @@ def tracked_view(qapp):
     m = app.TrackedModel()
     m.set_packages(
         [{"name": "b-aur", "version": "1-1", "repo": "aur"},
-         {"name": "a-off", "version": "2-1", "repo": "official"}],
-        [{"name": "b-aur", "installed": "1-1", "target": "1.1-1", "source": "extra",
-          "relation": "upgrade"}])
+         {"name": "a-off", "version": "2-1", "repo": "official"}])
     v = QListView()
     v.resize(900, 400)
     v.setModel(m)
@@ -344,24 +337,20 @@ class TestTrackedDelegate:
                             opt.rect.width())["height"]
         assert h > 78
 
-    def test_action_only_when_movable(self, tracked_view):
+    def test_uninstall_is_always_offered(self, tracked_view):
         d = tracked_view.itemDelegate()
-        opt, idx = _topt(tracked_view, 0)
-        lay = d._geom(0, tracked_view.model().item(0), opt.rect.width())
-        assert lay["action_txt"] == "Switch"
-        assert not lay["action"].isNull()
-        assert lay["action2_txt"] == "Uninstall"
-        assert not lay["action2"].isNull()
-        opt1, _ = _topt(tracked_view, 1)
-        lay1 = d._geom(1, tracked_view.model().item(1), opt1.rect.width())
-        assert lay1["action"].isNull()
-        assert not lay1["action2"].isNull()  # uninstall always offered
-        assert lay1["action2_txt"] == "Uninstall"
+        for row in (0, 1):
+            opt, _idx = _topt(tracked_view, row)
+            lay = d._geom(row, tracked_view.model().item(row),
+                          opt.rect.width())
+            assert lay["action2_txt"] == "Uninstall"
+            assert not lay["action2"].isNull()
 
     def test_uninstall_hit(self, tracked_view, qapp):
         d = tracked_view.itemDelegate()
-        opt, idx = _topt(tracked_view, 1)  # non-movable row
-        lay = d._geom(1, tracked_view.model().item(1), opt.rect.width())
+        row = tracked_view.model().row_of("a-off")
+        opt, idx = _topt(tracked_view, row)
+        lay = d._geom(row, tracked_view.model().item(row), opt.rect.width())
         got = []
         d.uninstall_requested.connect(got.append)
         c = lay["action2"].center() + opt.rect.topLeft()
@@ -375,39 +364,21 @@ class TestTrackedDelegate:
         m = tracked_view.model()
         m.set_state("b-aur", "failed", op="uninstall")
         d = tracked_view.itemDelegate()
-        opt, idx = _topt(tracked_view, 0)
-        lay = d._geom(0, m.item(0), opt.rect.width())
+        opt, _idx = _topt(tracked_view, 0)
+        row = m.row_of("b-aur")
+        lay = d._geom(row, m.item(row), opt.rect.width())
         assert lay["action2_txt"] == "Retry"
-        assert lay["action_txt"] == "Switch"  # switch still available
-        m.set_state("b-aur", "failed", op="switch")
-        lay = d._geom(0, m.item(0), opt.rect.width())
-        assert lay["action_txt"] == "Retry"
-        assert lay["action2_txt"] == "Uninstall"
 
     def test_remove_row(self):
         m = app.TrackedModel()
         m.set_packages(
             [{"name": "a", "version": "1", "repo": "aur"},
-             {"name": "b", "version": "1", "repo": "official"}],
-            [])
+             {"name": "b", "version": "1", "repo": "official"}])
         assert m.rowCount() == 2
         m.remove_row("a")
         assert m.rowCount() == 1 and m.item(0)["name"] == "b"
         m.remove_row("nope")  # silent no-op
         assert m.rowCount() == 1
-
-    def test_switch_hit(self, tracked_view, qapp):
-        d = tracked_view.itemDelegate()
-        opt, idx = _topt(tracked_view, 0)
-        lay = d._geom(0, tracked_view.model().item(0), opt.rect.width())
-        got = []
-        d.switch_requested.connect(got.append)
-        c = lay["action"].center() + opt.rect.topLeft()
-        ev = QMouseEvent(QEvent.Type.MouseButtonRelease, QPointF(c),
-                         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
-                         Qt.KeyboardModifier.NoModifier)
-        assert d.editorEvent(ev, tracked_view.model(), opt, idx) is True
-        assert got == ["b-aur"]
 
     def test_checkbox_toggle(self, tracked_view, qapp):
         m = tracked_view.model()
@@ -431,7 +402,7 @@ class TestTrackedDelegate:
             _Qt.CheckState.Unchecked
         m.setData(idx0, _Qt.CheckState.Checked,
                   _Qt.ItemDataRole.CheckStateRole)
-        assert m.checked_names() == ["b-aur"]
+        assert m.checked_names() == ["a-off"]
         m.set_all(True)
         assert sorted(m.checked_names()) == ["a-off", "b-aur"]
         m.set_all(False)
@@ -466,7 +437,7 @@ class TestTrackedDelegate:
         seen = []
         m.dataChanged.connect(lambda *a: seen.append(a))
         m.set_desktop("b-aur", "/x/b-aur.desktop")
-        assert m.item(0)["desktop"] == "/x/b-aur.desktop"
+        assert m.item(m.row_of("b-aur"))["desktop"] == "/x/b-aur.desktop"
         assert len(seen) == 1
         m.set_desktop("nope", "/x.desktop")  # unknown: silent no-op
         assert len(seen) == 1
@@ -478,13 +449,15 @@ class TestTrackedDelegate:
         lay = d._geom(0, m.item(0), opt.rect.width())
         assert lay["open"].isNull()
         m.set_desktop("b-aur", "/x/b-aur.desktop")
-        lay = d._geom(0, m.item(0), opt.rect.width())
+        row = m.row_of("b-aur")
+        opt, idx = _topt(tracked_view, row)
+        lay = d._geom(row, m.item(row), opt.rect.width())
         assert not lay["open"].isNull()
         assert lay["open_txt"] == "Open"
         # Pills share the bottom baseline inside the card, below the
         # top-right link row.
         card = lay["card"]
-        for k in ("action", "action2", "open"):
+        for k in ("action2", "open"):
             assert lay[k].top() > lay["link"].bottom()
             assert lay[k].bottom() <= card.bottom() - app.TrackedDelegate.PBOT
 
@@ -492,8 +465,9 @@ class TestTrackedDelegate:
         m = tracked_view.model()
         m.set_desktop("b-aur", "/x/b-aur.desktop")
         d = tracked_view.itemDelegate()
-        opt, idx = _topt(tracked_view, 0)
-        lay = d._geom(0, m.item(0), opt.rect.width())
+        row = m.row_of("b-aur")
+        opt, idx = _topt(tracked_view, row)
+        lay = d._geom(row, m.item(row), opt.rect.width())
         got = []
         d.open_requested.connect(got.append)
         c = lay["open"].center() + opt.rect.topLeft()
@@ -514,41 +488,34 @@ class TestTrackedDelegate:
         assert lay["link"].right() <= card.right() - app.TrackedDelegate.PAD
         assert lay["link"].left() > lay["name"].right()
         assert card.left() <= lay["link"].left()
-        # Version line splits installed → official for movable rows.
-        assert lay["ver_left"].startswith("1-1")
-        # The target names its source: an official repo reads as
-        # "official", a third-party one by name.
-        assert lay["ver_right"] == "official 1.1-1"
-        assert "switch for signed builds" in lay["hint_txt"]
-        # Non-movable official row: no label at all.
-        m = tracked_view.model()
-        m.set_packages([{"name": "x", "version": "1", "repo": "extra"}], [])
-        layx = d._geom(0, m.item(0), opt.rect.width())
-        assert layx["hint_txt"] == ""
-        assert layx["ver_right"] == ""
+        # Version line: the installed version, nothing else.
+        assert lay["ver_left"].startswith(
+            tracked_view.model().item(0)["version"])
         # Descriptions land via set_desc with a single-row repaint.
+        m = tracked_view.model()
         seen = []
         m.dataChanged.connect(lambda *a: seen.append(a))
-        m.set_desc("x", "Terminal emulator")
-        assert m.item(0)["desc"] == "Terminal emulator"
+        m.set_desc("a-off", "Terminal emulator")
+        assert m.item(m.row_of("a-off"))["desc"] == "Terminal emulator"
         assert len(seen) == 1
 
     def test_pills_bottom_right(self, tracked_view):
         d = tracked_view.itemDelegate()
-        opt, idx = _topt(tracked_view, 0)
         m = tracked_view.model()
         m.set_desktop("b-aur", "/x/b-aur.desktop")
-        lay = d._geom(0, m.item(0), opt.rect.width())
+        row = m.row_of("b-aur")
+        opt, idx = _topt(tracked_view, row)
+        lay = d._geom(row, m.item(row), opt.rect.width())
         card = lay["card"]
-        # All pills share the bottom baseline, right-aligned inside the
-        # card: Switch rightmost, then Uninstall, then Open.
-        for k in ("action", "action2", "open"):
+        # Pills share the bottom baseline, right-aligned inside the card:
+        # Uninstall rightmost, then Open.
+        for k in ("action2", "open"):
             assert not lay[k].isNull()
             assert card.top() < lay[k].top()
             assert lay[k].bottom() <= card.bottom() - app.TrackedDelegate.PBOT
             assert lay[k].right() <= card.right() - app.TrackedDelegate.PAD
-        assert lay["action"].right() >= lay["action2"].right() >= lay["open"].right()
-        assert lay["action"].left() > lay["action2"].left() > lay["open"].left()
+        assert lay["action2"].right() >= lay["open"].right()
+        assert lay["action2"].left() > lay["open"].left()
         # Hint clears the pill cluster.
         assert lay["hint"].right() <= lay["open"].left()
 
@@ -578,7 +545,8 @@ class TestTrackedDelegate:
                          Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
                          Qt.KeyboardModifier.NoModifier)
         assert d.editorEvent(ev, tracked_view.model(), opt, idx) is True
-        assert got == ["https://aur.archlinux.org/packages/b-aur"]
+        assert got == [
+            "https://archlinux.org/packages/?q=a-off"]
 
     def test_title_display(self, tracked_view, qapp):
         # Untracked app rows show the app title, but ops use the package.
@@ -710,8 +678,7 @@ class TestUntrackedScan:
     def test_tracked_row_complete(self):
         row = app._tracked_row("p", "1-1", "official", title="T")
         assert row == {"name": "p", "title": "T", "version": "1-1",
-                       "repo": "official", "target": "", "source": "",
-                       "relation": "", "state": "idle", "failed_op": "",
+                       "repo": "official", "state": "idle", "failed_op": "",
                        "desktop": None, "desc": "", "checked": False,
                        # The app's own page (AppImages / manual installs),
                        # the file behind an AppImage row, and whether the

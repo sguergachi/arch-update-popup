@@ -42,7 +42,7 @@ def _no_obsolete(self):
 
 
 def _no_tracked(self):
-    self.done.emit([], [])
+    self.done.emit([])
 
 
 def _no_scan(self):

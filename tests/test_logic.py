@@ -238,71 +238,6 @@ class TestVerifyUpgraded:
         assert title and advice
 
 
-class TestRepoMoves:
-    def test_parse_sync_versions(self):
-        out = ("Repository      : extra\nName            : foo\n"
-               "Version         : 1.2-3\nDescription     : x\n\n"
-               "Repository      : extra\nName            : bar\n"
-               "Version         : 4.5-6\n")
-        assert app.parse_sync_versions(out) == {"foo": "1.2-3", "bar": "4.5-6"}
-        assert app.parse_sync_versions("") == {}
-
-    def test_compare_versions(self, monkeypatch):
-        import subprocess as sp
-
-        def fake_run(cmd, **kwargs):
-            a, b = cmd[1], cmd[2]
-
-            class R:
-                stdout = "-1\n" if a < b else ("0\n" if a == b else "1\n")
-
-            return R()
-
-        monkeypatch.setattr(app.subprocess, "run", fake_run)
-        assert app.compare_versions("1.0", "2.0") == -1
-        assert app.compare_versions("2.0", "2.0") == 0
-        assert app.compare_versions("2.0", "1.0") == 1
-
-    def test_find_repo_moves(self, monkeypatch):
-        monkeypatch.setattr(app, "get_foreign_packages",
-                            lambda: {"newer": "1.0-1", "same": "2.0-1",
-                                     "older": "3.0-1", "auronly": "1.0-1"})
-        import subprocess as sp
-
-        class R:
-            stdout = ("Name            : newer\nVersion         : 1.1-1\n\n"
-                      "Name            : same\nVersion         : 2.0-1\n\n"
-                      "Name            : older\nVersion         : 2.9-1\n")
-
-        monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: R())
-        monkeypatch.setattr(app, "compare_versions",
-                            lambda a, b: -1 if a < b else (0 if a == b else 1))
-        moves = {m["name"]: m for m in app.find_repo_moves()}
-        assert set(moves) == {"newer", "same", "older"}
-        assert moves["newer"]["relation"] == "upgrade"
-        assert moves["same"]["relation"] == "same"
-        assert moves["older"]["relation"] == "downgrade"
-
-    def test_find_repo_moves_scoped(self, monkeypatch):
-        seen = {}
-
-        def fake_foreign():
-            return {"a": "1-1", "b": "1-1"}
-
-        monkeypatch.setattr(app, "get_foreign_packages", fake_foreign)
-
-        def fake_run(cmd, **kwargs):
-            seen["args"] = [c for c in cmd if not c.startswith("-")]
-            class R:
-                stdout = "Name            : a\nVersion         : 2-1\n"
-            return R()
-
-        monkeypatch.setattr(app.subprocess, "run", fake_run)
-        monkeypatch.setattr(app, "compare_versions", lambda a, b: -1)
-        moves = app.find_repo_moves(["a"])
-        assert [m["name"] for m in moves] == ["a"]
-        assert "pacman" in seen["args"][0]
-
 
 class TestScanStopHook:
     def test_should_stop_aborts_early(self, monkeypatch):
@@ -445,16 +380,16 @@ class TestManagedSources:
 
     def test_official_repos_are_recognised(self):
         for repo in ("core", "extra", "multilib", "extra-testing"):
-            assert app._repo_kind(repo) == "official"
-            assert app._repo_label(repo) == "official"
+            assert app._source_key(repo) == app.SRC_OFFICIAL
+            assert app._source_label(repo) == "official"
 
     def test_binary_aur_repos_are_managed_and_named(self):
         for repo in ("cachyos", "chaotic-aur", "archlinuxcn", "alhp",
                      "garuda"):
-            assert app._repo_kind(repo) == "managed"
+            assert app._source_key(repo) == app.SRC_MANAGED
             # Named, not swallowed into "official": which farm built it
             # matters when you are deciding what to trust.
-            assert app._repo_label(repo) == repo
+            assert app._source_label(repo) == "third-party"
 
     def test_parse_sync_info_reads_the_repo(self):
         out = (
@@ -468,23 +403,6 @@ class TestManagedSources:
         info = app.parse_sync_info(out)
         assert info["brave-bin"] == ("1.80.0-1", "cachyos")
         assert info["discord"] == ("0.0.100-1", "extra")
-        # The old name→version view still works.
-        assert app.parse_sync_versions(out) == {
-            "brave-bin": "1.80.0-1", "discord": "0.0.100-1"}
-
-    def test_moves_carry_the_providing_repo(self, monkeypatch):
-        monkeypatch.setattr(app, "get_foreign_packages",
-                            lambda: {"brave-bin": "1.79.1-1"})
-        monkeypatch.setattr(app, "compare_versions", lambda a, b: -1)
-        monkeypatch.setattr(app, "_run", lambda *a, **k: type(
-            "R", (), {"stdout": "Repository      : cachyos\n"
-                                "Name            : brave-bin\n"
-                                "Version         : 1.80.0-1\n",
-                      "returncode": 0})())
-        moves = app.find_repo_moves(["brave-bin"])
-        assert moves == [{"name": "brave-bin", "installed": "1.79.1-1",
-                          "target": "1.80.0-1", "source": "cachyos",
-                          "source_kind": "managed", "relation": "upgrade"}]
 
     def test_enabled_repos_are_read_from_pacman_conf(self, tmp_path,
                                                     monkeypatch):
@@ -702,13 +620,11 @@ class TestSourceKeys:
         for repo in ("official", "core", "extra", "multilib",
                      "core-testing", "kde-unstable"):
             assert app._source_key(repo) == app.SRC_OFFICIAL
-            assert app._repo_kind(repo) == "official"
 
     def test_aur_and_managed_repos(self):
         assert app._source_key("aur") == app.SRC_AUR
         for repo in ("cachyos-v3", "chaotic-aur", "archlinuxcn"):
             assert app._source_key(repo) == app.SRC_MANAGED
-            assert app._repo_kind(repo) == "managed"
 
     def test_flatpak_and_manual_are_sources_of_their_own(self):
         assert app._source_key("flatpak") == app.SRC_FLATPAK

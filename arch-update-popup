@@ -214,15 +214,9 @@ def pacman_lock_held() -> bool:
         return False
 
 
-def _repo_kind(repo: str) -> str:
-    """'official', or 'managed' for a third-party binary source."""
-    return ("official" if _source_key(repo) == SRC_OFFICIAL else "managed")
 
 
-def _repo_label(repo: str) -> str:
-    """Human name for a providing repo ('official' reads better than a list)."""
-    kind = _repo_kind(repo)
-    return "official" if kind == "official" else (repo or "third-party")
+
 
 GITLAB_HOSTS = [
     "gitlab.gnome.org",
@@ -1256,19 +1250,6 @@ def obsolete_conflict_culprits(output: str, obsolete: list[str]) -> list[str]:
 _PACMAN_LOCK = "/var/lib/pacman/db.lck"
 
 
-def get_foreign_packages() -> dict[str, str]:
-    """Return {name: installed_version} for foreign (incl. AUR) packages."""
-    try:
-        r = _run(["pacman", "-Qm"], capture_output=True,
-                           text=True, timeout=30)
-    except Exception:
-        return {}
-    out: dict[str, str] = {}
-    for line in (r.stdout or "").splitlines():
-        parts = line.split()
-        if len(parts) >= 2:
-            out[parts[0]] = parts[1]
-    return out
 
 
 def parse_sync_info(output: str) -> dict[str, tuple[str, str]]:
@@ -1295,62 +1276,6 @@ def parse_sync_info(output: str) -> dict[str, tuple[str, str]]:
     return found
 
 
-def parse_sync_versions(output: str) -> dict[str, str]:
-    """Parse `pacman -Si` batch output into {name: version}."""
-    return {name: version
-            for name, (version, _repo) in parse_sync_info(output).items()}
-
-
-def compare_versions(a: str, b: str) -> int:
-    """-1 if a<b, 0 if equal, 1 if a>b (pacman vercmp semantics)."""
-    try:
-        r = _run(["vercmp", a, b], capture_output=True,
-                           text=True, timeout=10)
-        return max(-1, min(1, int((r.stdout or "0").strip())))
-    except Exception:
-        return 0
-
-
-def find_repo_moves(names: list[str] | None = None) -> list[dict]:
-    """Find foreign packages that an enabled repo also provides.
-
-    That is the whole "get off the AUR" story: if a managed repo carries
-    the package, switching means a signed, prebuilt package instead of
-    compiling an unreviewed PKGBUILD here.
-
-    Returns [{name, installed, target, source, relation}] where relation
-    is 'upgrade' (the repo build is newer), 'same', or 'downgrade' (needs
-    confirming). Pass `names` to check only those packages (faster).
-    """
-    foreign = get_foreign_packages()
-    if not foreign:
-        return []
-    if names is not None:
-        wanted = set(names)
-        foreign = {k: v for k, v in foreign.items() if k in wanted}
-        if not foreign:
-            return []
-    try:
-        # NB: exit code is nonzero when ANY name is unknown — the found
-        # ones still print to stdout, so parse regardless of returncode.
-        r = _run(["pacman", "-Si", *foreign],
-                           capture_output=True, text=True, timeout=60)
-    except Exception:
-        return []
-    sync = parse_sync_info(r.stdout or "")
-    moves: list[dict] = []
-    for name, inst in foreign.items():
-        if name not in sync:
-            continue
-        target, repo = sync[name]
-        cmp = compare_versions(inst, target)
-        moves.append({
-            "name": name, "installed": inst, "target": target,
-            "source": repo, "source_kind": _repo_kind(repo),
-            "relation": "upgrade" if cmp < 0 else (
-                "same" if cmp == 0 else "downgrade"),
-        })
-    return moves
 
 
 # Semantic colors live in the design system (see _positive_hex and friends):
@@ -1612,9 +1537,9 @@ def flatpak_tracked_rows() -> list[dict]:
     return rows
 
 
-def load_tracked() -> tuple[list[dict], list[dict]]:
+def load_tracked() -> list[dict]:
     """Everything the Tracked tab shows: explicitly installed packages,
-    installed Flatpak apps, and the moves that could replace AUR builds."""
+    installed Flatpak apps, and installed AppImages."""
     try:
         installed = get_installed_packages()
     except Exception:
@@ -1627,19 +1552,15 @@ def load_tracked() -> tuple[list[dict], list[dict]]:
         installed += appimage_rows()
     except Exception:
         pass
-    try:
-        moves = find_repo_moves()
-    except Exception:
-        moves = []
-    return installed, moves
+    return installed
 
 
 class TrackedLoader(QThread):
-    """Loads explicitly installed packages + Flatpak apps + repo moves."""
-    done = pyqtSignal(list, list)  # (installed, moves)
+    """Loads explicitly installed packages + Flatpak apps + AppImages."""
+    done = pyqtSignal(list)  # installed
 
     def run(self) -> None:
-        self.done.emit(*load_tracked())
+        self.done.emit(load_tracked())
 
 
 def pick_desktop_file(pkgname: str, paths: list[str]) -> str:
@@ -2129,7 +2050,6 @@ def _tracked_row(name: str, version: str, repo: str, title: str = "",
     launcher on disk) and "dependency" (a package pulled in by another).
     """
     return {"name": name, "title": title, "version": version, "repo": repo,
-            "target": "", "source": "", "relation": "",
             "state": "idle", "failed_op": "",
             "desktop": desktop or None, "desc": desc, "checked": False,
             "url": url, "path": "", "kind": kind}
@@ -3195,10 +3115,6 @@ QLabel#stat-caption {
    (see _accent_strip) — a per-side QSS border ignores the corner radius. */
 QWidget#banner-danger {
     background: %(surface)s; border: 1px solid %(negative)s;
-    border-radius: %(radius)spx;
-}
-QWidget#banner-moves {
-    background: %(surface)s; border: 1px solid %(accent)s;
     border-radius: %(radius)spx;
 }
 QLabel#banner-title { font-size: %(body)spx; font-weight: 700; color: %(negative)s; }
@@ -4843,12 +4759,9 @@ class TrackedModel(_FilterableModel, QAbstractListModel):
             return "applications"
         return _source_key(item.get("repo", ""))
 
-    def set_packages(self, installed: list[dict],
-                     moves: list[dict]) -> None:
-        by_name = {m["name"]: m for m in moves}
+    def set_packages(self, installed: list[dict]) -> None:
         items = []
         for pkg in installed:
-            m = by_name.get(pkg["name"])
             items.append({
                 "name": pkg["name"], "version": pkg.get("version", ""),
                 "repo": pkg.get("repo", ""),
@@ -4859,9 +4772,6 @@ class TrackedModel(_FilterableModel, QAbstractListModel):
                 "path": pkg.get("path", ""),
                 # The app's own page (AppImages, manual installs).
                 "url": pkg.get("url", ""),
-                "target": m["target"] if m else "",
-                "source": m["source"] if m else "",
-                "relation": m["relation"] if m else "",
                 "state": "idle",
                 "failed_op": "",
                 # GUI launcher (.desktop path): None = not resolved yet,
@@ -4873,9 +4783,7 @@ class TrackedModel(_FilterableModel, QAbstractListModel):
                 # removal is destructive, so selection is explicit).
                 "checked": False,
             })
-        # Movable packages float to the top, then by the name on screen.
-        items.sort(key=lambda it: (not it["target"],
-                                   (it["title"] or it["name"]).lower()))
+        items.sort(key=lambda it: (it["title"] or it["name"]).lower())
         self.beginResetModel()
         self._items = items
         self._reapply_filter()
@@ -4984,17 +4892,11 @@ class TrackedModel(_FilterableModel, QAbstractListModel):
         self._visible = [i - 1 if i > src else i for i in self._visible]
         self.endRemoveRows()
 
-    def movable_names(self) -> list[str]:
-        """Movable packages in the current view (drives Select all)."""
-        return [it["name"] for it in self.visible_items() if it["target"]]
-
-
 class TrackedDelegate(QStyledItemDelegate):
     """Same card design as the Updates list: checkbox rail, name + repo
     pill, View package link top-right, version line, description, status
     hint + Open + Uninstall + Switch pills along the bottom."""
 
-    switch_requested = pyqtSignal(str)
     uninstall_requested = pyqtSignal(str)
     open_requested = pyqtSignal(str)
     link_activated = pyqtSignal(str)    # external URL clicked
@@ -5057,39 +4959,23 @@ class TrackedDelegate(QStyledItemDelegate):
         name_w = min(fm_name.horizontalAdvance(title) + 14, name_avail)
         title_txt = fm_name.elidedText(title, Qt.TextElideMode.ElideRight,
                                        name_w)
-        # Metadata line: installed version, or "installed → cachyos" when
-        # a managed repo carries it (mirrors the Updates old → new line),
-        # followed by the description when there is room for it. The repo
-        # is named, because "some other source has this" is the whole
-        # point of switching off the AUR.
-        target = item["target"] or ""
-        source = item["source"] or ""
-        # Untracked app rows show the human application name as their
-        # title — the *package* name (what Uninstall removes) must stay
-        # visible, so it rides on the version line.
+        # Metadata line: the installed version, then the description when
+        # there is room for it. Untracked app rows show the human
+        # application name as their title — the *package* name (what
+        # Uninstall removes) must stay visible, so it rides this line.
         pkg_txt = ""
         if (item.get("title") or "").strip() and item["title"] != item["name"]:
             pkg_txt = item["name"] if not item["version"] \
                 else f" · {item['name']}"
-        if target:
-            ver_left = f"{item['version']} → " if item["version"] else ""
-            ver_left_w = fm.horizontalAdvance(ver_left)
-            ver_right = fm_bold.elidedText(
-                f"{_repo_label(source)} {target}", Qt.TextElideMode.ElideRight,
-                max(20, cw - ver_left_w))
-        else:
-            ver_left = fm.elidedText(item["version"],
-                                     Qt.TextElideMode.ElideRight,
-                                     max(20, cw
-                                         - fm.horizontalAdvance(pkg_txt)))
-            ver_left += pkg_txt
-            ver_left_w = 0
-            ver_right = ""
+        ver_left = fm.elidedText(item["version"],
+                                 Qt.TextElideMode.ElideRight,
+                                 max(20, cw - fm.horizontalAdvance(pkg_txt)))
+        ver_left += pkg_txt
+        ver_left_w = 0
         h_name, h_line, h_pill = self._rows()
         ver_top = y + h_name + self.GAP
         desc_avail = max(0, cw - ver_left_w
-                         - (fm_bold.horizontalAdvance(ver_right) if target
-                            else fm.horizontalAdvance(ver_left)))
+                         - fm.horizontalAdvance(ver_left))
         desc_txt = (fm.elidedText(item.get("desc") or "",
                                   Qt.TextElideMode.ElideRight, desc_avail)
                     if desc_avail > 60 else "")
@@ -5098,27 +4984,9 @@ class TrackedDelegate(QStyledItemDelegate):
         # can never drift under the cursor.
         desc_top = ver_top + h_line + self.GAP
         bottom_top = desc_top + h_line + self.GAP
-        # Pills sit on the bottom baseline, right-aligned (Switch
-        # rightmost, then Uninstall, then Open) — like the Updates
-        # action pill below its notes line.
-        switch_failed = (item["state"] == "failed"
-                         and item.get("failed_op", "switch") == "switch")
+        # Pills sit on the bottom baseline, right-aligned (Uninstall,
+        # then Open) — like the Updates action pill below its notes line.
         pills_w = 0
-        if target:
-            if item["state"] == "switching":
-                txt = "Switching…"
-            elif item["state"] == "done":
-                txt = "Switched ✓"
-            elif switch_failed:
-                txt = "Retry"
-            else:
-                txt = "Switch"
-            aw = fm.horizontalAdvance(txt) + 22
-            action = QRect(right - aw, bottom_top, aw, h_pill)
-            pills_w += aw + 8
-        else:
-            action, txt = QRect(), ""
-        # Uninstall pill: always present, left of Switch when both show.
         if item["state"] == "uninstalling":
             uni_txt = "Removing…"
         elif (item["state"] == "failed"
@@ -5140,24 +5008,8 @@ class TrackedDelegate(QStyledItemDelegate):
         # Row = card + CDY on both sides, so cards keep an 8px gap and
         # the card itself always has PBOT below its last element.
         total = ycur + self.PBOT + self.CDY
-        # Bottom-line hint: what switching would buy you. The source is
-        # named and the two kinds read differently — an official build is
-        # Arch's own, a managed source is somebody else's build farm, which
-        # is still a signed, prebuilt package rather than a PKGBUILD run
-        # here. Only an actionable hint earns a line: the AUR badge already
-        # says "AUR", so "not in the official repos" was just noise.
-        if target:
-            label = _repo_label(source)
-            if _repo_kind(source) == "official":
-                hint_txt = (f"{label.capitalize()} {target} available"
-                            " — switch for signed builds")
-            else:
-                hint_txt = (f"{label} {target} available — switch for a"
-                            " prebuilt, signed package")
-            hint_col = _positive_hex()
-        else:
-            hint_txt = ""
-            hint_col = _secondary_hex()
+        hint_txt = ""
+        hint_col = _secondary_hex()
         return {
             "check": QRect(x0 - self.RAIL + 4, y + 1, 18, 18),
             "name": QRect(x0, y, name_w, h_name),
@@ -5171,15 +5023,12 @@ class TrackedDelegate(QStyledItemDelegate):
             "ver": QRect(x0, ver_top, cw, h_line),
             "ver_left": ver_left,
             "ver_left_w": ver_left_w,
-            "ver_right": ver_right,
             "desc": QRect(x0, desc_top, cw, h_line),
             "desc_txt": desc_txt,
             "hint": QRect(x0, bottom_top + 4,
                           max(10, cw - pills_w - 12), h_line),
             "hint_txt": hint_txt,
             "hint_col": hint_col,
-            "action": action,
-            "action_txt": txt,
             "action2": action2,
             "action2_txt": uni_txt,
             "open": open_rect,
@@ -5283,26 +5132,13 @@ class TrackedDelegate(QStyledItemDelegate):
                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                    lay["link_txt"])
         p.setFont(self._f_text)
-        # Version line: installed version, or installed → <repo> when a
-        # managed repo carries it (mirrors Updates' old → new line).
+        # Version line: the installed version, with the package name when
+        # the row shows a human title instead.
         p.setPen(QPen(QColor(_secondary_hex())))
         vr = move(lay["ver"])
-        if lay["ver_right"]:
-            p.drawText(vr,
-                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                       lay["ver_left"])
-            p.setFont(self._f_bold)
-            p.setPen(QPen(QColor(_positive_hex())))
-            p.drawText(QRect(vr.left() + lay["ver_left_w"], vr.top(),
-                             max(10, vr.width() - lay["ver_left_w"]),
-                             vr.height()),
-                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                       lay["ver_right"])
-            p.setFont(self._f_text)
-        else:
-            p.drawText(vr,
-                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                       lay["ver_left"])
+        p.drawText(vr,
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   lay["ver_left"])
         # Description line, muted, right of the version — the pills live
         # on the bottom row now, not mid-card.
         if lay["desc_txt"]:
@@ -5322,23 +5158,6 @@ class TrackedDelegate(QStyledItemDelegate):
         # font was already reset, so pills never inherit it.
         p.setFont(self._f_text)
 
-        if not lay["action"].isNull():
-            ar = move(lay["action"])
-            hover = self._hover if self._hover[0] == index.row() else (-1, "")
-            danger = item["state"] == "failed" and item.get(
-                "failed_op", "switch") == "switch"
-            col = _negative_hex() if danger else _accent_hex()
-            if hover[1] == "action" or item["state"] in ("switching", "done"):
-                p.setBrush(QBrush(QColor(col)))
-                p.setPen(Qt.PenStyle.NoPen)
-                p.drawRoundedRect(ar, 6, 6)
-                p.setPen(QPen(QColor(_on_accent_hex())))
-            else:
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(QPen(QColor(col), 1.5))
-                p.drawRoundedRect(ar, 6, 6)
-                p.setPen(QPen(QColor(col)))
-            p.drawText(ar, Qt.AlignmentFlag.AlignCenter, lay["action_txt"])
         if not lay["action2"].isNull():
             ur = move(lay["action2"])
             hover = self._hover if self._hover[0] == index.row() else (-1, "")
@@ -5385,7 +5204,7 @@ class TrackedDelegate(QStyledItemDelegate):
                              option.rect.width())
             pos = event.position().toPoint() - option.rect.topLeft()
             kind = ""
-            for k in ("check", "action", "action2", "open", "link"):
+            for k in ("check", "action2", "open", "link"):
                 if not lay[k].isNull() and lay[k].contains(pos):
                     kind = k
                     break
@@ -5406,9 +5225,6 @@ class TrackedDelegate(QStyledItemDelegate):
             pos = event.position().toPoint() - option.rect.topLeft()
             if lay["check"].contains(pos):
                 self.toggled.emit(index.row())
-                return True
-            if not lay["action"].isNull() and lay["action"].contains(pos):
-                self.switch_requested.emit(model.item(index.row())["name"])
                 return True
             if not lay["action2"].isNull() and lay["action2"].contains(pos):
                 self.uninstall_requested.emit(model.item(index.row())["name"])
@@ -5543,7 +5359,6 @@ class UpdateWindow(QMainWindow):
         self._installing_row: int | None = None
         self._popover: NotesPopover | None = None
         self._orphans: set = set()  # parked threads (see _park_thread)
-        self._moves_dialog: MovesDialog | None = None
         self._sources_dialog: ManagedSourcesDialog | None = None
         # Buttons whose icons bake the theme's grey: re-resolved live in
         # _apply_theme(). Registered via _icon_btn(), keyed by button so a
@@ -5763,11 +5578,7 @@ class UpdateWindow(QMainWindow):
         lay_sec = QVBoxLayout(self._slot_security)
         lay_sec.setContentsMargins(0, 0, 0, 0)
         up.addWidget(self._slot_security)
-        self._slot_moves = QWidget()
-        lay_moves = QVBoxLayout(self._slot_moves)
-        lay_moves.setContentsMargins(0, 0, 0, 0)
-        up.addWidget(self._slot_moves)
-        self._refresh_view_banners(recompute_moves=True)
+        self._refresh_view_banners()
 
         n_cached = sum(1 for i in range(n) if i in cached_info)
         self._set_idle_header(n_cached)
@@ -6159,8 +5970,6 @@ class UpdateWindow(QMainWindow):
         # narrows (log panel, window resize) or the cards clip.
         self._track_list.viewport().installEventFilter(
             _ViewResizeHook(self._track_list))
-        self._track_delegate.switch_requested.connect(
-            self._request_track_switch)
         self._track_delegate.uninstall_requested.connect(
             self._request_track_uninstall)
         self._track_delegate.open_requested.connect(
@@ -6178,9 +5987,6 @@ class UpdateWindow(QMainWindow):
         tr.addWidget(self._track_list, 1)
         self._content_stack.addWidget(self._track_page)
         self._track_loaded = False
-        self._track_queue: list[str] = []
-        self._track_runner: UpdateRunner | None = None
-        self._track_current: str | None = None
         self._track_uninstaller: ObsoleteRemover | None = None
         self._track_uninstall_current: str | None = None
         self._track_uninstall_names: list[str] = []
@@ -6234,12 +6040,15 @@ class UpdateWindow(QMainWindow):
             "Reload the list of installed packages",
             self._refresh_tracked)
         ft.addWidget(self._track_refresh_btn)
-        self._track_move_all_btn = QPushButton("Move to managed repos")
-        self._track_move_all_btn.setObjectName("primary")
-        self._track_move_all_btn.setFixedHeight(_sp(34))
-        self._track_move_all_btn.setMinimumWidth(190)
-        self._track_move_all_btn.clicked.connect(self._on_track_main_clicked)
-        ft.addWidget(self._track_move_all_btn)
+        self._track_uninstall_btn = QPushButton("Uninstall selected")
+        self._track_uninstall_btn.setObjectName("primary")
+        self._track_uninstall_btn.setFixedHeight(_sp(34))
+        self._track_uninstall_btn.setMinimumWidth(190)
+        self._track_uninstall_btn.setToolTip(
+            "Remove every checked package")
+        self._track_uninstall_btn.clicked.connect(
+            self._uninstall_tracked_selected)
+        ft.addWidget(self._track_uninstall_btn)
         self._footer_stack.addWidget(self._foot_tracked)
         # ── Untracked page: GUI apps found on disk + dependency packages ──
         # One list, not two: what is an application and what is a stray
@@ -6832,59 +6641,8 @@ class UpdateWindow(QMainWindow):
         self._slot_security.layout().addWidget(banner)
         self._slot_security.setVisible(True)
 
-    def _rebuild_moves_banner(self, recompute: bool = False) -> None:
-        """AUR→managed banner inside its slot, mirroring the current list.
-
-        `recompute` (construction only) asks pacman for the candidate set;
-        afterwards the set is just filtered to the names the fresh check
-        still lists — no settle-time forks on the GUI thread.
-        """
-        _aur_names = {p["name"] for p in self._updates
-                      if (p.get("repo") or "").lower() == "aur"}
-        if not _aur_names:
-            self._pending_moves = []
-        elif recompute:
-            # Detection is two fast local pacman calls; allowed here only
-            # because the window is mid-construction (established pattern).
-            try:
-                self._pending_moves = [
-                    m for m in find_repo_moves(list(_aur_names))
-                    if m["name"] in _aur_names]
-            except Exception:
-                self._pending_moves = []
-        else:
-            self._pending_moves = [
-                m for m in (self._pending_moves or []) if m["name"] in _aur_names]
-        self._clear_container(self._slot_moves)
-        if not self._pending_moves:
-            self._slot_moves.setVisible(False)
-            return
-        mv = QWidget()
-        mv.setObjectName("banner-moves")
-        mv.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        mv_body = _card_layout(mv, _accent_hex())
-        mb = QHBoxLayout()
-        mb.setSpacing(_sp(12))
-        mv_body.addLayout(mb)
-        mt = QLabel(
-            f"<b>{len(self._pending_moves)} of these AUR packages "
-            f"{'is' if len(self._pending_moves) == 1 else 'are'} also in "
-            "a managed repo</b> — switch for a signed, prebuilt "
-            "package.")
-        mt.setObjectName("banner-body")
-        mt.setWordWrap(True)
-        mb.addWidget(mt, 1)
-        review_btn = QPushButton("Review")
-        review_btn.setObjectName("secondary-small")
-        review_btn.setFixedHeight(_sp(28))
-        review_btn.clicked.connect(self._open_moves_dialog)
-        mb.addWidget(review_btn)
-        self._slot_moves.layout().addWidget(mv)
-        self._slot_moves.setVisible(True)
-
-    def _refresh_view_banners(self, recompute_moves: bool = False) -> None:
+    def _refresh_view_banners(self) -> None:
         self._rebuild_security_banner()
-        self._rebuild_moves_banner(recompute=recompute_moves)
 
     def _start_recheck_fetcher(self) -> None:
         """Fetch release notes for the fresh rows (generation-stamped)."""
@@ -7099,12 +6857,11 @@ class UpdateWindow(QMainWindow):
                 "none compromised.", "ok")
 
     # ── Tracked view ─────────────────────────────────────────────────────────
-    def _on_tracked_loaded(self, installed: list[dict],
-                           moves: list[dict]) -> None:
+    def _on_tracked_loaded(self, installed: list[dict]) -> None:
         self._release_thread("_track_loader")
         self._track_loaded = True
         self._track_loading = False
-        self._track_model.set_packages(installed, moves)
+        self._track_model.set_packages(installed)
         self._refresh_tracked_summary()
         self._refresh_track_stats()
         self._update_view_badges()
@@ -7151,7 +6908,6 @@ class UpdateWindow(QMainWindow):
 
     def _refresh_tracked_summary(self) -> None:
         n = self._track_model.rowCount()
-        movable = self._track_model.movable_names()
         counts = self._track_model.source_counts()
         n_aur = counts.get(SRC_AUR, 0)
         n_flat = counts.get(SRC_FLATPAK, 0)
@@ -7192,11 +6948,6 @@ class UpdateWindow(QMainWindow):
                 extra.append(f"{n_img} AppImage{'s' if n_img != 1 else ''}")
             if extra:
                 what += " · " + " · ".join(extra)
-        if movable:
-            what += (f" · <b>{len(movable)}</b> available from a managed "
-                     "repo")
-        elif n_aur and not n_flat:
-            what += " — none available from a managed repo"
         self._track_summary.setText(what + ".")
         self._refresh_tracked_footer()
 
@@ -7207,7 +6958,7 @@ class UpdateWindow(QMainWindow):
         self._log_action("Reloading the tracked package list…")
         self._track_loaded = False
         self._track_loading = True
-        self._track_model.set_packages([], [])
+        self._track_model.set_packages([])
         self._release_thread("_track_loader")
         self._track_loader = TrackedLoader()
         self._track_loader.done.connect(self._on_tracked_loaded)
@@ -7223,11 +6974,10 @@ class UpdateWindow(QMainWindow):
         """
         if not getattr(self, "_track_loaded", False):
             self._track_footer_label.setText("Loading…")
-            self._track_move_all_btn.setText("Move to managed repos")
-            self._track_move_all_btn.setEnabled(False)
+            self._track_uninstall_btn.setText("Uninstall selected")
+            self._track_uninstall_btn.setEnabled(False)
             return
         n = self._track_model.rowCount()
-        movable = self._track_model.movable_names()
         sel = self._track_model.checked_names()
         n_sel = len(sel)
         running = self._track_uninstaller is not None
@@ -7236,37 +6986,16 @@ class UpdateWindow(QMainWindow):
             self._track_footer_label.setText(
                 f"Removing {len(self._track_uninstall_names)} "
                 f"package{'s' if len(self._track_uninstall_names) != 1 else ''}…")
-            self._track_move_all_btn.setText("Removing…")
-            self._track_move_all_btn.setEnabled(False)
+            self._track_uninstall_btn.setText("Removing…")
+            self._track_uninstall_btn.setEnabled(False)
             return
-        if n_sel:
-            # The header carries the count; the footer only names the
-            # action the button is about to take.
-            self._track_footer_label.setText("")
-            self._track_move_all_btn.setText(
-                f"Uninstall {n_sel} selected")
-            self._track_move_all_btn.setToolTip(
-                "Remove every checked package (pacman -Rns)")
-            self._track_move_all_btn.setEnabled(True)
-            return
-        if movable:
-            self._track_footer_label.setText(
-                f"{len(movable)} can move off the AUR")
-            self._track_move_all_btn.setText("Move to managed repos")
-            self._track_move_all_btn.setToolTip(
-                "Switch every movable package to the signed build from its "
-                "repo, one by one")
-            self._track_move_all_btn.setEnabled(True)
-        elif n:
-            self._track_footer_label.setText(f"{n} tracked · nothing to move")
-            self._track_move_all_btn.setText("Move to managed repos")
-            self._track_move_all_btn.setToolTip(
-                "Switch every movable package to official builds, one by one")
-            self._track_move_all_btn.setEnabled(False)
-        else:
-            self._track_footer_label.setText("Nothing tracked")
-            self._track_move_all_btn.setText("Move to managed repos")
-            self._track_move_all_btn.setEnabled(False)
+        self._track_footer_label.setText(f"{n} tracked" if n
+                                         else "Nothing tracked")
+        # The header carries the count; the footer names the action the
+        # button is about to take, and the button never changes size.
+        self._track_uninstall_btn.setText(
+            f"Uninstall {n_sel} selected" if n_sel else "Uninstall selected")
+        self._track_uninstall_btn.setEnabled(bool(n_sel))
 
     def _on_track_toggled(self, row: int) -> None:
         idx = self._track_model.index(row)
@@ -7281,12 +7010,6 @@ class UpdateWindow(QMainWindow):
     def _select_tracked_all(self, checked: bool) -> None:
         self._track_model.set_all(checked)
         self._refresh_tracked_footer()
-
-    def _on_track_main_clicked(self) -> None:
-        if self._track_model.checked_names():
-            self._uninstall_tracked_selected()
-        else:
-            self._move_all_tracked()
 
     def _update_view_badges(self) -> None:
         # The tab answers "how many updates are pending", so it counts the
@@ -7309,124 +7032,6 @@ class UpdateWindow(QMainWindow):
             n_un = self._un_model.rowCount()
             self._view_buttons["untracked"].setText(
                 f"Untracked ({n_un})" if n_un else "Untracked")
-
-    # — Inline AUR → official switching (one at a time: one pacman lock) —
-    def _request_track_switch(self, name: str) -> None:
-        r = self._track_model.row_of(name)
-        if r is None:
-            return
-        item = self._track_model.item(r)
-        if not item["target"] or name in self._track_queue \
-                or name == self._track_current:
-            return
-        if item["relation"] == "downgrade" and item["state"] != "failed":
-            box = QMessageBox(self)
-            box.setWindowTitle(f"Switch {name}?")
-            box.setIcon(QMessageBox.Icon.Warning)
-            box.setText(
-                f"The {_repo_label(item['source'])} build "
-                f"({item['target']}) is OLDER than your "
-                f"installed AUR build ({item['version']}).\n\n"
-                "Switching will downgrade the package. Proceed?")
-            go_btn = box.addButton("Switch anyway",
-                                   QMessageBox.ButtonRole.AcceptRole)
-            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            box.exec()
-            if box.clickedButton() is not go_btn:
-                return
-        if os.path.exists(_PACMAN_LOCK):
-            self._set_status(
-                "Another package operation is running — wait for it to "
-                "finish, then retry.", "error")
-            return
-        self._track_queue.append(name)
-        self._track_model.set_state(name, "idle")
-        self._run_next_track_switch()
-
-    def _move_all_tracked(self) -> None:
-        for name in self._track_model.movable_names():
-            if name not in self._track_queue and name != self._track_current:
-                r = self._track_model.row_of(name)
-                if r is not None and self._track_model.item(r)["relation"] != "downgrade":
-                    self._track_queue.append(name)
-        # Downgrades need individual confirmation — skip them in bulk.
-        self._run_next_track_switch()
-        self._set_status(
-            f"Queued {len(self._track_queue)} move"
-            f"{'s' if len(self._track_queue) != 1 else ''} to managed repos…",
-            "info")
-        self._log_action(
-            f"Queued {len(self._track_queue)} move"
-            f"{'s' if len(self._track_queue) != 1 else ''} to managed repos")
-
-    def _run_next_track_switch(self) -> None:
-        if self._track_runner is not None or not self._track_queue:
-            return
-        if os.path.exists(_PACMAN_LOCK):
-            self._set_status(
-                "Pacman database is locked — retry when the other "
-                "operation finishes.", "error")
-            self._track_queue.clear()
-            return
-        name = self._track_queue.pop(0)
-        self._track_current = name
-        self._track_model.set_state(name, "switching")
-        row = self._track_model.row_of(name)
-        source = (self._track_model.item(row)["source"]
-                  if row is not None else "")
-        label = _repo_label(source)
-        self._set_status(f"Switching {name} to the {label} build…", "info")
-        self._log_action(f"Switching {name} to the {label} build…")
-        self._track_runner = UpdateRunner(None, [name])
-        self._track_runner.done.connect(self._on_track_switch_done)
-        self._track_runner.start()
-
-    def _on_track_switch_done(self, success: bool, output: str) -> None:
-        name = self._track_current or ""
-        self._release_thread("_track_runner")
-        self._track_current = None
-        r = self._track_model.row_of(name)
-        if r is None:
-            self._run_next_track_switch()
-            return
-        item = self._track_model.item(r)
-        verified = False
-        if success:
-            verified = not verify_upgraded({name: item["target"]})
-        if not success and classify_update_failure(output)[0] == "cancelled":
-            # Circuit breaker: auth dismissed — nothing ran.
-            self._track_model.set_state(name, "idle")
-            self._set_status(f"Switching {name} cancelled — nothing was "
-                             "changed.", "info")
-            self._log_action(f"Switching {name} cancelled")
-            self._refresh_tracked_summary()
-            self._update_view_badges()
-            self._run_next_track_switch()
-            return
-        if success and verified:
-            self._track_model.set_state(name, "done")
-            label = _repo_label(item["source"])
-            self._set_status(f"{name} now tracks the {label} build ✓", "ok")
-            self._log_action(f"{name} now tracks the {label} build ✓")
-        else:
-            if success:
-                output += (f"\n{name}: still not at {item['target']} — "
-                           "was not upgraded (stale sync database)")
-            self._track_model.set_state(name, "failed", op="switch")
-            self._log_action(f"Switching {name} failed")
-            self._set_status(
-                f"Switching {name} failed — use Retry on its row.", "error")
-            lines = [l for l in output.splitlines() if l.strip()]
-            self._show_error_dialog(
-                "switch failed",
-                f"Switching {name} to the "
-                f"{_repo_label(item['source'])} build failed.",
-                "Use Retry on its row, or open the log panel for the full "
-                "output.",
-                "\n".join(lines[-40:]) if lines else "(no output captured)")
-        self._refresh_tracked_summary()
-        self._update_view_badges()
-        self._run_next_track_switch()
 
     # — Per-package uninstall (Tracked tab) —
     def _busy_with_update(self) -> bool:
@@ -8902,27 +8507,6 @@ class UpdateWindow(QMainWindow):
     def _on_sources_closed(self) -> None:
         self._sources_dialog = None
 
-    def _open_moves_dialog(self) -> None:
-        if self._moves_dialog is not None:
-            self._moves_dialog.raise_()
-            self._moves_dialog.activateWindow()
-            return
-        self._moves_dialog = MovesDialog(self._pending_moves)
-        self._moves_dialog.closed.connect(self._on_moves_dialog_closed)
-        self._moves_dialog.moves_done.connect(self._on_moves_changed)
-        self._moves_dialog.logged.connect(self._log_action)
-        self._moves_dialog.show()
-        self._moves_dialog.raise_()
-        self._moves_dialog.activateWindow()
-
-    def _on_moves_dialog_closed(self) -> None:
-        self._moves_dialog = None
-
-    def _on_moves_changed(self) -> None:
-        self._set_status(
-            "Switched to managed repos — press Check Now (tray) or "
-            "reopen this window to refresh the list.", "ok")
-
     def show_popover(self, row: int) -> None:
         self._popover = NotesPopover(self, self._model.item(row))
         self._popover.show()
@@ -9339,7 +8923,7 @@ class UpdateWindow(QMainWindow):
             if thread.isRunning():
                 self._park_thread(thread)
             setattr(self, attr, None)
-        for attr in ("_runner", "_single", "_remover", "_track_runner",
+        for attr in ("_runner", "_single", "_remover",
                      "_track_uninstaller", "_untracked_uninstaller"):
             thread = getattr(self, attr, None)
             if thread is not None:
@@ -9488,121 +9072,6 @@ class _SourceEnableRunner(QThread):
 
 _SEC_SCAN_HINT = ("Scan all installed packages against known "
                   "supply-chain attacks.")
-
-
-def _relation_pill(relation: str, source: str = "") -> str:
-    """Pill label for a switch candidate: which source, and how it compares."""
-    label = _repo_label(source)
-    return {
-        "upgrade": f"{label} newer",
-        "same": "same version",
-        "downgrade": f"{label} older",
-    }.get(relation, label)
-
-
-def _relation_tint(relation: str) -> str:
-    return {"upgrade": "positive", "downgrade": "warning"}.get(relation,
-                                                               "muted")
-
-
-def _relation_color(relation: str) -> str:
-    """Rail color for a switch candidate (None → no rail)."""
-    return {"upgrade": _positive_hex(),
-            "downgrade": _warning_hex()}.get(relation, "")
-
-
-class _MoveRow(QWidget):
-    """One candidate: name + relation pill, versions, Switch button."""
-
-    def __init__(self, move: dict, on_switch) -> None:
-        super().__init__()
-        self.move_name = move["name"]
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setObjectName("package-card")
-        self._relation = move["relation"]
-        body = _card_layout(self, _relation_color(move["relation"]), spacing=4)
-
-        top = QHBoxLayout()
-        top.setSpacing(_sp(16))
-        left = QVBoxLayout()
-        left.setSpacing(_sp(4))
-        name_row = QHBoxLayout()
-        name_row.setSpacing(_sp(8))
-        name = QLabel(move["name"])
-        name.setObjectName("package-name")
-        name_row.addWidget(name)
-        name_row.addWidget(_badge(_relation_pill(move["relation"],
-                                                 move["source"]),
-                                  _relation_tint(move["relation"])))
-        name_row.addStretch()
-        left.addLayout(name_row)
-
-        ver = QHBoxLayout()
-        ver.setSpacing(_sp(6))
-        was = QLabel(f"AUR {move['installed']}  →")
-        was.setObjectName("text-muted")
-        ver.addWidget(was)
-        now = QLabel(f"{_repo_label(move['source'])} {move['target']}")
-        now.setObjectName("text-positive")
-        ver.addWidget(now)
-        ver.addStretch()
-        left.addLayout(ver)
-        top.addLayout(left, 1)
-
-        # One row action, vertically centred against the two text lines.
-        self._switch_btn = QPushButton("Switch")
-        self._switch_btn.setObjectName("secondary-small")
-        self._switch_btn.setFixedHeight(_sp(28))
-        self._switch_btn.setToolTip(
-            "Replace the AUR build with the signed package from "
-            f"{_repo_label(move['source'])}")
-        self._switch_btn.clicked.connect(lambda: on_switch(self.move_name))
-        top.addWidget(self._switch_btn, 0, Qt.AlignmentFlag.AlignVCenter)
-        body.addLayout(top)
-
-        self._state_lbl = QLabel("")
-        self._state_lbl.setObjectName("package-date")
-        self._state_lbl.setWordWrap(True)
-        self._state_lbl.setVisible(False)
-        body.addWidget(self._state_lbl)
-
-    def set_row_state(self, state: str, text: str = "") -> None:
-        """idle | switching | done | failed — button + note follow."""
-        self._state_lbl.setText(text)
-        self._state_lbl.setVisible(bool(text))
-        if state == "switching":
-            self._switch_btn.setEnabled(False)
-            self._switch_btn.setText("Switching…")
-            self._set_note("text-accent")
-        elif state == "done":
-            self._switch_btn.setEnabled(False)
-            self._switch_btn.setText("Switched ✓")
-            self._set_note("text-positive")
-            self._set_card("package-card-done")
-        elif state == "failed":
-            self._switch_btn.setEnabled(True)
-            self._switch_btn.setText("Retry")
-            self._set_note("text-negative")
-            self._set_card("package-card-failed")
-        else:
-            self._switch_btn.setEnabled(True)
-            self._switch_btn.setText(
-                "Queued" if text.startswith("Queued") else "Switch")
-            self._set_note("package-date")
-            self._set_card("package-card")
-
-    def _set_note(self, object_name: str) -> None:
-        """Swap the note's role; Qt needs a repolish to re-apply QSS."""
-        if self._state_lbl.objectName() == object_name:
-            return
-        self._state_lbl.setObjectName(object_name)
-        self._state_lbl.style().unpolish(self._state_lbl)
-        self._state_lbl.style().polish(self._state_lbl)
-
-    def _set_card(self, name: str) -> None:
-        self.setObjectName(name)
-        self.style().unpolish(self)
-        self.style().polish(self)
 
 
 class ManagedSourcesDialog(QMainWindow):
@@ -9870,215 +9339,6 @@ class ManagedSourcesDialog(QMainWindow):
         if event.type() in _THEME_CHANGE_TYPES:
             self.setStyleSheet(_themed_qss())
 
-
-class MovesDialog(QMainWindow):
-    """Review foreign packages available in official repos; switch them."""
-
-    closed = pyqtSignal()
-    moves_done = pyqtSignal()  # at least one switch succeeded
-    logged = pyqtSignal(str)   # action lines for the window's activity log
-
-    def __init__(self, moves: list[dict]) -> None:
-        super().__init__()
-        self._moves = {m["name"]: m for m in moves}
-        self._rows: dict[str, _MoveRow] = {}
-        self._queue: list[str] = []
-        self._runner: UpdateRunner | None = None
-        self._current: str | None = None
-        self._changed = False
-        self._orphans: set = set()  # parked threads, never destroyed live
-
-        n = len(moves)
-        self.setWindowTitle(
-            f"Switch to Managed Packages — {n} candidate"
-            f"{'s' if n != 1 else ''}")
-        self.setMinimumSize(760, 480)
-        self.setStyleSheet(_themed_qss())
-
-        root = QWidget()
-        self.setCentralWidget(root)
-        lay = QVBoxLayout(root)
-        lay.setContentsMargins(_sp(24), _sp(24), _sp(24), _sp(24))
-        lay.setSpacing(_sp(16))
-
-        head = QHBoxLayout()
-        head.setSpacing(_sp(16))
-        icon_lbl = QLabel()
-        icon_lbl.setPixmap(_app_icon().pixmap(40, 40))
-        head.addWidget(icon_lbl, 0, Qt.AlignmentFlag.AlignTop)
-        tb = QVBoxLayout()
-        tb.setSpacing(2)
-        eyebrow = QLabel("MANAGED SOURCES")
-        eyebrow.setObjectName("eyebrow")
-        tb.addWidget(eyebrow)
-        title = QLabel("Switch off the AUR")
-        title.setObjectName("title")
-        tb.addWidget(title)
-        sources = sorted({_repo_label(m["source"]) for m in moves})
-        sub = QLabel(
-            "These installed AUR packages are also carried by a managed "
-            "repo: <b>" + ", ".join(sources) + "</b>. Switching replaces "
-            "your locally-built AUR package with that repo's signed, "
-            "prebuilt one — no PKGBUILD of yours is run to get it.")
-        sub.setObjectName("subtitle")
-        sub.setWordWrap(True)
-        tb.addWidget(sub)
-        head.addLayout(tb, 1)
-        lay.addLayout(head)
-        lay.addWidget(_divider())
-
-        scroll = QScrollArea()
-        scroll.setObjectName("package-list")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        inner = QWidget()
-        inner.setObjectName("list-inner")
-        ll = QVBoxLayout(inner)
-        ll.setContentsMargins(_sp(8), _sp(8), _sp(8), _sp(8))
-        ll.setSpacing(_sp(8))
-        for m in moves:
-            row = _MoveRow(m, self.request_switch)
-            self._rows[m["name"]] = row
-            ll.addWidget(row)
-        ll.addStretch()
-        scroll.setWidget(inner)
-        lay.addWidget(scroll, 1)
-
-        lay.addWidget(_divider())
-        footer = QHBoxLayout()
-        footer.setSpacing(_sp(8))
-        self._status = QLabel("")
-        self._status.setObjectName("meta")
-        footer.addWidget(self._status, 0, Qt.AlignmentFlag.AlignVCenter)
-        footer.addStretch()
-        close_btn = QPushButton("Close")
-        close_btn.setObjectName("secondary")
-        close_btn.setFixedHeight(_sp(34))
-        close_btn.setMinimumWidth(120)
-        close_btn.clicked.connect(self.close)
-        footer.addWidget(close_btn)
-        lay.addLayout(footer)
-
-    # — Switch flow (strictly sequential: pacman has one lock) —
-    def request_switch(self, name: str) -> None:
-        if name in self._queue or name == self._current:
-            return
-        move = self._moves.get(name)
-        if move is None:
-            return
-        if move["relation"] == "downgrade" and self._rows[name]._switch_btn.text() != "Retry":
-            box = QMessageBox(self)
-            box.setWindowTitle(f"Switch {name}?")
-            box.setIcon(QMessageBox.Icon.Warning)
-            box.setText(
-                f"The {_repo_label(move['source'])} build "
-                f"({move['target']}) is OLDER than your "
-                f"installed AUR build ({move['installed']}).\n\n"
-                "Switching will downgrade the package. Proceed?")
-            go_btn = box.addButton("Switch anyway",
-                                   QMessageBox.ButtonRole.AcceptRole)
-            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            box.exec()
-            if box.clickedButton() is not go_btn:
-                return
-        if os.path.exists(_PACMAN_LOCK):
-            self._status.setText(
-                "Another package operation is running — "
-                "close the update window or wait, then retry.")
-            return
-        self._queue.append(name)
-        self._rows[name].set_row_state("idle", "Queued — waiting for turn…")
-        self._run_next()
-
-    def _run_next(self) -> None:
-        if self._runner is not None or not self._queue:
-            return
-        if os.path.exists(_PACMAN_LOCK):
-            self._status.setText(
-                "Pacman database is locked — retry when the other "
-                "operation finishes.")
-            for name in self._queue:
-                self._rows[name].set_row_state("idle")
-            self._queue.clear()
-            return
-        name = self._queue.pop(0)
-        self._current = name
-        self._rows[name].set_row_state("switching", "Installing official build…")
-        self._status.setText(f"Switching {name}… (a password dialog may appear)")
-        self.logged.emit(f"Switching {name} to the official build…")
-        # Force the pacman path: deterministic official-repo install.
-        self._runner = UpdateRunner(None, [name])
-        self._runner.done.connect(self._on_switch_done)
-        self._runner.start()
-
-    def _on_switch_done(self, success: bool, output: str) -> None:
-        name = self._current or ""
-        if self._runner is not None:
-            self._runner.wait(5000)
-            self._runner = None
-        self._current = None
-        move = self._moves.get(name, {})
-        verified = False
-        if success and move:
-            verified = not verify_upgraded({name: move["target"]})
-        if not success and classify_update_failure(output)[0] == "cancelled":
-            # Circuit breaker: auth dismissed — nothing ran.
-            self._rows[name].set_row_state("idle")
-            self.logged.emit(f"Switching {name} cancelled")
-            self._status.setText(
-                "Cancelled — nothing was changed."
-                if not self._queue else f"Continuing ({len(self._queue)} queued)…")
-            self._run_next()
-            return
-        if success and verified:
-            self._rows[name].set_row_state(
-                "done",
-                f"Now tracking {_repo_label(move['source'])} "
-                f"{move['target']} ✓")
-            self._changed = True
-            self.logged.emit(f"{name} now tracks the official build ✓")
-            self.moves_done.emit()
-        else:
-            if success:
-                # Exit 0 but version didn't land (stale DB edge).
-                output += (f"\n{name}: still not at "
-                           f"{move.get('target', '?')} — "
-                           "was not upgraded (stale sync database)")
-            lines = [l for l in output.splitlines() if l.strip()]
-            hint = " · ".join(lines[-2:]) if lines else "No output captured"
-            self.logged.emit(f"Switching {name} failed: {hint}")
-            self._rows[name].set_row_state("failed", hint)
-        self._status.setText(
-            "Done — reopen the update window or Check Now to refresh."
-            if not self._queue else f"Continuing ({len(self._queue)} queued)…")
-        self._run_next()
-
-    def closeEvent(self, event) -> None:  # type: ignore[override]
-        # Never destroy a running QThread (aborts the process). The
-        # runner stops gracefully via terminate(); if it won't stop,
-        # park it instead of dropping the wrapper.
-        if self._runner is not None:
-            if self._runner.isRunning():
-                try:
-                    self._runner.terminate()
-                except Exception:
-                    pass
-                if not self._runner.wait(8000):
-                    self._runner.finished.connect(self._runner.deleteLater)
-                    self._runner.finished.connect(
-                        lambda: self._orphans.discard(self._runner))
-                    self._orphans.add(self._runner)
-            self._runner = None
-        super().closeEvent(event)
-        self.closed.emit()
-
-    def changeEvent(self, event) -> None:  # type: ignore[override]
-        super().changeEvent(event)
-        if event.type() in _THEME_CHANGE_TYPES:
-            self.setStyleSheet(_themed_qss())
-
-
-# ── System tray application ────────────────────────────────────────────────────
 
 class TrayApp(QObject):
     _CHECK_INTERVAL_MS = 30 * 60 * 1000   # 30 minutes
