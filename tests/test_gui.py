@@ -2667,7 +2667,8 @@ class TestStatStripFilters:
         qapp.processEvents()
         cells = window._track_stat_cards
         assert {k: c._value.text() for k, c in cells.items()} == {
-            "": "3", "official": "1", "aur": "1", "managed": "1"}
+            "": "3", "official": "1", "aur": "1", "managed": "1",
+            "flatpak": "0"}
         # The "everything" cell is a readout, not a filter: nothing is
         # highlighted until a real filter is on.
         assert not any(c.property("active") for c in cells.values())
@@ -2679,28 +2680,29 @@ class TestStatStripFilters:
         qapp.processEvents()
         assert window._track_model.rowCount() == 3
 
-    def test_untracked_strip_separates_flatpak_and_dependencies(
+    def test_untracked_strip_separates_apps_and_dependencies(
             self, window, qapp):
         _settle_loaders(window, qapp)
         window._on_untracked_loaded(
-            [_row("com.discordapp.Discord", "Discord", "flatpak"),
-             _row("zen", "Zen", "manual")],
+            [_row("zen", "Zen", "manual"), _row("whisper-flow", "WF",
+                                                "manual")],
             [_row("libfoo", "libfoo", "official")])
         qapp.processEvents()
         cells = window._un_stat_cards
         assert {k: c._value.text() for k, c in cells.items()} == {
-            "": "3", "flatpak": "1", "manual": "1", "dependencies": "1"}
-        cells["flatpak"].clicked.emit()
-        qapp.processEvents()
-        assert window._unapp_model.rowCount() == 1
-        assert window._unpkg_model.rowCount() == 0
+            "": "3", "manual": "2", "dependencies": "1"}
         cells["dependencies"].clicked.emit()
         qapp.processEvents()
         assert window._unapp_model.rowCount() == 0
         assert window._unpkg_model.rowCount() == 1
-        cells["dependencies"].clicked.emit()
+        cells["manual"].clicked.emit()
         qapp.processEvents()
         assert window._unapp_model.rowCount() == 2
+        assert window._unpkg_model.rowCount() == 0
+        cells["manual"].clicked.emit()
+        qapp.processEvents()
+        assert window._unapp_model.rowCount() == 2
+        assert window._unpkg_model.rowCount() == 1
 
     def test_every_strip_is_the_same_height(self, window, qapp):
         # Thin and uniform: the strips are one row of 38px cells.
@@ -2740,15 +2742,56 @@ def _row(name, title, repo):
 class TestFlatpakRows:
     """Flatpak apps are a source you can see, filter and remove."""
 
-    def test_flatpak_launchers_become_flatpak_rows(self, monkeypatch,
-                                                   tmp_path):
+    def test_flatpak_apps_are_tracked_rows(self, monkeypatch):
+        monkeypatch.setattr(app, "_flatpak_apps",
+                            lambda: {"com.discordapp.Discord":
+                                     ("1.0.151", "system"),
+                                     "com.ticktick.TickTick":
+                                     ("8.0.20", "user")})
+        rows = app.flatpak_tracked_rows()
+        by_name = {r["name"]: r for r in rows}
+        assert by_name["com.discordapp.Discord"]["repo"] == "flatpak"
+        assert by_name["com.discordapp.Discord"]["version"] == "1.0.151"
+        assert len(rows) == 2
+
+    def test_the_tracked_load_includes_flatpak(self, monkeypatch):
+        monkeypatch.setattr(app, "get_installed_packages",
+                            lambda: [{"name": "konsole", "version": "1-1",
+                                      "repo": "official"}])
+        monkeypatch.setattr(app, "find_repo_moves", lambda names=None: [])
+        monkeypatch.setattr(app, "_flatpak_apps",
+                            lambda: {"com.discordapp.Discord":
+                                     ("1.0.151", "system")})
+        installed, _moves = app.load_tracked()
+        names = {r["name"] for r in installed}
+        assert names == {"konsole", "com.discordapp.Discord"}
+
+    def test_a_broken_flatpak_call_still_lists_pacman_packages(
+            self, monkeypatch):
+        monkeypatch.setattr(app, "get_installed_packages",
+                            lambda: [{"name": "konsole", "version": "1-1",
+                                      "repo": "official"}])
+        monkeypatch.setattr(app, "find_repo_moves", lambda names=None: [])
+
+        def boom():
+            raise OSError("flatpak exploded")
+
+        monkeypatch.setattr(app, "flatpak_tracked_rows", boom)
+        installed, _moves = app.load_tracked()
+        assert [r["name"] for r in installed] == ["konsole"]
+
+    def test_untracked_leaves_flatpak_apps_to_tracked(self, monkeypatch,
+                                                      tmp_path):
         exports = tmp_path / "exports"
+        apps = tmp_path / "applications"
         exports.mkdir()
+        apps.mkdir()
         (exports / "com.discordapp.Discord.desktop").write_text(
             "[Desktop Entry]\nName=Discord\nExec=/usr/bin/flatpak run "
             "com.discordapp.Discord\nType=Application\n")
-        (exports / "zen.desktop").write_text(
-            "[Desktop Entry]\nName=Zen\nExec=/usr/bin/zen\nType=Application\n")
+        (apps / "zen.desktop").write_text(
+            "[Desktop Entry]\nName=Zen\nExec=/usr/bin/zen\n"
+            "Type=Application\n")
         monkeypatch.setattr(app, "_flatpak_export_dirs", lambda: [str(exports)])
         monkeypatch.setattr(app, "scan_desktop_files",
                             lambda dirs=None: [
@@ -2757,21 +2800,38 @@ class TestFlatpakRows:
                                  "title": "Discord", "comment": "Chat",
                                  "exec": "/usr/bin/flatpak run "
                                          "com.discordapp.Discord"},
-                                {"file": str(exports / "zen.desktop"),
+                                {"file": str(apps / "zen.desktop"),
                                  "title": "Zen", "comment": "",
                                  "exec": "/usr/bin/zen"}])
         monkeypatch.setattr(app, "_flatpak_apps",
                             lambda: {"com.discordapp.Discord":
                                      ("1.0.151", "system")})
         rows = app.UntrackedLoader()._load_apps()
-        by_name = {r["name"]: r for r in rows}
-        assert by_name["com.discordapp.Discord"]["repo"] == "flatpak"
-        assert by_name["com.discordapp.Discord"]["version"] == "1.0.151"
-        assert by_name["com.discordapp.Discord"]["title"] == "Discord"
-        assert by_name["zen"]["repo"] == "manual"
+        names = {r["name"] for r in rows}
+        assert "com.discordapp.Discord" not in names
+        assert "zen" in names
 
-    def test_uninstalling_a_flatpak_row_uses_flatpak(self, window, qapp,
-                                                     monkeypatch):
+    def test_a_flatpak_row_resolves_its_title_without_pacman(
+            self, monkeypatch, tmp_path):
+        exports = tmp_path / "exports"
+        exports.mkdir()
+        (exports / "com.discordapp.Discord.desktop").write_text(
+            "[Desktop Entry]\nName=Discord\nComment=Chat for gamers\n"
+            "Exec=/usr/bin/flatpak run com.discordapp.Discord\n"
+            "Type=Application\n")
+        monkeypatch.setattr(app, "_flatpak_export_dirs", lambda: [str(exports)])
+        monkeypatch.setattr(
+            app, "_run",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("no pacman")))
+        desktop = app.TrackedEnricher._flatpak_desktop(
+            "com.discordapp.Discord")
+        assert desktop.endswith("com.discordapp.Discord.desktop")
+        assert app._desktop_title(desktop) == "Discord"
+        assert app.TrackedEnricher._flatpak_desc(
+            "com.discordapp.Discord") == "Chat for gamers"
+
+    def test_uninstalling_a_tracked_flatpak_uses_flatpak(self, window, qapp,
+                                                        monkeypatch):
         started = []
 
         class FakeFlatpak(QObject):
