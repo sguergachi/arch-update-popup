@@ -8379,8 +8379,9 @@ class ManagedSourcesDialog(QMainWindow):
         # Keep the reference: a QThread destroyed while running aborts
         # the whole process ("QThread: Destroyed while thread is still
         # running"). Released in _on_enable_done, like every other runner.
-        self._show_log()
-        self._set_status(f"Enabling {name}…", "info")
+        # (No _show_log/_set_status here: this runs on the dialog, which
+        # has neither. The main window's status line is updated via the
+        # logged signal and the progress dialog's label.)
         progress = QProgressDialog(
             f"Enabling {name}…", "Cancel", 0, 0, self)
         progress.setWindowTitle(f"Enable {name}")
@@ -8437,7 +8438,7 @@ class ManagedSourcesDialog(QMainWindow):
         if success:
             self._restart_needed = True
             self._restart_btn.setVisible(True)
-            self._log_action(f"{name} enabled — restart to apply")
+            self.logged.emit(f"{name} enabled — restart to apply")
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Information)
             box.setWindowTitle("Source enabled")
@@ -8450,13 +8451,22 @@ class ManagedSourcesDialog(QMainWindow):
             box.setStyleSheet(_themed_qss())
             box.exec()
         else:
+            if classify_update_failure(output)[0] == "cancelled":
+                # Dismissed authentication: nothing ran.
+                self.logged.emit(f"Enabling {name} cancelled by authentication")
+                return
             lines = [l for l in output.splitlines() if l.strip()]
-            self._show_error_dialog(
-                "enable failed",
-                f"Enabling {name} failed.",
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Critical)
+            box.setWindowTitle("Arch Update — enable failed")
+            box.setText(f"Enabling {name} failed.")
+            box.setInformativeText(
                 "Nothing was changed. Run the commands from the details "
-                "manually, or paste them into a terminal.",
+                "manually, or paste them into a terminal.")
+            box.setDetailedText(
                 "\n".join(lines[-40:]) if lines else "(no output captured)")
+            box.setStyleSheet(_themed_qss())
+            box.exec()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         super().closeEvent(event)
