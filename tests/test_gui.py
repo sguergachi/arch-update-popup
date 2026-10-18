@@ -2810,7 +2810,7 @@ class TestFlatpakRows:
         monkeypatch.setattr(app, "_flatpak_apps",
                             lambda: {"com.discordapp.Discord":
                                      ("1.0.151", "system")})
-        rows = app.UntrackedLoader()._load_apps()
+        rows, _titles = app.UntrackedLoader()._load_apps()
         names = {r["name"] for r in rows}
         assert "com.discordapp.Discord" not in names
         assert "zen" in names
@@ -3044,7 +3044,7 @@ class TestAppImageRows:
                                 {"file": str(tmp_path / "other.desktop"),
                                  "title": "Other", "comment": "",
                                  "exec": "/usr/bin/other"}])
-        rows = app.UntrackedLoader()._load_apps()
+        rows, _titles = app.UntrackedLoader()._load_apps()
         names = {r["name"] for r in rows}
         assert "zen" not in names
         assert "other" in names

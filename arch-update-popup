@@ -2341,6 +2341,57 @@ class AppImageRemover(QThread):
         self.done.emit(ok, "\n".join(lines[-40:]))
 
 
+def required_by_map() -> dict[str, list[str]]:
+    """{package: [packages that require it]} for everything installed.
+
+    `expac -Q '%n|%N'` answers for the whole machine in one call. Without
+    expac, one `pacman -Qi` for the packages asked about is the fallback.
+    """
+    if shutil.which("expac"):
+        try:
+            res = _run(["expac", "-Q", "%n|%N"], capture_output=True,
+                       text=True, timeout=60)
+        except Exception:
+            return {}
+        out: dict[str, list[str]] = {}
+        for line in (res.stdout or "").splitlines():
+            name, _, needs = line.partition("|")
+            name = name.strip()
+            if name:
+                out[name] = needs.split()
+        return out
+    return {}
+
+
+def _explicit_requirers(dep: str, required_by: dict[str, list[str]],
+                        explicit: set[str], limit: int | None = None,
+                        max_depth: int = 8) -> list[str]:
+    """The explicitly installed packages that (transitively) need `dep`.
+
+    A dependency is usually needed by another dependency — what the user
+    wants to see is the app at the top of that chain, so the graph is
+    walked upwards. Both bounds are generous (chains here are at most a
+    few links; 8 covers every package on a real machine) because the walk
+    costs milliseconds and a wrong "nothing needs this" is worse than a
+    slow one.
+    """
+    found: list[str] = []
+    seen = {dep}
+    queue: list[tuple[str, int]] = [(n, 1) for n in required_by.get(dep, [])]
+    while queue and (limit is None or len(found) < limit):
+        name, depth = queue.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        if name in explicit:
+            found.append(name)
+            continue
+        if depth >= max_depth:
+            continue
+        queue.extend((up, depth + 1) for up in required_by.get(name, []))
+    return found
+
+
 class UntrackedLoader(QThread):
     """Finds untracked software in the background.
 
@@ -2352,15 +2403,18 @@ class UntrackedLoader(QThread):
 
     def run(self) -> None:
         try:
-            apps = self._load_apps()
+            apps, titles = self._load_apps()
             if self.isInterruptionRequested():
                 return
-            pkgs = self._load_deps()
+            pkgs = self._load_deps(titles)
         except Exception:
             return
         self.done.emit(apps, pkgs)
 
-    def _load_apps(self) -> list[dict]:
+    def _load_apps(self) -> tuple[list[dict], dict[str, str]]:
+        """(app rows, {package: launcher title}) — the titles cover every
+        package that ships a launcher, explicit or not, so a dependency can
+        name the applications that need it."""
         found = scan_desktop_files()
         owners: dict[str, tuple[str | None, str]] = {}
         files = [a["file"] for a in found if not _flatpak_id_for(a)]
@@ -2391,6 +2445,12 @@ class UntrackedLoader(QThread):
                     ff, owner, ver = parse_qo_owner(line)
                     if owner:
                         owners[ff] = (owner, ver)
+        # Launcher title per owning package, for naming apps in messages.
+        titles: dict[str, str] = {}
+        for app in found:
+            owner, _ver = owners.get(app["file"], (None, ""))
+            if owner and app.get("title"):
+                titles.setdefault(owner, app["title"])
         versions = _installed_version_map()
         foreign = _foreign_pkg_set()
         rows = []
@@ -2429,9 +2489,9 @@ class UntrackedLoader(QThread):
             seen.add(key)
             rows.append(row)
         rows.sort(key=lambda it: (it["title"] or it["name"]).lower())
-        return rows
+        return rows, titles
 
-    def _load_deps(self) -> list[dict]:
+    def _load_deps(self, titles: dict[str, str] | None = None) -> list[dict]:
         try:
             r = _run(["pacman", "-Qd"], capture_output=True, text=True)
         except Exception:
@@ -2439,6 +2499,11 @@ class UntrackedLoader(QThread):
         if r.returncode != 0:
             return []
         foreign = _foreign_pkg_set()
+        titles = titles or {}
+        # What needs what, so a stray dependency can name the applications
+        # that pulled it in — that is the only reason to keep it.
+        required_by = required_by_map()
+        explicit = _explicit_package_set() if required_by else set()
         rows = []
         for line in r.stdout.splitlines():
             if self.isInterruptionRequested():
@@ -2449,9 +2514,23 @@ class UntrackedLoader(QThread):
             rows.append(_tracked_row(
                 parts[0], parts[1],
                 "aur" if parts[0] in foreign else "official",
+                desc=self._needed_by(parts[0], required_by, explicit, titles),
                 kind="dependency"))
         rows.sort(key=lambda it: it["name"].lower())
         return rows
+
+    @staticmethod
+    def _needed_by(name: str, required_by: dict[str, list[str]],
+                   explicit: set[str], titles: dict[str, str]) -> str:
+        """One line naming the applications that need this package."""
+        needs = _explicit_requirers(name, required_by, explicit)
+        if not needs:
+            return ("No explicitly installed package needs it."
+                    if required_by else "")
+        label = ", ".join(titles.get(n, n) for n in needs[:3])
+        if len(needs) > 3:
+            label += f", +{len(needs) - 3} more"
+        return f"Needed by {label}"
 
 
 class InfoFetcher(QThread):

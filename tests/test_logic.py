@@ -902,3 +902,89 @@ class TestPackageLinks:
         url = app._package_url("com.obsproject.Studio", "flatpak")
         assert "aur.archlinux.org" not in url
         assert "archlinux.org/packages" not in url
+
+
+class TestDependencyRequirers:
+    """A stray dependency should name the applications that need it."""
+
+    def test_a_direct_requirer(self):
+        req = {"libfoo": ["steam"]}
+        assert app._explicit_requirers("libfoo", req, {"steam"}) == ["steam"]
+
+    def test_a_chain_is_walked_to_the_application(self):
+        # libfoo ← libbar ← steam: the user wants to see Steam.
+        req = {"libfoo": ["libbar"], "libbar": ["steam"]}
+        assert app._explicit_requirers("libfoo", req, {"steam"}) == ["steam"]
+
+    def test_a_chain_that_ends_in_nothing_explicit(self):
+        # libfoo ← libbar ← (nothing): no application needs it.
+        req = {"libfoo": ["libbar"]}
+        assert app._explicit_requirers("libfoo", req, {"steam"}) == []
+
+    def test_a_cycle_does_not_hang(self):
+        req = {"a": ["b"], "b": ["a"]}
+        assert app._explicit_requirers("a", req, set()) == []
+
+    def test_every_requirer_is_reported(self):
+        req = {"libfoo": ["a", "b", "c", "d", "e"]}
+        found = app._explicit_requirers("libfoo", req, {"a", "b", "c", "d", "e"})
+        assert found == ["a", "b", "c", "d", "e"]
+
+    def test_the_needed_by_line_names_titles(self):
+        req = {"libfoo": ["steam", "lutris", "heroic-games-launcher-bin",
+                          "bottles"]}
+        line = app.UntrackedLoader._needed_by(
+            "libfoo", req,
+            {"steam", "lutris", "heroic-games-launcher-bin", "bottles"},
+            {"steam": "Steam", "lutris": "Lutris",
+             "heroic-games-launcher-bin": "Heroic Games Launcher"})
+        assert line == "Needed by Steam, Lutris, Heroic Games Launcher, +1 more"
+
+    def test_the_needed_by_line_falls_back_to_the_package_name(self):
+        req = {"libfoo": ["gaze-bin"]}
+        assert app.UntrackedLoader._needed_by("libfoo", req, {"gaze-bin"}, {}) \
+            == "Needed by gaze-bin"
+
+    def test_the_needed_by_line_says_when_nothing_needs_it(self):
+        req = {"libfoo": ["some-orphan"]}
+        assert app.UntrackedLoader._needed_by("libfoo", req, set(), {}) == \
+            "No explicitly installed package needs it."
+
+    def test_no_data_means_no_claim(self):
+        assert app.UntrackedLoader._needed_by("libfoo", {}, set(), {}) == ""
+
+    def test_required_by_map_parses_expac(self, monkeypatch):
+        class R:
+            stdout = ("libfoo|steam lutris\n"
+                      "libbar|0\n")
+
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/expac")
+        monkeypatch.setattr(app, "_run", lambda *a, **k: R())
+        req = app.required_by_map()
+        assert req["libfoo"] == ["steam", "lutris"]
+        assert req["libbar"] == ["0"]      # expac prints 0 for "nothing"
+
+    def test_required_by_map_without_expac_says_nothing(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: None)
+        assert app.required_by_map() == {}
+
+
+class TestDependencyRows:
+    """The dependency rows carry that line as their description."""
+
+    def test_load_deps_asks_who_needs_each_package(self, monkeypatch):
+        class R:
+            stdout = "libfoo 1-1\nlibbar 2-1\n"
+            returncode = 0
+
+        monkeypatch.setattr(app, "_run", lambda *a, **k: R())
+        monkeypatch.setattr(app, "_foreign_pkg_set", lambda: set())
+        monkeypatch.setattr(app, "required_by_map",
+                            lambda: {"libfoo": ["steam"]})
+        monkeypatch.setattr(app, "_explicit_package_set", lambda: {"steam"})
+        rows = app.UntrackedLoader()._load_deps({"steam": "Steam"})
+        by_name = {r["name"]: r for r in rows}
+        assert by_name["libfoo"]["desc"] == "Needed by Steam"
+        assert by_name["libbar"]["desc"] == \
+            "No explicitly installed package needs it."
+        assert by_name["libfoo"]["kind"] == "dependency"
