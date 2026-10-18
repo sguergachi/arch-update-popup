@@ -712,7 +712,10 @@ class TestUntrackedScan:
         assert row == {"name": "p", "title": "T", "version": "1-1",
                        "repo": "official", "target": "", "source": "",
                        "relation": "", "state": "idle", "failed_op": "",
-                       "desktop": None, "desc": "", "checked": False}
+                       "desktop": None, "desc": "", "checked": False,
+                       # The app's own page (AppImages / manual installs)
+                       # and the file behind an AppImage row.
+                       "url": "", "path": ""}
 
     def test_set_items(self, qapp):
         m = app.TrackedModel()

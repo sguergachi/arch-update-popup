@@ -866,3 +866,39 @@ class TestRequestReboot:
         # ink on a deep one (Breeze's amber takes white).
         assert ((ink.lightness() > fill.lightness())
                 == (fill.lightness() <= 150))
+
+
+class TestPackageLinks:
+    """Every source links to its own home — or to nothing at all."""
+
+    def test_aur_goes_to_the_aur(self):
+        assert app._package_url("zen-browser-bin", "aur") == \
+            "https://aur.archlinux.org/packages/zen-browser-bin"
+
+    def test_flatpak_goes_to_flathub(self):
+        assert app._package_url("com.discordapp.Discord", "flatpak") == \
+            "https://flathub.org/apps/com.discordapp.Discord"
+
+    def test_repo_packages_go_to_the_arch_search(self):
+        for repo in ("official", "core", "extra", "cachyos-v3",
+                     "chaotic-aur"):
+            url = app._package_url("konsole", repo)
+            assert url == "https://archlinux.org/packages/?q=konsole"
+
+    def test_an_appimage_links_only_to_its_own_page(self):
+        # A file has no registry: no URL in the launcher, no link.
+        assert app._package_url("Claude", "appimage") == ""
+        assert app._package_url("Paper", "appimage",
+                                "https://paper.example/") == \
+            "https://paper.example/"
+
+    def test_a_manual_install_links_only_to_its_own_page(self):
+        assert app._package_url("Stray", "manual") == ""
+        assert app._package_url("Stray", "manual", "https://stray.game") == \
+            "https://stray.game"
+
+    def test_a_flatpak_app_never_links_to_the_aur(self):
+        # The reported bug: a Flatpak app opened an AUR-shaped page.
+        url = app._package_url("com.obsproject.Studio", "flatpak")
+        assert "aur.archlinux.org" not in url
+        assert "archlinux.org/packages" not in url

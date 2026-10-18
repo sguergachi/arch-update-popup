@@ -1996,6 +1996,8 @@ def _appimage_row(path: str, launcher: dict | None) -> dict:
         "title": launcher.get("title", "") or _appimage_pretty(stem),
         "desktop": launcher.get("file", ""),
         "desc": launcher.get("comment", ""),
+        # The app's own page, when its launcher names one.
+        "url": launcher.get("url", ""),
         # The file itself is the removal target — no package owns it.
         "path": path,
     }
@@ -2066,7 +2068,8 @@ def scan_desktop_files(dirs: list[str] | None = None,
                 continue
             found[fn] = {"file": path, "title": entry["Name"],
                          "comment": entry.get("Comment", ""),
-                         "exec": entry.get("Exec", "")}
+                         "exec": entry.get("Exec", ""),
+                         "url": entry.get("URL", "")}
     return list(found.values())
 
 
@@ -2118,12 +2121,13 @@ def _foreign_pkg_set() -> set[str]:
 
 
 def _tracked_row(name: str, version: str, repo: str, title: str = "",
-                 desktop: str = "", desc: str = "") -> dict:
+                 desktop: str = "", desc: str = "", url: str = "") -> dict:
     """A complete TrackedModel-compatible row dict."""
     return {"name": name, "title": title, "version": version, "repo": repo,
             "target": "", "source": "", "relation": "",
             "state": "idle", "failed_op": "",
-            "desktop": desktop or None, "desc": desc, "checked": False}
+            "desktop": desktop or None, "desc": desc, "checked": False,
+            "url": url, "path": ""}
 
 
 class FlatpakRemover(QThread):
@@ -2411,7 +2415,7 @@ class UntrackedLoader(QThread):
             row = _tracked_row(
                 name, version, repo, title=a["title"],
                 desktop=a["file"] if launchable else "",
-                desc=a["comment"])
+                desc=a["comment"], url=a.get("url", ""))
             # Same app shipped twice (system + user copy, .bak-style
             # twins): collapse on title + launch command.
             key = ((row["title"] or row["name"]).lower(), a["exec"])
@@ -3374,10 +3378,21 @@ _APP_QSS = _build_qss()
 _QSS_CACHE: dict[tuple[bool, float], str] = {}
 
 
-def _package_url(name: str, repo: str) -> str:
-    """Deep link to a package: exact AUR page, or Arch package search."""
-    if (repo or "").lower() == "aur":
+def _package_url(name: str, repo: str, url: str = "") -> str:
+    """Where to read about this package or app — '' when nowhere honest.
+
+    Each source has its own home: a Flatpak app is on Flathub, an AUR
+    package on the AUR, a repo package in Arch's search. An AppImage is
+    just a file: its launcher's URL if it has one, otherwise no link at
+    all — a wrong page is worse than no link.
+    """
+    key = _source_key(repo)
+    if key == SRC_FLATPAK:
+        return f"https://flathub.org/apps/{name}"
+    if key == SRC_AUR:
         return f"https://aur.archlinux.org/packages/{name}"
+    if key in (SRC_APPIMAGE, SRC_MANUAL):
+        return (url or "").strip()
     return f"https://archlinux.org/packages/?q={name}"
 
 
@@ -3488,14 +3503,16 @@ class _ScanRow(QWidget):
             ver.setObjectName("package-date")
             top.addWidget(ver, 0, Qt.AlignmentFlag.AlignVCenter)
         top.addStretch()
-        link = QLabel(
-            f"<a style='text-decoration:none; color:{_link_hex()}' "
-            f"href='{_package_url(pkg['name'], pkg.get('repo', ''))}'>"
-            "View package ↗</a>"
-        )
-        link.setObjectName("package-link")
-        link.setOpenExternalLinks(True)
-        top.addWidget(link)
+        url = _package_url(pkg["name"], pkg.get("repo", ""),
+                           pkg.get("url", ""))
+        if url:
+            link = QLabel(
+                f"<a style='text-decoration:none; color:{_link_hex()}' "
+                f"href='{url}'>View package ↗</a>"
+            )
+            link.setObjectName("package-link")
+            link.setOpenExternalLinks(True)
+            top.addWidget(link)
         outer.addLayout(top)
 
         if is_comp:
@@ -4331,8 +4348,11 @@ class PackageDelegate(QStyledItemDelegate):
         fm_bold = QFontMetrics(self._f_bold)
 
         # ── Row 1 · name + repo pill, with the one row action top-right ────
-        link_txt = "View package  ↗"
-        link_w = fm.horizontalAdvance(link_txt)
+        # No page for this source means no link — never a wrong one.
+        link_txt = ("View package  ↗"
+                    if _package_url(item["name"], item.get("repo", ""),
+                                    item.get("url", "")) else "")
+        link_w = fm.horizontalAdvance(link_txt) if link_txt else 0
         badge_txt = (item["repo"] or "").upper()
         badge_w = (QFontMetrics(self._f_badge).horizontalAdvance(badge_txt) + 14
                    if badge_txt else 0)
@@ -4408,7 +4428,9 @@ class PackageDelegate(QStyledItemDelegate):
             if (item["state"] != "idle" or item["compromised"]) else QRect(),
             "name": QRect(x0, y, name_w, h_name),
             "badge": QRect(x0 + name_w + 8, y + 3, badge_w, 15),
-            "link": QRect(right - link_w - 4, y, link_w + 4, h_name),
+            # Zero-width when there is no link: nothing to hover or hit.
+            "link": (QRect(right - link_w - 4, y, link_w + 4, h_name)
+                     if link_w else QRect()),
             "ver": QRect(x0, ver_top, cw, h_line),
             "ver_old": ver_old, "ver_new": ver_new, "ver_w": ver_w,
             "desc": QRect(),
@@ -4686,9 +4708,10 @@ class PackageDelegate(QStyledItemDelegate):
                     and item["state"] == "idle"):
                 self.toggled.emit(index.row())
                 return True
-            if lay["link"].contains(pos):
+            if not lay["link"].isNull() and lay["link"].contains(pos):
                 self.link_activated.emit(
-                    _package_url(item["name"], item["repo"]))
+                    _package_url(item["name"], item["repo"],
+                                 item.get("url", "")))
                 return True
             if not lay["more"].isNull() and lay["more"].contains(pos):
                 self.more_requested.emit(index.row())
@@ -4743,6 +4766,8 @@ class TrackedModel(_FilterableModel, QAbstractListModel):
                 "title": pkg.get("title", ""),
                 # AppImage rows: the file to delete on Uninstall.
                 "path": pkg.get("path", ""),
+                # The app's own page (AppImages, manual installs).
+                "url": pkg.get("url", ""),
                 "target": m["target"] if m else "",
                 "source": m["source"] if m else "",
                 "relation": m["relation"] if m else "",
@@ -4927,8 +4952,10 @@ class TrackedDelegate(QStyledItemDelegate):
         right = width - self.CDX - self.PAD
         cw = right - x0
         y = self.CDY + self.PTOP
-        link_txt = "View package  ↗"
-        link_w = fm.horizontalAdvance(link_txt)
+        link_txt = ("View package  ↗"
+                    if _package_url(item["name"], item.get("repo", ""),
+                                    item.get("url", "")) else "")
+        link_w = fm.horizontalAdvance(link_txt) if link_txt else 0
         # Display title: usually the package name; Untracked app rows
         # show the human-readable application name instead.
         title = item.get("title") or item["name"]
@@ -5046,7 +5073,9 @@ class TrackedDelegate(QStyledItemDelegate):
             "title": title,
             "title_txt": title_txt,
             "badge": QRect(x0 + name_w + 8, y + 3, badge_w, 15),
-            "link": QRect(right - link_w - 4, y, link_w + 4, h_name),
+            # Zero-width when there is no link: nothing to hover or hit.
+            "link": (QRect(right - link_w - 4, y, link_w + 4, h_name)
+                     if link_w else QRect()),
             "link_txt": link_txt,
             "ver": QRect(x0, ver_top, cw, h_line),
             "ver_left": ver_left,
@@ -5298,7 +5327,8 @@ class TrackedDelegate(QStyledItemDelegate):
                 return True
             if not lay["link"].isNull() and lay["link"].contains(pos):
                 it = model.item(index.row())
-                self.link_activated.emit(_package_url(it["name"], it["repo"]))
+                self.link_activated.emit(
+                    _package_url(it["name"], it["repo"], it.get("url", "")))
                 return True
         return False
 
@@ -5352,14 +5382,15 @@ class NotesPopover(QDialog):
 
         row = QHBoxLayout()
         row.setSpacing(8)
-        pkg_link = QLabel(
-            f"<a style='text-decoration:none; color:{_link_hex()}' "
-            f"href='{_package_url(item['name'], item['repo'])}'>"
-            "Open package page ↗</a>")
-        pkg_link.setStyleSheet(f"color: {_secondary_hex()};")
-        pkg_link.setObjectName("package-link")
-        pkg_link.setOpenExternalLinks(True)
-        row.addWidget(pkg_link)
+        pkg_url = _package_url(item["name"], item["repo"], item.get("url", ""))
+        if pkg_url:
+            pkg_link = QLabel(
+                f"<a style='text-decoration:none; color:{_link_hex()}' "
+                f"href='{pkg_url}'>Open package page ↗</a>")
+            pkg_link.setStyleSheet(f"color: {_secondary_hex()};")
+            pkg_link.setObjectName("package-link")
+            pkg_link.setOpenExternalLinks(True)
+            row.addWidget(pkg_link)
         row.addStretch()
         copy_btn = QPushButton("Copy")
         copy_btn.setObjectName("secondary-small")

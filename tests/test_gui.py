@@ -3107,3 +3107,63 @@ class TestAppImageRows:
 
         assert started == [["/home/s/Applications/Claude.AppImage"]]
         assert window._track_kind == "appimage"
+
+
+class TestViewPackageLinks:
+    """The row link follows the source, and disappears when there is no
+    honest page for it."""
+
+    def _link_rect(self, window, row):
+        d = window._track_list.itemDelegate()
+        return d._geom(row, window._track_model.item(row), 1240)["link"]
+
+    def test_a_flatpak_row_links_to_flathub(self, window, qapp, monkeypatch):
+        _settle_loaders(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "com.discordapp.Discord", "version": "1",
+              "repo": "flatpak", "title": "Discord", "desktop": ""}], [])
+        qapp.processEvents()
+        url = app._package_url("com.discordapp.Discord", "flatpak")
+        assert url == "https://flathub.org/apps/com.discordapp.Discord"
+        assert not self._link_rect(window, 0).isNull()
+
+    def test_an_appimage_without_a_page_shows_no_link(self, window, qapp,
+                                                      monkeypatch):
+        _settle_loaders(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "Claude", "version": "", "repo": "appimage",
+              "title": "Claude", "path": "/x/Claude.AppImage"}], [])
+        qapp.processEvents()
+        assert self._link_rect(window, 0).isNull(), "link offered, no page"
+
+    def test_an_appimage_with_a_page_shows_one(self, window, qapp,
+                                              monkeypatch):
+        _settle_loaders(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "Paper", "version": "0.1.10", "repo": "appimage",
+              "title": "Paper", "url": "https://paper.example/",
+              "path": "/x/Paper.AppImage"}], [])
+        qapp.processEvents()
+        assert not self._link_rect(window, 0).isNull()
+
+    def test_a_pacman_row_keeps_its_link(self, window, qapp, monkeypatch):
+        _settle_loaders(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "konsole", "version": "1", "repo": "official"}], [])
+        qapp.processEvents()
+        assert not self._link_rect(window, 0).isNull()
+
+    def test_clicking_a_row_without_a_link_opens_nothing(self, window, qapp,
+                                                         monkeypatch):
+        opened = []
+        monkeypatch.setattr(app.QDesktopServices, "openUrl",
+                            lambda url: opened.append(url))
+        _settle_loaders(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "Claude", "version": "", "repo": "appimage",
+              "title": "Claude", "path": "/x/Claude.AppImage"}], [])
+        qapp.processEvents()
+        d = window._track_list.itemDelegate()
+        lay = d._geom(0, window._track_model.item(0), 1240)
+        assert lay["link"].isNull()
+        assert opened == []
