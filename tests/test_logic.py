@@ -612,3 +612,51 @@ class TestAskpassEnable:
         # Second cleanup is a no-op (no crash).
         r._cleanup()
         assert r._askpass is None
+
+
+class TestManagedSourceProbe:
+    """The Sources panel must never guess a source's state."""
+
+    def test_pacman_repo_probe_reads_pacman_conf(self, monkeypatch):
+        monkeypatch.setattr(app, "enabled_repos", lambda: {"chaotic-aur"})
+        assert app._managed_source_ready("chaotic-aur", {"chaotic-aur"})
+        assert not app._managed_source_ready("archlinuxcn", {"chaotic-aur"})
+
+    def test_flatpak_probe_is_not_a_pacman_repo(self, monkeypatch):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+
+            class R:
+                stdout = "flathub\n"
+            return R()
+
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/flatpak")
+        monkeypatch.setattr(app.subprocess, "run", fake_run)
+        assert app._flatpak_ready() is True
+        assert calls and calls[0][0] == "flatpak"
+        # A pacman.conf without flatpak in it must not deny Flatpak.
+        assert app._managed_source_ready("flatpak", set()) is True
+
+    def test_flatpak_probe_needs_the_binary(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: None)
+        assert app._flatpak_ready() is False
+        assert app._managed_source_ready("flatpak", set()) is False
+
+    def test_flatpak_probe_needs_the_flathub_remote(self, monkeypatch):
+        class R:
+            stdout = "flathub-beta\n"
+
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/flatpak")
+        monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: R())
+        assert app._flatpak_ready() is False
+
+    def test_flatpak_probe_survives_a_broken_flatpak(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/flatpak")
+
+        def boom(*a, **k):
+            raise OSError("no flatpak here")
+
+        monkeypatch.setattr(app.subprocess, "run", boom)
+        assert app._flatpak_ready() is False

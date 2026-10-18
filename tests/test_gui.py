@@ -2189,3 +2189,226 @@ class TestPerf:
               f"({layout_s / 322 * 1000:.1f} ms/row)")
         assert layout_s < 20
         v.close()
+
+
+class _FakeBtn(QObject):
+    """Minimal push-button stand-in for the confirmation box."""
+    clicked = pyqtSignal()
+
+    def __init__(self, text):
+        super().__init__()
+        self._text = text
+
+    def setText(self, text):
+        self._text = text
+
+    def text(self):
+        return self._text
+
+
+class _AcceptingBox:
+    """A QMessageBox that always reports 'the user pressed Enable'."""
+
+    class Icon:
+        Question = 0
+
+    class ButtonRole:
+        AcceptRole = 0
+        ActionRole = 1
+        RejectRole = 2
+
+    def __init__(self, parent=None):
+        self._accept = None
+        self.buttons = []
+
+    def setIcon(self, *_a):
+        pass
+
+    def setWindowTitle(self, *_a):
+        pass
+
+    def setText(self, *_a):
+        pass
+
+    def setInformativeText(self, *_a):
+        pass
+
+    def setDetailedText(self, *_a):
+        pass
+
+    def setStyleSheet(self, *_a):
+        pass
+
+    def addButton(self, text, role):
+        btn = _FakeBtn(text)
+        self.buttons.append(btn)
+        if role == self.ButtonRole.AcceptRole:
+            self._accept = btn
+        return btn
+
+    def exec(self):
+        return 0
+
+    def clickedButton(self):
+        return self._accept
+
+
+class _CancellingBox(_AcceptingBox):
+    """A QMessageBox where the user pressed Cancel (or closed it)."""
+
+    def clickedButton(self):
+        return None
+
+
+@pytest.fixture()
+def sources_dialog(qapp, monkeypatch):
+    """A ManagedSourcesDialog with no real pacman.conf and a fake runner."""
+    monkeypatch.setattr(app, "enabled_repos", lambda: set())
+    monkeypatch.setattr(app, "_flatpak_ready", lambda: False)
+    monkeypatch.setattr(app, "_SourceEnableRunner", FakeSourceEnableRunner)
+    monkeypatch.setattr(app, "QMessageBox", _AcceptingBox)
+    dlg = app.ManagedSourcesDialog()
+    yield dlg
+    dlg.close()
+
+
+def _enable_card(dlg):
+    """The first card that offers an Enable button, with that button."""
+    for w in dlg.findChildren(app.QWidget):
+        btn = getattr(w, "_enable_btn", None)
+        if btn is not None:
+            return w, btn
+    raise AssertionError("no source card offered an Enable button")
+
+
+class TestManagedSourcesEnable:
+    """The inline enable flow: one card, no modal progress, honest state."""
+
+    def test_enable_is_inline_and_updates_every_state_label(
+            self, sources_dialog):
+        d = sources_dialog
+        card, btn = _enable_card(d)
+        fired = []
+        d.restart_needed.connect(lambda: fired.append(True))
+
+        d._enable_source("Chaotic-AUR", "#!/bin/bash\necho hi", card, btn)
+
+        # Progress lives inside the card; the button becomes the state.
+        assert btn.text() == "Enabling…"
+        assert not btn.isEnabled()
+        assert card._bar.property("state") == "running"
+        assert card._status_lbl.text() == "Starting…"
+        runner = d._enable_runner
+        assert isinstance(runner, FakeSourceEnableRunner)
+        runner.line.emit("installing keyring")
+        assert card._status_lbl.text() == "installing keyring"
+
+        runner.done.emit(True, "all good")
+
+        assert btn.text() == "Enabled ✓"
+        assert not btn.isEnabled()
+        assert "enabled ✓" in card._status_lbl.text()
+        assert card._bar.property("state") == "done"
+        assert d._enable_runner is None
+        assert fired
+
+    def test_success_flips_the_badge_too(self, sources_dialog):
+        # The bug the user hit: button said Enabled while the badge still
+        # said NOT ENABLED. Both must move together.
+        d = sources_dialog
+        card, btn = _enable_card(d)
+        assert card._badge.text() == "NOT ENABLED"
+        assert card._badge.property("tint") == "muted"
+
+        d._enable_source("Chaotic-AUR", "#!/bin/bash\necho hi", card, btn)
+        d._enable_runner.done.emit(True, "")
+
+        assert card._badge.text() == "ENABLED"
+        assert card._badge.property("tint") == "positive"
+        assert btn.text() == "Enabled ✓"
+
+    def test_failure_keeps_the_badge_and_offers_a_retry(self, sources_dialog):
+        d = sources_dialog
+        card, btn = _enable_card(d)
+
+        d._enable_source("archlinuxcn", "#!/bin/bash\nexit 1", card, btn)
+        d._enable_runner.done.emit(
+            False, "error: target not found: archlinuxcn-keyring\nboom")
+
+        assert btn.text() == "Enable"
+        assert btn.isEnabled()
+        assert card._badge.text() == "NOT ENABLED"
+        assert card._badge.property("tint") == "muted"
+        assert card._status_lbl.text().startswith("Failed:")
+        assert "boom" in card._status_lbl.text()
+        assert card._bar.property("state") == "failed"
+
+    def test_cancel_runs_nothing(self, sources_dialog, monkeypatch):
+        d = sources_dialog
+        monkeypatch.setattr(app, "QMessageBox", _CancellingBox)
+        card, btn = _enable_card(d)
+
+        d._enable_source("Chaotic-AUR", "#!/bin/bash\necho hi", card, btn)
+
+        assert btn.text() == "Enable"
+        assert btn.isEnabled()
+        assert card._status_lbl.text() == card._desc
+        assert card._bar.property("state") == "idle"
+        assert getattr(d, "_enable_runner", None) is None
+
+    def test_no_state_change_moves_the_card(self, sources_dialog):
+        # The UI law: showing progress must not move anything. The status
+        # takes the description's fixed slot and the track is always there.
+        d = sources_dialog
+        d.show()
+        card, btn = _enable_card(d)
+        before = card.height()
+
+        d._enable_source("Chaotic-AUR", "#!/bin/bash\necho hi", card, btn)
+        assert card.height() == before, "progress moved the card"
+
+        d._enable_runner.line.emit("some quite long pacman output line here")
+        assert card.height() == before
+
+        d._enable_runner.done.emit(True, "")
+        assert card.height() == before
+
+    def test_every_card_is_the_same_height(self, sources_dialog):
+        # Uniform cards: one slot for the description, one for the track.
+        d = sources_dialog
+        d.show()
+        cards = [w for w in d.findChildren(app.QWidget)
+                 if hasattr(w, "_bar")]
+        assert len(cards) >= 4
+        heights = {c.height() for c in cards}
+        assert len(heights) == 1, f"cards differ: {heights}"
+
+
+class TestAutoRowText:
+    """Auto-added dependency rows explain themselves exactly once."""
+
+    def test_auto_row_has_no_version_text_to_overlap(self, qapp):
+        from PyQt6.QtWidgets import QListView
+        m = app.PackageModel(_updates(1), {})
+        r = m.ensure_row("libfoo")
+        item = m.item(r)
+        assert item["auto"]
+        v = QListView()
+        v.resize(1240, 800)
+        v.setModel(m)
+        d = app.PackageDelegate(v)
+        v.setItemDelegate(d)
+        lay = d._layout(r, item, 1240)
+        # The version slot is empty: the description is the only text on
+        # that line, so the two can never print on top of each other.
+        assert lay["ver_old"] == ""
+        assert lay["ver_new"] == ""
+        assert lay["desc_txt"]
+
+    def test_auto_row_description_is_one_clean_sentence(self, qapp):
+        m = app.PackageModel(_updates(1), {})
+        item = m.item(m.ensure_row("libfoo"))
+        assert item["desc"] == (
+            "Added automatically as a dependency while installing — "
+            "it wasn't in the update list.")
+        assert "No changelog for auto-added packages." == item["notes"]

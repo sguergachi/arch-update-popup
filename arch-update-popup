@@ -74,8 +74,8 @@ _MANAGED_SOURCES: list[tuple[str, str, str, str]] = [
      "calls official, and the safest place for a package to land."),
     ("CachyOS", "cachyos", "",
      "Arch and AUR packages rebuilt and signed by the CachyOS build farm, "
-     "with performance, stability and security patches on top. No PKGBUILD "
-     "is run on your machine to get one. Already enabled here."),
+     "with performance and security patches on top — no PKGBUILD runs on "
+     "your machine."),
     ("Chaotic-AUR", "chaotic-aur", """#!/bin/bash
 set -e
 # 1. Trust the Chaotic-AUR signing key (must come before anything else).
@@ -93,9 +93,9 @@ pacman -Sy
 pacman -Sy --noconfirm chaotic-keyring chaotic-mirrorlist
 # 5. Refresh again with the new keyring in place.
 pacman -Sy""",
-     "A semi-automated AUR build farm: packages are signed, the PKGBUILD and "
-     "its sources are statically scanned before a build, and a package is "
-     "held back unless every AUR maintainer involved is trusted."),
+     "A semi-automated AUR build farm: packages are signed, and the recipe "
+     "is scanned before a build — held back unless every maintainer "
+     "involved is trusted."),
     ("archlinuxcn", "archlinuxcn", """#!/bin/bash
 set -e
 # 1. Import and trust the archlinuxcn signing key.
@@ -119,8 +119,8 @@ set -e
 pacman -Sy --noconfirm flatpak
 flatpak remote-add --if-not-exists flathub \
     https://flathub.org/repo/flathub.flatpakrepo""",
-     "Sandboxed, signed and curated per application. Not a pacman repo, so "
-     "migrating means removing the package and installing the Flatpak."),
+     "Sandboxed, signed and curated per application. Not a pacman repo: "
+     "moving over means removing the package and installing the Flatpak."),
 ]
 
 
@@ -137,6 +137,27 @@ def enabled_repos() -> set[str]:
     except OSError:
         pass
     return names
+
+
+def _flatpak_ready() -> bool:
+    """Flatpak installed, with the Flathub remote registered (local read)."""
+    if not shutil.which("flatpak"):
+        return False
+    try:
+        res = subprocess.run(["flatpak", "remotes", "--columns=name"],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    remotes = {ln.strip().lower() for ln in (res.stdout or "").splitlines()}
+    return "flathub" in remotes
+
+
+def _managed_source_ready(probe: str, enabled: set[str]) -> bool:
+    """Is this managed source already usable on this machine? Flatpak is
+    not a pacman repo, so it answers for itself."""
+    if probe == "flatpak":
+        return _flatpak_ready()
+    return probe in enabled
 
 
 def _repo_kind(repo: str) -> str:
@@ -2624,6 +2645,11 @@ QProgressBar {
     min-height: 3px; max-height: 3px; color: transparent;
 }
 QProgressBar::chunk { background: %(positive)s; border-radius: 2px; }
+/* Per-card tracks in the sources panel: the property carries the state so
+   the color follows a live theme switch (no inline styles anywhere). */
+QProgressBar[state="running"]::chunk { background: %(accent)s; }
+QProgressBar[state="done"]::chunk { background: %(positive)s; }
+QProgressBar[state="failed"]::chunk { background: %(negative)s; }
 
 /* — Clickable latest-log preview above the progress bar — */
 QLabel#log-preview { font-size: %(meta)spx; color: %(muted)s; padding: 2px 0; }
@@ -3434,9 +3460,9 @@ class PackageModel(_FilterableModel, QAbstractListModel):
         self._items.append({
             "name": name, "old": "", "new": "",
             "repo": "", "compromised": False, "reasons": [],
-            "desc": "Pulled in automatically while installing "
-                    "(e.g. a dependency) — it was not in the update list.",
-            "notes": "No changelog available for auto-added packages.",
+            "desc": "Added automatically as a dependency while installing "
+                    "— it wasn't in the update list.",
+            "notes": "No changelog for auto-added packages.",
             "date": "", "full": "", "source": "", "source_url": "",
             "checked": False, "state": "idle", "_rev": 0, "auto": True,
         })
@@ -3609,9 +3635,12 @@ class PackageDelegate(QStyledItemDelegate):
         old_txt, new_txt = item["old"], item["new"]
         arrow = "  →  "
         if item.get("auto"):
+            # Nothing to show in the version slot: the metadata line below
+            # carries the single sentence that explains the row. Drawing a
+            # version here too would print the two on top of each other.
             ver_w = 0
             ver_old = ""
-            ver_new = "dependency — added automatically during install"
+            ver_new = ""
         elif old_txt:
             ver_w = (fm.horizontalAdvance(old_txt)
                      + fm.horizontalAdvance(arrow)
@@ -3698,7 +3727,6 @@ class PackageDelegate(QStyledItemDelegate):
         lay["more_txt"] = more_txt
         lay["link_txt"] = link_txt
         lay["badge_txt"] = badge_txt
-        lay["ver_is_auto"] = bool(item.get("auto"))
         self._geo[key] = lay
         return lay
 
@@ -3791,24 +3819,19 @@ class PackageDelegate(QStyledItemDelegate):
         vr = move(lay["ver"])
         fm = QFontMetrics(self._f_text)
         x = vr.left()
-        if lay["ver_is_auto"]:
-            p.setFont(self._f_text)
+        if lay["ver_old"]:
+            p.setFont(self._f_strike)
             p.setPen(QPen(QColor(_secondary_hex())))
             p.drawText(vr, Qt.AlignmentFlag.AlignLeft
-                       | Qt.AlignmentFlag.AlignVCenter, lay["ver_new"])
-        else:
-            if lay["ver_old"]:
-                p.setFont(self._f_strike)
-                p.setPen(QPen(QColor(_secondary_hex())))
-                p.drawText(vr, Qt.AlignmentFlag.AlignLeft
-                           | Qt.AlignmentFlag.AlignVCenter, lay["ver_old"])
-                x += fm.horizontalAdvance(lay["ver_old"])
-                p.setFont(self._f_text)
-                p.drawText(QRect(x, vr.top(), fm.horizontalAdvance("  →  "),
-                                 vr.height()),
-                           Qt.AlignmentFlag.AlignLeft
-                           | Qt.AlignmentFlag.AlignVCenter, "  →  ")
-                x += fm.horizontalAdvance("  →  ")
+                       | Qt.AlignmentFlag.AlignVCenter, lay["ver_old"])
+            x += fm.horizontalAdvance(lay["ver_old"])
+            p.setFont(self._f_text)
+            p.drawText(QRect(x, vr.top(), fm.horizontalAdvance("  →  "),
+                             vr.height()),
+                       Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter, "  →  ")
+            x += fm.horizontalAdvance("  →  ")
+        if lay["ver_new"]:
             p.setFont(self._f_bold)
             p.setPen(QPen(QColor(_positive_hex())))
             p.drawText(QRect(x, vr.top(), max(10, vr.right() - x),
@@ -3816,13 +3839,16 @@ class PackageDelegate(QStyledItemDelegate):
                        Qt.AlignmentFlag.AlignLeft
                        | Qt.AlignmentFlag.AlignVCenter, lay["ver_new"])
             x += QFontMetrics(self._f_bold).horizontalAdvance(lay["ver_new"])
+        # The description follows the version after a small gap — but a row
+        # with no version (an auto-added dependency) starts it flush left.
+        gap = 12 if (lay["ver_old"] or lay["ver_new"]) else 0
         meta = " · ".join(p for p in (item["date"], lay["desc_txt"]) if p)
         if meta:
             p.setFont(self._f_text)
             p.setPen(QPen(QColor(_secondary_hex())))
-            avail = max(0, vr.right() - x - 12)
+            avail = max(0, vr.right() - x - gap)
             if avail > 40:
-                p.drawText(QRect(x + 12, vr.top(), avail, vr.height()),
+                p.drawText(QRect(x + gap, vr.top(), avail, vr.height()),
                            Qt.AlignmentFlag.AlignLeft
                            | Qt.AlignmentFlag.AlignVCenter,
                            fm.elidedText(meta, Qt.TextElideMode.ElideRight,
@@ -8334,10 +8360,14 @@ class ManagedSourcesDialog(QMainWindow):
             row.setSpacing(_sp(8))
             label = QLabel(name)
             label.setObjectName("package-name")
+            # Fixed row height: a card that offers a button and one that
+            # does not must still be exactly the same height.
+            label.setFixedHeight(_sp(24))
             row.addWidget(label)
-            on_here = probe in enabled
-            row.addWidget(_badge("enabled" if on_here else "not enabled",
-                                 "positive" if on_here else "muted"))
+            on_here = _managed_source_ready(probe, enabled)
+            badge = _badge("enabled" if on_here else "not enabled",
+                           "positive" if on_here else "muted")
+            row.addWidget(badge)
             row.addStretch()
             if steps and not on_here:
                 # One button, one job: the app enables the source for them.
@@ -8354,26 +8384,24 @@ class ManagedSourcesDialog(QMainWindow):
             note = QLabel(why)
             note.setObjectName("text-muted")
             note.setWordWrap(True)
+            # A fixed two-line slot: the description lives here when idle,
+            # the live status takes its place while enabling — same slot,
+            # same height, so no state change can move the card.
+            note.setFixedHeight(note.fontMetrics().lineSpacing() * 2)
             body.addWidget(note)
-            # Inline progress area: hidden until an enable is running.
-            progress_area = QWidget()
-            progress_area.setVisible(False)
-            pa = QVBoxLayout(progress_area)
-            pa.setContentsMargins(0, _sp(4), 0, 0)
-            pa.setSpacing(_sp(4))
-            status_lbl = QLabel("")
-            status_lbl.setObjectName("text-muted")
-            status_lbl.setWordWrap(True)
-            pa.addWidget(status_lbl)
+            # The slim track is in the layout from the start (an idle
+            # hairline): progress changes its color, never its size.
             bar = QProgressBar()
-            bar.setRange(0, 0)
             bar.setTextVisible(False)
-            pa.addWidget(bar)
-            body.addWidget(progress_area)
+            bar.setRange(0, 1)
+            bar.setValue(0)
+            bar.setProperty("state", "idle")
+            body.addWidget(bar)
             # Stash the per-card widgets so the enable flow can drive them.
             card._enable_btn = enable_btn if (steps and not on_here) else None
-            card._progress_area = progress_area
-            card._status_lbl = status_lbl
+            card._badge = badge
+            card._desc = why
+            card._status_lbl = note
             card._bar = bar
             box.addWidget(card)
         box.addStretch()
@@ -8383,8 +8411,8 @@ class ManagedSourcesDialog(QMainWindow):
         foot = QHBoxLayout()
         foot.setSpacing(_sp(8))
         hint = QLabel(
-            "Adding a repo is your call, in /etc/pacman.conf — this app "
-            "never changes it.")
+            "Enabling runs that source's documented setup commands — you "
+            "see and confirm every one of them first.")
         hint.setObjectName("meta")
         hint.setWordWrap(True)
         foot.addWidget(hint, 1)
@@ -8434,12 +8462,15 @@ class ManagedSourcesDialog(QMainWindow):
         if box.clickedButton() is not run_btn:
             return
 
-        # Inline progress: the button becomes "Enabling…", a bar + status
-        # line appear below the description, and the runner streams output.
+        # Inline progress: the button becomes "Enabling…", the description
+        # slot swaps to the live status, and the card's track turns accent.
+        # Nothing is added to the layout, so nothing moves.
         btn.setEnabled(False)
         btn.setText("Enabling…")
-        card._progress_area.setVisible(True)
+        self._set_note_role(card._status_lbl, "text-muted")
         card._status_lbl.setText("Starting…")
+        card._bar.setRange(0, 0)
+        self._set_bar_state(card._bar, "running")
         self.logged.emit(f"Enabling {name}…")
         self._enable_runner = _SourceEnableRunner(steps)
         self._enable_runner.line.connect(
@@ -8457,20 +8488,51 @@ class ManagedSourcesDialog(QMainWindow):
         if runner is not None:
             runner.wait(5000)
         if success:
-            card._status_lbl.setText(f"{name} enabled ✓")
-            card._bar.setVisible(False)
+            card._status_lbl.setText(f"{name} enabled ✓ — restart to apply.")
+            self._set_note_role(card._status_lbl, "text-positive")
+            card._bar.setRange(0, 1)
+            card._bar.setValue(1)
+            self._set_bar_state(card._bar, "done")
             btn.setText("Enabled ✓")
             btn.setEnabled(False)
+            # The badge was built from the state at open time: flip it too,
+            # so the card cannot say "enabled" and "not enabled" at once.
+            badge = getattr(card, "_badge", None)
+            if badge is not None:
+                badge.setText("ENABLED")
+                badge.setProperty("tint", "positive")
+                style = badge.style()
+                style.unpolish(badge)
+                style.polish(badge)
             self.restart_needed.emit()
             self.logged.emit(f"{name} enabled — restart to apply")
         else:
             lines = [l for l in output.splitlines() if l.strip()]
-            hint = " · ".join(lines[-2:]) if lines else "No output captured"
+            hint = lines[-1] if lines else "No output captured"
             card._status_lbl.setText(f"Failed: {hint}")
-            card._status_lbl.setStyleSheet(
-                f"color: {_negative_hex()};")
+            self._set_note_role(card._status_lbl, "text-negative")
+            card._bar.setRange(0, 1)
+            card._bar.setValue(1)
+            self._set_bar_state(card._bar, "failed")
             btn.setText("Enable")
             btn.setEnabled(True)
+
+    def _set_note_role(self, lbl: QLabel, role: str) -> None:
+        """Swap a label's semantic role through the stylesheet, so the
+        color follows the live theme instead of freezing inline."""
+        if lbl.objectName() == role:
+            return
+        lbl.setObjectName(role)
+        style = lbl.style()
+        style.unpolish(lbl)
+        style.polish(lbl)
+
+    def _set_bar_state(self, bar: QProgressBar, state: str) -> None:
+        """Repaint a card's track for a new state (see the QSS variants)."""
+        bar.setProperty("state", state)
+        style = bar.style()
+        style.unpolish(bar)
+        style.polish(bar)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         runner = getattr(self, "_enable_runner", None)
