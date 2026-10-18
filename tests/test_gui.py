@@ -2630,3 +2630,216 @@ class TestSourcesStateAgreement:
             assert card._enable_btn is None
         finally:
             fresh.close()
+
+
+class TestStatStripFilters:
+    """The stat strip is a filter bar: every cell counts exactly what
+    clicking it shows, on every tab that has one."""
+
+    def test_updates_cells_filter_the_list(self, window, qapp):
+        cells = window._update_stat_cards
+        assert list(cells) == ["ready", "repos", "aur", "blocked"]
+        counts = {k: int(c._value.text()) for k, c in cells.items()}
+        for key, n in counts.items():
+            cells[key].clicked.emit()
+            qapp.processEvents()
+            assert window._model.rowCount() == n, f"{key} counted {n}"
+            assert cells[key].property("active") is True
+            cells[key].clicked.emit()
+            qapp.processEvents()
+            assert window._model.rowCount() == 4
+            assert cells[key].property("active") is False
+
+    def test_clicking_the_active_cell_clears_it(self, window, qapp):
+        window._stat_aur.clicked.emit()
+        qapp.processEvents()
+        assert window._model.filter_source() == "aur"
+        window._stat_aur.clicked.emit()
+        qapp.processEvents()
+        assert window._model.filter_source() == ""
+
+    def test_tracked_strip_counts_and_filters(self, window, qapp):
+        _settle_loaders(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "konsole", "version": "1-1", "repo": "official"},
+             {"name": "aur-pkg", "version": "1-1", "repo": "aur"},
+             {"name": "cachy", "version": "1-1", "repo": "cachyos-v3"}], [])
+        qapp.processEvents()
+        cells = window._track_stat_cards
+        assert {k: c._value.text() for k, c in cells.items()} == {
+            "": "3", "official": "1", "aur": "1", "managed": "1"}
+        # The "everything" cell is a readout, not a filter: nothing is
+        # highlighted until a real filter is on.
+        assert not any(c.property("active") for c in cells.values())
+        cells["managed"].clicked.emit()
+        qapp.processEvents()
+        assert window._track_model.rowCount() == 1
+        assert window._track_model.item(0)["name"] == "cachy"
+        cells[""].clicked.emit()
+        qapp.processEvents()
+        assert window._track_model.rowCount() == 3
+
+    def test_untracked_strip_separates_flatpak_and_dependencies(
+            self, window, qapp):
+        _settle_loaders(window, qapp)
+        window._on_untracked_loaded(
+            [_row("com.discordapp.Discord", "Discord", "flatpak"),
+             _row("zen", "Zen", "manual")],
+            [_row("libfoo", "libfoo", "official")])
+        qapp.processEvents()
+        cells = window._un_stat_cards
+        assert {k: c._value.text() for k, c in cells.items()} == {
+            "": "3", "flatpak": "1", "manual": "1", "dependencies": "1"}
+        cells["flatpak"].clicked.emit()
+        qapp.processEvents()
+        assert window._unapp_model.rowCount() == 1
+        assert window._unpkg_model.rowCount() == 0
+        cells["dependencies"].clicked.emit()
+        qapp.processEvents()
+        assert window._unapp_model.rowCount() == 0
+        assert window._unpkg_model.rowCount() == 1
+        cells["dependencies"].clicked.emit()
+        qapp.processEvents()
+        assert window._unapp_model.rowCount() == 2
+
+    def test_every_strip_is_the_same_height(self, window, qapp):
+        # Thin and uniform: the strips are one row of 38px cells.
+        for cards in (window._update_stat_cards, window._track_stat_cards,
+                      window._un_stat_cards):
+            heights = {c.height() for c in cards.values()}
+            assert heights == {app._sp(38)}, heights
+
+    def test_filtering_moves_nothing(self, window, qapp):
+        # The UI law: a filter changes what is listed, never the frame.
+        before = (window._stats_row.height(), window._list_header.height(),
+                  window._list.height())
+        window._stat_aur.clicked.emit()
+        qapp.processEvents()
+        after = (window._stats_row.height(), window._list_header.height(),
+                 window._list.height())
+        assert after == before
+
+
+def _settle_loaders(window, qapp):
+    """Let the window's real background loaders finish first: their
+    (empty) results arrive after a staged one and would replace it."""
+    for attr in ("_obs_checker", "_track_loader", "_untracked_loader"):
+        thread = getattr(window, attr, None)
+        if thread is not None:
+            thread.wait(25000)
+    qapp.processEvents()
+    qapp.processEvents()
+
+
+def _row(name, title, repo):
+    return {"name": name, "title": title, "version": "1", "repo": repo,
+            "target": "", "source": "", "relation": "", "state": "idle",
+            "failed_op": "", "desktop": None, "desc": "", "checked": False}
+
+
+class TestFlatpakRows:
+    """Flatpak apps are a source you can see, filter and remove."""
+
+    def test_flatpak_launchers_become_flatpak_rows(self, monkeypatch,
+                                                   tmp_path):
+        exports = tmp_path / "exports"
+        exports.mkdir()
+        (exports / "com.discordapp.Discord.desktop").write_text(
+            "[Desktop Entry]\nName=Discord\nExec=/usr/bin/flatpak run "
+            "com.discordapp.Discord\nType=Application\n")
+        (exports / "zen.desktop").write_text(
+            "[Desktop Entry]\nName=Zen\nExec=/usr/bin/zen\nType=Application\n")
+        monkeypatch.setattr(app, "_flatpak_export_dirs", lambda: [str(exports)])
+        monkeypatch.setattr(app, "scan_desktop_files",
+                            lambda dirs=None: [
+                                {"file": str(exports /
+                                             "com.discordapp.Discord.desktop"),
+                                 "title": "Discord", "comment": "Chat",
+                                 "exec": "/usr/bin/flatpak run "
+                                         "com.discordapp.Discord"},
+                                {"file": str(exports / "zen.desktop"),
+                                 "title": "Zen", "comment": "",
+                                 "exec": "/usr/bin/zen"}])
+        monkeypatch.setattr(app, "_flatpak_apps",
+                            lambda: {"com.discordapp.Discord":
+                                     ("1.0.151", "system")})
+        rows = app.UntrackedLoader()._load_apps()
+        by_name = {r["name"]: r for r in rows}
+        assert by_name["com.discordapp.Discord"]["repo"] == "flatpak"
+        assert by_name["com.discordapp.Discord"]["version"] == "1.0.151"
+        assert by_name["com.discordapp.Discord"]["title"] == "Discord"
+        assert by_name["zen"]["repo"] == "manual"
+
+    def test_uninstalling_a_flatpak_row_uses_flatpak(self, window, qapp,
+                                                     monkeypatch):
+        started = []
+
+        class FakeFlatpak(QObject):
+            line = pyqtSignal(str)
+            done = pyqtSignal(bool, str)
+
+            def __init__(self, ids, installs=None):
+                super().__init__()
+                started.append(list(ids))
+                self.ids = list(ids)
+
+            def isRunning(self):
+                return False
+
+            def wait(self, ms=0):
+                return True
+
+            def start(self):
+                pass
+
+            def terminate(self):
+                pass
+
+        monkeypatch.setattr(app, "FlatpakRemover", FakeFlatpak)
+        monkeypatch.setattr(app, "_flatpak_apps",
+                            lambda: {"com.discordapp.Discord":
+                                     ("1.0.151", "system")})
+        _accept_box(monkeypatch, "Remove")
+        _settle_loaders(window, qapp)
+        window._on_untracked_loaded(
+            [_row("com.discordapp.Discord", "Discord", "flatpak")], [])
+        qapp.processEvents()
+
+        window._request_untracked_uninstall("com.discordapp.Discord")
+
+        assert started == [["com.discordapp.Discord"]]
+        assert window._un_kind == "flatpak"
+
+    def test_a_gone_flatpak_app_is_removed_from_the_list(self, window, qapp,
+                                                         monkeypatch):
+        class FakeFlatpak(QObject):
+            line = pyqtSignal(str)
+            done = pyqtSignal(bool, str)
+
+            def __init__(self, ids, installs=None):
+                super().__init__()
+
+            def isRunning(self):
+                return False
+
+            def wait(self, ms=0):
+                return True
+
+            def start(self):
+                pass
+
+            def terminate(self):
+                pass
+
+        monkeypatch.setattr(app, "FlatpakRemover", FakeFlatpak)
+        monkeypatch.setattr(app, "_flatpak_apps", lambda: {})
+        _accept_box(monkeypatch, "Remove")
+        _settle_loaders(window, qapp)
+        window._on_untracked_loaded(
+            [_row("com.discordapp.Discord", "Discord", "flatpak")], [])
+        qapp.processEvents()
+        window._request_untracked_uninstall("com.discordapp.Discord")
+        window._untracked_uninstaller.done.emit(True, "uninstalled")
+
+        assert window._unapp_model.row_of("com.discordapp.Discord") is None
+        assert "uninstalled" in window._sub.text()

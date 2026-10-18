@@ -693,3 +693,112 @@ class TestPacmanLock:
         kind, _t, _a = app.classify_update_failure(
             "error: failed to commit transaction (conflicting files)")
         assert kind != "busy"
+
+
+class TestSourceKeys:
+    """One vocabulary for where a package came from."""
+
+    def test_official_repos_and_the_pseudo_name(self):
+        for repo in ("official", "core", "extra", "multilib",
+                     "core-testing", "kde-unstable"):
+            assert app._source_key(repo) == app.SRC_OFFICIAL
+            assert app._repo_kind(repo) == "official"
+
+    def test_aur_and_managed_repos(self):
+        assert app._source_key("aur") == app.SRC_AUR
+        for repo in ("cachyos-v3", "chaotic-aur", "archlinuxcn"):
+            assert app._source_key(repo) == app.SRC_MANAGED
+            assert app._repo_kind(repo) == "managed"
+
+    def test_flatpak_and_manual_are_sources_of_their_own(self):
+        assert app._source_key("flatpak") == app.SRC_FLATPAK
+        assert app._source_key("") == app.SRC_MANUAL
+        assert app._source_label("flatpak") == "flatpak"
+        assert app._source_label("cachyos-v3") == "third-party"
+
+    def test_every_source_has_a_badge_colour(self):
+        for repo in ("official", "aur", "flatpak", "", "cachyos-v3",
+                     "extra-testing"):
+            rgb, fg = app._repo_tint(repo)
+            assert len(rgb) == 3 and fg.startswith("#")
+
+
+class TestFlatpakDetection:
+    """A Flatpak app must be recognisable from its launcher."""
+
+    def test_launcher_in_an_exports_dir_is_flatpak(self, tmp_path,
+                                                   monkeypatch):
+        monkeypatch.setattr(app, "_flatpak_export_dirs",
+                            lambda: [str(tmp_path)])
+        path = tmp_path / "com.discordapp.Discord.desktop"
+        path.write_text("[Desktop Entry]\nName=Discord\n")
+        assert app._flatpak_app_id(str(path)) == "com.discordapp.Discord"
+
+    def test_a_normal_launcher_is_not_flatpak(self):
+        assert app._flatpak_app_id("/usr/share/applications/zen.desktop") == ""
+
+    def test_exec_that_runs_through_flatpak_gives_the_app_id(self):
+        exec_line = ("/usr/bin/flatpak run --branch=stable --arch=x86_64 "
+                     "--command=ticktick --file-forwarding "
+                     "com.ticktick.TickTick @@u %U @@")
+        assert app._flatpak_exec_id(exec_line) == "com.ticktick.TickTick"
+        assert app._flatpak_exec_id("/usr/bin/zen %u") == ""
+        assert app._flatpak_exec_id("") == ""
+
+    def test_the_exports_dir_wins_over_the_exec(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(app, "_flatpak_export_dirs",
+                            lambda: [str(tmp_path)])
+        path = tmp_path / "org.openshot.OpenShot.desktop"
+        path.write_text("[Desktop Entry]\nName=OpenShot\n")
+        app_row = {"file": str(path),
+                   "exec": "/usr/bin/flatpak run com.ticktick.TickTick"}
+        assert app._flatpak_id_for(app_row) == "org.openshot.OpenShot"
+
+    def test_flatpak_apps_parses_the_list(self, monkeypatch):
+        class R:
+            stdout = ("com.discordapp.Discord\t1.0.151\tsystem\n"
+                      "com.ticktick.TickTick\t8.0.20\tuser\n"
+                      "broken line\n")
+
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/flatpak")
+        monkeypatch.setattr(app, "_run", lambda *a, **k: R())
+        apps = app._flatpak_apps()
+        assert apps["com.discordapp.Discord"] == ("1.0.151", "system")
+        assert apps["com.ticktick.TickTick"] == ("8.0.20", "user")
+
+    def test_no_flatpak_binary_means_no_flatpak_source(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: None)
+        assert app._flatpak_apps() == {}
+
+
+class TestFlatpakRemoverCommands:
+    """Flatpak is not pacman: no -Rns, and only system apps need root."""
+
+    def test_user_apps_run_without_sudo(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/sudo")
+        r = app.FlatpakRemover(["com.ticktick.TickTick"],
+                               {"com.ticktick.TickTick": "user"})
+        assert r._batches == [
+            ["flatpak", "uninstall", "--noninteractive", "--assumeyes",
+             "--user", "com.ticktick.TickTick"]]
+        assert r._askpass is None
+
+    def test_system_apps_run_under_sudo_with_askpass(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/sudo")
+        r = app.FlatpakRemover(["com.discordapp.Discord"],
+                               {"com.discordapp.Discord": "system"})
+        assert r._batches[0][:3] == ["sudo", "-A", "flatpak"]
+        assert "--system" in r._batches[0]
+        assert r._askpass is not None
+        r._cleanup()
+        assert r._askpass is None
+
+    def test_a_mixed_selection_runs_the_user_batch_first(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/sudo")
+        r = app.FlatpakRemover(
+            ["com.discordapp.Discord", "com.ticktick.TickTick"],
+            {"com.ticktick.TickTick": "user"})
+        assert len(r._batches) == 2
+        assert "--user" in r._batches[0]
+        assert "--system" in r._batches[1]
+        r._cleanup()

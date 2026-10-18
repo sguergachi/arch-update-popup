@@ -64,6 +64,42 @@ OFFICIAL_REPOS = {
     "gnome-unstable", "kde-unstable",
 }
 
+# ── Sources ──────────────────────────────────────────────────────────────
+# One vocabulary for "where did this come from", shared by the badges, the
+# stat-strip filters and the source panel, so Flatpak and the managed repos
+# are as recognisable as official and AUR.
+SRC_OFFICIAL = "official"
+SRC_AUR = "aur"
+SRC_FLATPAK = "flatpak"
+SRC_MANUAL = "manual"        # on disk, owned by no package manager
+SRC_MANAGED = "managed"      # a third-party pacman repo (cachyos, …)
+
+_SOURCE_META: dict[str, tuple[str, str]] = {
+    # key → (label, filter-card caption)
+    SRC_OFFICIAL: ("official", "official"),
+    SRC_AUR: ("aur", "aur"),
+    SRC_FLATPAK: ("flatpak", "flatpak"),
+    SRC_MANUAL: ("manual install", "manual"),
+    SRC_MANAGED: ("third-party", "third-party"),
+}
+
+
+def _source_key(repo: str) -> str:
+    """Canonical source key for a repo name or a pseudo-source."""
+    r = (repo or "").lower()
+    if not r:
+        return SRC_MANUAL
+    if r in (SRC_FLATPAK, SRC_MANUAL, SRC_AUR, SRC_OFFICIAL):
+        return r
+    if r in OFFICIAL_REPOS:
+        return SRC_OFFICIAL
+    return SRC_MANAGED
+
+
+def _source_label(repo: str) -> str:
+    """Human name for a source, for a tooltip or a filter caption."""
+    return _SOURCE_META[_source_key(repo)][0]
+
 
 # Where a package can live instead of the AUR, and what backs each one.
 # This app never edits pacman.conf — it reports what is enabled and what
@@ -178,7 +214,7 @@ def pacman_lock_held() -> bool:
 
 def _repo_kind(repo: str) -> str:
     """'official', or 'managed' for a third-party binary source."""
-    return "official" if (repo or "").lower() in OFFICIAL_REPOS else "managed"
+    return ("official" if _source_key(repo) == SRC_OFFICIAL else "managed")
 
 
 def _repo_label(repo: str) -> str:
@@ -1701,6 +1737,77 @@ class TrackedEnricher(QThread):
         return ""
 
 
+def _flatpak_export_dirs() -> list[str]:
+    """Where Flatpak puts the launchers of its installed apps."""
+    home = os.path.expanduser("~")
+    return ["/var/lib/flatpak/exports/share/applications",
+            os.path.join(home, ".local/share/flatpak/exports/share/"
+                               "applications")]
+
+
+def _flatpak_app_id(path: str) -> str:
+    """The Flatpak application id for a launcher in an exports dir.
+
+    Flatpak names its desktop files after the app id, which is also what
+    `flatpak uninstall` takes — so the id is both the row's identity and
+    the removal target. '' when the file isn't a Flatpak launcher.
+    """
+    folder = os.path.abspath(os.path.dirname(path))
+    for root in _flatpak_export_dirs():
+        if folder == os.path.abspath(root):
+            return os.path.splitext(os.path.basename(path))[0]
+    return ""
+
+
+def _flatpak_exec_id(exec_line: str) -> str:
+    """The Flatpak app id from an Exec that launches through Flatpak.
+
+    A hand-made launcher for a Flatpak app (or a second copy of one) is
+    still that Flatpak app: `flatpak run --branch=stable … <app id>`.
+    """
+    try:
+        parts = shlex.split(exec_line or "")
+    except ValueError:
+        parts = (exec_line or "").split()
+    if not parts or os.path.basename(parts[0]) not in ("flatpak",
+                                                       "flatpak-run"):
+        return ""
+    if "run" not in parts:
+        return ""
+    for part in parts[parts.index("run") + 1:]:
+        if not part.startswith("-"):
+            return part
+    return ""
+
+
+def _flatpak_id_for(app: dict) -> str:
+    """The Flatpak app id for a scanned launcher, or ''."""
+    return _flatpak_app_id(app["file"]) or _flatpak_exec_id(app.get("exec", ""))
+
+
+def _flatpak_apps() -> dict[str, tuple[str, str]]:
+    """{application id: (version, installation)} for installed apps.
+
+    One local `flatpak list` — no network. Empty when Flatpak isn't
+    installed or the call fails, so a machine without Flatpak simply
+    never reports a Flatpak source.
+    """
+    if not shutil.which("flatpak"):
+        return {}
+    try:
+        res = _run(["flatpak", "list", "--app",
+                    "--columns=application,version,installation"],
+                   capture_output=True, text=True, timeout=20)
+    except Exception:
+        return {}
+    apps: dict[str, tuple[str, str]] = {}
+    for line in (res.stdout or "").splitlines():
+        parts = [p.strip() for p in line.split("\t")]
+        if len(parts) >= 3 and parts[0]:
+            apps[parts[0]] = (parts[1], parts[2].lower())
+    return apps
+
+
 def scan_desktop_files(dirs: list[str] | None = None) -> list[dict]:
     """Find installed GUI applications by searching .desktop files.
 
@@ -1798,6 +1905,122 @@ def _tracked_row(name: str, version: str, repo: str, title: str = "",
             "desktop": desktop or None, "desc": desc, "checked": False}
 
 
+class FlatpakRemover(QThread):
+    """Uninstalls Flatpak apps, streaming the output.
+
+    Flatpak is not pacman: there is no database lock to wait for and no
+    `-Rns`. System installs need root (we use the same `sudo -A` askpass
+    as everywhere else, because no polkit agent runs in this session);
+    user installs must *not* be run as root.
+    """
+
+    line = pyqtSignal(str)
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, app_ids: list[str],
+                 installations: dict[str, str] | None = None) -> None:
+        super().__init__()
+        self._proc: subprocess.Popen | None = None
+        self._killed = False
+        installs = installations or {}
+        user = [a for a in app_ids if installs.get(a, "system") == "user"]
+        system = [a for a in app_ids if a not in user]
+        base = ["flatpak", "uninstall", "--noninteractive", "--assumeyes"]
+        self._batches: list[list[str]] = []
+        if user:
+            self._batches.append([*base, "--user", *user])
+        if system:
+            self._askpass = (make_askpass_script(
+                "Enter sudo password to remove Flatpak apps:")
+                if shutil.which("sudo") else None)
+            prefix = (["sudo", "-A"] if self._askpass else ["pkexec"])
+            self._batches.append([*prefix, *base, "--system", *system])
+        else:
+            self._askpass = None
+
+    def _child_env(self) -> dict:
+        env = os.environ.copy()
+        if self._askpass:
+            env["SUDO_ASKPASS"] = self._askpass
+        return env
+
+    def _cleanup(self) -> None:
+        if self._askpass:
+            try:
+                os.unlink(self._askpass)
+            except OSError:
+                pass
+            self._askpass = None
+
+    def run(self) -> None:
+        lines: list[str] = []
+        ok = True
+        try:
+            for cmd in self._batches:
+                if self._killed:
+                    ok = False
+                    break
+                ok = self._run_one(cmd, lines) and ok
+        finally:
+            self._cleanup()
+        self.done.emit(ok and not self._killed, "\n".join(lines[-40:]))
+
+    def _run_one(self, cmd: list[str], lines: list[str]) -> bool:
+        env = self._child_env()
+        master_fd, slave_fd = pty.openpty()
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=slave_fd, stderr=slave_fd,
+                stdin=subprocess.DEVNULL, env=env, close_fds=True)
+        except FileNotFoundError as e:
+            os.close(master_fd)
+            os.close(slave_fd)
+            lines.append(str(e))
+            return False
+        os.close(slave_fd)
+        self._proc = proc
+        if self._killed:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        buf = ""
+        while True:
+            try:
+                ready, _, _ = select.select([master_fd], [], [], 0.05)
+            except (OSError, ValueError):
+                break
+            if ready:
+                try:
+                    buf += os.read(master_fd, 4096).decode(errors="replace")
+                except OSError:
+                    break
+                while "\n" in buf:
+                    raw, buf = buf.split("\n", 1)
+                    for fragment in raw.split("\r"):
+                        fragment = _ANSI_RE.sub("", fragment).strip()
+                        if fragment:
+                            lines.append(fragment)
+                            self.line.emit(fragment)
+            elif proc.poll() is not None:
+                break
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        proc.wait()
+        return proc.returncode == 0
+
+    def terminate(self) -> None:  # type: ignore[override]
+        self._killed = True
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
 class UntrackedLoader(QThread):
     """Finds untracked software in the background.
 
@@ -1819,8 +2042,9 @@ class UntrackedLoader(QThread):
 
     def _load_apps(self) -> list[dict]:
         found = scan_desktop_files()
+        flat = _flatpak_apps()
         owners: dict[str, tuple[str | None, str]] = {}
-        files = [a["file"] for a in found]
+        files = [a["file"] for a in found if not _flatpak_id_for(a)]
         if files and not self.isInterruptionRequested():
             # pacman prints owned lines even when it exits nonzero over
             # unowned files — always parse stdout, then resolve only the
@@ -1854,6 +2078,22 @@ class UntrackedLoader(QThread):
         seen: set[tuple[str, str]] = set()
         explicit = _explicit_package_set()
         for a in found:
+            # Flatpak first: its launchers are owned by Flatpak, not by any
+            # pacman package, and the app id is the removal target.
+            app_id = _flatpak_id_for(a)
+            if app_id and app_id in flat:
+                version, _install = flat[app_id]
+                launchable = (a["exec"] and _desktop_launchable(a["file"]))
+                row = _tracked_row(
+                    app_id, version, SRC_FLATPAK,
+                    title=a["title"],
+                    desktop=a["file"] if launchable else "",
+                    desc=a["comment"])
+                key = ((row["title"] or row["name"]).lower(), a["exec"])
+                if key not in seen:
+                    seen.add(key)
+                    rows.append(row)
+                continue
             owner, ver = owners.get(a["file"], (None, ""))
             if owner:
                 # Genuinely untracked means "not in your explicit set":
@@ -1868,7 +2108,7 @@ class UntrackedLoader(QThread):
                 # desktop filename; uninstall is unavailable.
                 name = os.path.splitext(os.path.basename(a["file"]))[0]
                 version = ""
-            repo = ""
+                repo = SRC_MANUAL
             if owner:
                 repo = "aur" if name in foreign else "official"
             launchable = (a["exec"] and _desktop_launchable(a["file"]))
@@ -2543,6 +2783,16 @@ QWidget#stat-card {
     background: %(surface)s; border: 1px solid %(border)s;
     border-radius: %(radius)spx;
 }
+/* A stat cell doubles as a filter: hovering says so, and the active one
+   keeps its box exactly while its border and tint change. */
+QWidget#stat-card[filterable="true"]:hover {
+    border-color: %(accent)s;
+}
+QWidget#stat-card[active="true"] {
+    border-color: %(accent)s;
+    background: %(accent_soft)s;
+}
+QWidget#stat-card[active="true"] QLabel#stat-caption { color: palette(text); }
 QLabel#stat-value { font-size: %(stat)spx; font-weight: 600; }
 QLabel#stat-caption {
     font-size: %(eyebrow)spx; font-weight: 700; color: %(muted)s;
@@ -2853,9 +3103,14 @@ def _badge(text: str, tint: str) -> QLabel:
 
 def _repo_tint_key(repo: str) -> str:
     """Badge tint name for a repo (see the repo-badge QSS variants)."""
-    r = (repo or "").lower()
-    if r == "aur":
+    key = _source_key(repo)
+    if key == SRC_AUR:
         return "warning"
+    if key == SRC_FLATPAK:
+        return "positive"
+    if key == SRC_MANUAL:
+        return "muted"
+    r = (repo or "").lower()
     if "testing" in r:
         return "visited"
     return "accent"
@@ -2865,16 +3120,21 @@ def _repo_tint(repo: str) -> tuple[tuple[int, int, int], str]:
     """(rgb, foreground hex) pill colors per repo, readable both themes.
 
     Colors come from the active scheme: AUR is the desktop's neutral/warning
-    hue, testing its visited/purple, official the accent. Callers choose the
+    hue, testing its visited/purple, Flatpak its positive/green, a manual
+    install the muted foreground, official the accent. Callers choose the
     format — stylesheets take CSS rgba(), QPainter takes QColor(*rgb, alpha).
     """
     r = (repo or "").lower()
+    key = _source_key(repo)
     hexes = {
-        "aur": _warning_hex(),
-        "testing": _visited_hex(),
-        "official": _accent_hex(),
+        SRC_AUR: _warning_hex(),
+        SRC_FLATPAK: _positive_hex(),
+        SRC_MANUAL: _secondary_hex(),
+        SRC_OFFICIAL: _accent_hex(),
+        SRC_MANAGED: _accent_hex(),
     }
-    key = "aur" if r == "aur" else ("testing" if "testing" in r else "official")
+    if "testing" in r:
+        hexes[key] = _visited_hex()
     c = QColor(hexes[key])
     return (c.red(), c.green(), c.blue()), hexes[key]
 
@@ -3246,21 +3506,32 @@ class _StatCard(QWidget):
     """One cell of the stat strip: a big number, then its caption.
 
     Every cell is the same fixed height so the strip reads as one even
-    row of the grid no matter how long a caption is.
+    row of the grid no matter how long a caption is. Cells that stand for
+    a subset of the list are clickable filters: the active one is
+    highlighted, and nothing moves when it changes (same box, new border).
     """
 
-    def __init__(self, value: str, caption: str, accent: str) -> None:
+    clicked = pyqtSignal()
+
+    def __init__(self, value: str, caption: str, accent: str,
+                 filterable: bool = True) -> None:
         super().__init__()
         self.setObjectName("stat-card")
         # Plain QWidgets don't paint QSS backgrounds/borders without this.
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setFixedHeight(_sp(52))
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, filterable)
+        self.setFixedHeight(_sp(38))
         # A fixed column width keeps the strip a real grid: the numbers
         # stay grouped instead of drifting apart across a wide window.
         self.setMaximumWidth(_sp(280))
+        self.setProperty("active", False)
+        self.setProperty("filterable", filterable)
+        self._filterable = filterable
+        if filterable:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(_sp(16), 0, _sp(16), 0)
-        lay.setSpacing(_sp(10))
+        lay.setContentsMargins(_sp(14), 0, _sp(14), 0)
+        lay.setSpacing(_sp(8))
         self._value = QLabel(value)
         self._value.setObjectName("stat-value")
         self._value.setStyleSheet(f"color: {accent};")
@@ -3284,6 +3555,45 @@ class _StatCard(QWidget):
 
     def set_accent(self, color: str) -> None:
         self._value.setStyleSheet(f"color: {color};")
+
+    def set_active(self, active: bool) -> None:
+        """Highlight this cell as the filter in force (no geometry change)."""
+        active = bool(active)
+        if self.property("active") == active:
+            return
+        self.setProperty("active", active)
+        style = self.style()
+        style.unpolish(self)
+        style.polish(self)
+
+    def set_filterable(self, on: bool) -> None:
+        """A cell with nothing behind it stays a readout, not a button."""
+        on = bool(on)
+        self.setProperty("filterable", on)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, on)
+        self.setCursor(Qt.CursorShape.PointingHandCursor if on
+                       else Qt.CursorShape.ArrowCursor)
+        style = self.style()
+        style.unpolish(self)
+        style.polish(self)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if (self._filterable and event.button() == Qt.MouseButton.LeftButton
+                and self.rect().contains(event.position().toPoint())):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
+def _stat_strip(cards: list[_StatCard]) -> QWidget:
+    """One row of stat cells: equal widths, honest whitespace after."""
+    row = QWidget()
+    lay = QHBoxLayout(row)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(_sp(8))
+    for card in cards:
+        lay.addWidget(card, 1)
+    lay.addStretch()
+    return row
 
 
 class _ClickableLabel(QLabel):
@@ -3326,6 +3636,7 @@ class _FilterableModel:
 
     def _init_filter(self) -> None:
         self._filter = ""
+        self._source = ""        # "" = every source
         self._visible = list(range(len(self._items)))
 
     # — Mapping —
@@ -3335,12 +3646,25 @@ class _FilterableModel:
     def filter_text(self) -> str:
         return self._filter
 
+    def filter_source(self) -> str:
+        return self._source
+
     def _matches(self, item: dict) -> bool:
+        if self._source and not self._source_match(item, self._source):
+            return False
         if not self._filter:
             return True
         hay = " ".join(str(item.get(key) or "") for key in
                        ("name", "title", "desc", "notes", "repo")).lower()
         return self._filter in hay
+
+    def _item_source(self, item: dict) -> str:
+        """Source key for one row — models with their own idea override."""
+        return _source_key(item.get("repo", ""))
+
+    def _source_match(self, item: dict, key: str) -> bool:
+        """Does `item` belong to filter key `key`? Overridable."""
+        return self._item_source(item) == key
 
     def set_filter(self, text: str) -> bool:
         """Apply a filter; True when the visible set actually changed."""
@@ -3348,11 +3672,30 @@ class _FilterableModel:
         if needle == self._filter:
             return False
         self._filter = needle
+        self._refilter()
+        return True
+
+    def set_source_filter(self, source: str) -> bool:
+        """Show one source only ('' clears it). True when it changed."""
+        if source == self._source:
+            return False
+        self._source = source
+        self._refilter()
+        return True
+
+    def _refilter(self) -> None:
         self.beginResetModel()
         self._visible = [i for i, it in enumerate(self._items)
                          if self._matches(it)]
         self.endResetModel()
-        return True
+
+    def source_counts(self) -> dict[str, int]:
+        """{source key: rows} across the whole list, filter or no filter."""
+        counts: dict[str, int] = {}
+        for it in self._items:
+            key = self._item_source(it)
+            counts[key] = counts.get(key, 0) + 1
+        return counts
 
     def row_of(self, name: str) -> int | None:
         for row, src in enumerate(self._visible):
@@ -3391,6 +3734,20 @@ class _ViewResizeHook(QObject):
 
 class PackageModel(_FilterableModel, QAbstractListModel):
     """One dict per package; check state lives in Qt.CheckStateRole."""
+
+    def _item_source(self, item: dict) -> str:
+        """A compromised package answers to BLOCKED, not to its repo: the
+        stat strip counts what will actually be installed."""
+        if item.get("compromised"):
+            return "blocked"
+        return _source_key(item.get("repo", ""))
+
+    def _source_match(self, item: dict, key: str) -> bool:
+        if key == "ready":
+            return not item.get("compromised")
+        if key == "repos":
+            return self._item_source(item) in (SRC_OFFICIAL, SRC_MANAGED)
+        return self._item_source(item) == key
 
     def __init__(self, updates: list[dict], cached: dict) -> None:
         super().__init__()
@@ -4032,10 +4389,18 @@ class PackageDelegate(QStyledItemDelegate):
 class TrackedModel(_FilterableModel, QAbstractListModel):
     """One dict per explicitly installed package."""
 
-    def __init__(self) -> None:
+    def __init__(self, own_source: str = "") -> None:
         super().__init__()
         self._items: list[dict] = []
+        # A list that is itself one source (the dependency packages in the
+        # Untracked tab) answers to that source, not to each row's repo.
+        self._own_source = own_source
         self._init_filter()
+
+    def _item_source(self, item: dict) -> str:
+        if self._own_source:
+            return self._own_source
+        return _source_key(item.get("repo", ""))
 
     def set_packages(self, installed: list[dict],
                      moves: list[dict]) -> None:
@@ -4888,21 +5253,38 @@ class UpdateWindow(QMainWindow):
         stats = QHBoxLayout(self._stats_row)
         stats.setContentsMargins(0, 0, 0, 0)
         stats.setSpacing(_sp(8))
-        n_aur = sum(1 for p in updates if p.get("repo") == "aur")
-        n_off = n - n_aur
         n_comp = sum(1 for p in updates if p.get("compromised"))
+        n_repos = sum(1 for p in updates if not p.get("compromised")
+                      and _source_key(p.get("repo", ""))
+                      in (SRC_OFFICIAL, SRC_MANAGED))
+        n_aur = sum(1 for p in updates if not p.get("compromised")
+                    and _source_key(p.get("repo", "")) == SRC_AUR)
         self._stat_ready = _StatCard(str(n - n_comp), "ready to install",
                                      _positive_hex())
-        self._stat_official = _StatCard(str(n_off), "official", _accent_hex())
+        self._stat_official = _StatCard(str(n_repos), "from repos",
+                                        _accent_hex())
         self._stat_aur = _StatCard(str(n_aur), "aur", _warning_hex())
-        stats.addWidget(self._stat_ready, 1)
-        stats.addWidget(self._stat_official, 1)
-        stats.addWidget(self._stat_aur, 1)
         # Always four cells: adding one later would resize the other three.
         self._stat_blocked = _StatCard(str(n_comp), "blocked · skipped",
                                        _negative_hex() if n_comp
                                        else _secondary_hex())
-        stats.addWidget(self._stat_blocked, 1)
+        self._update_stat_cards = {
+            "ready": self._stat_ready,
+            "repos": self._stat_official,
+            SRC_AUR: self._stat_aur,
+            "blocked": self._stat_blocked,
+        }
+        self._stat_official.setToolTip(
+            "Show packages from pacman repositories — official, CachyOS, "
+            "Chaotic-AUR, archlinuxcn")
+        self._stat_ready.setToolTip(
+            "Show every package that can be installed")
+        for key, card in self._update_stat_cards.items():
+            card.clicked.connect(
+                lambda _=False, k=key: self._toggle_update_filter(k))
+        for card in (self._stat_ready, self._stat_official,
+                     self._stat_aur, self._stat_blocked):
+            stats.addWidget(card, 1)
         # Left-aligned grid: any leftover width is honest whitespace, not
         # a stretched empty card.
         stats.addStretch()
@@ -5260,6 +5642,26 @@ class UpdateWindow(QMainWindow):
         self._track_summary = QLabel("Loading tracked packages…")
         self._track_summary.setObjectName("meta")
         tr.addWidget(self._track_summary)
+        # Source strip: what the installed set is made of, and the filter
+        # for it (see AGENTS.md — the strip never moves between states).
+        self._stat_track_all = _StatCard("0", "installed", _accent_hex())
+        self._stat_track_off = _StatCard("0", "official", _accent_hex())
+        self._stat_track_aur = _StatCard("0", "aur", _warning_hex())
+        self._stat_track_managed = _StatCard("0", "third-party",
+                                             _secondary_hex())
+        self._track_stat_cards = {
+            "": self._stat_track_all,
+            SRC_OFFICIAL: self._stat_track_off,
+            SRC_AUR: self._stat_track_aur,
+            SRC_MANAGED: self._stat_track_managed,
+        }
+        for key, card in self._track_stat_cards.items():
+            card.setToolTip(
+                "Show every installed package" if key == ""
+                else f"Show only {card._caption.text().lower()} packages")
+            card.clicked.connect(
+                lambda _=False, k=key: self._toggle_track_filter(k))
+        tr.addWidget(_stat_strip(list(self._track_stat_cards.values())))
         self._track_header = _ListHeader("Filter installed packages…")
         self._track_header.select_all.connect(self._select_tracked_all)
         self._track_header.filter_changed.connect(
@@ -5375,6 +5777,25 @@ class UpdateWindow(QMainWindow):
         un = QVBoxLayout(self._un_page)
         un.setContentsMargins(0, 0, 0, 0)
         un.setSpacing(_sp(16))
+        # Source strip for the untracked page: what is here and where it
+        # came from. One click narrows both lists; clicking again clears.
+        self._stat_un_all = _StatCard("0", "untracked", _accent_hex())
+        self._stat_un_flatpak = _StatCard("0", "flatpak", _positive_hex())
+        self._stat_un_manual = _StatCard("0", "manual", _secondary_hex())
+        self._stat_un_deps = _StatCard("0", "dependencies", _warning_hex())
+        self._un_stat_cards = {
+            "": self._stat_un_all,
+            SRC_FLATPAK: self._stat_un_flatpak,
+            SRC_MANUAL: self._stat_un_manual,
+            "dependencies": self._stat_un_deps,
+        }
+        for key, card in self._un_stat_cards.items():
+            card.setToolTip(
+                "Show everything pacman doesn't track" if key == ""
+                else f"Show only {card._caption.text().lower()}")
+            card.clicked.connect(
+                lambda _=False, k=key: self._toggle_un_filter(k))
+        un.addWidget(_stat_strip(list(self._un_stat_cards.values())))
         self._un_header = _ListHeader("", with_search=False)
         self._un_header.select_all.connect(self._select_untracked_all)
         self._un_sel_label = self._un_header.count
@@ -5390,7 +5811,7 @@ class UpdateWindow(QMainWindow):
         self._unapp_label.setObjectName("eyebrow")
         un.addWidget(self._unapp_label)
         un.addWidget(self._unapp_view, 3)
-        self._unpkg_model = TrackedModel()
+        self._unpkg_model = TrackedModel(own_source="dependencies")
         self._unpkg_view, self._unpkg_delegate = self._make_card_list(
             self._unpkg_model)
         self._unpkg_empty = _placeholder_overlay(self._unpkg_view)
@@ -5403,6 +5824,13 @@ class UpdateWindow(QMainWindow):
         self._untracked_loader: UntrackedLoader | None = None
         self._untracked_uninstaller: ObsoleteRemover | None = None
         self._untracked_uninstall_names: list[str] = []
+        self._un_batch: list[str] = []      # the batch a remover is on
+        self._un_pending: list[str] = []    # the batch waiting its turn
+        self._un_kind: str = "pacman"       # which remover is running
+        # Results of the whole selection, across batches.
+        self._un_gone: list[str] = []
+        self._un_failed: list[str] = []
+        self._un_outputs: list[str] = []
 
         self._foot_untracked = QWidget()
         fu = QHBoxLayout(self._foot_untracked)
@@ -5621,6 +6049,83 @@ class UpdateWindow(QMainWindow):
         self._track_delegate.invalidate()
         self._refresh_tracked_summary()
 
+    # — Stat-strip filters: click a cell to filter, click it again to clear —
+    def _toggle_update_filter(self, key: str) -> None:
+        cur = self._model.filter_source()
+        if not self._model.set_source_filter("" if cur == key else key):
+            return
+        self._delegate.invalidate()
+        self._refresh_empty_state()
+        self._refresh_selection_ui()
+        self._refresh_stat_active()
+        self._note_activity()
+
+    def _refresh_stat_active(self) -> None:
+        """Mark the cell whose filter is in force. No geometry change."""
+        cur = self._model.filter_source()
+        for key, card in self._update_stat_cards.items():
+            card.set_active(key == cur)
+
+    def _refresh_update_stats(self) -> None:
+        """Recount the four cells from the keys their filters use, so a
+        cell always counts exactly what clicking it would show."""
+        counts = self._model.source_counts()
+        blocked = counts.get("blocked", 0)
+        repos = counts.get(SRC_OFFICIAL, 0) + counts.get(SRC_MANAGED, 0)
+        self._stat_ready.set_value(str(max(len(self._updates) - blocked, 0)))
+        self._stat_official.set_value(str(repos))
+        self._stat_aur.set_value(str(counts.get(SRC_AUR, 0)))
+        self._stat_blocked.set_value(str(blocked))
+        self._stat_blocked.set_accent(_negative_hex() if blocked
+                                      else _secondary_hex())
+        self._refresh_stat_active()
+
+    def _toggle_track_filter(self, key: str) -> None:
+        cur = self._track_model.filter_source()
+        if not self._track_model.set_source_filter("" if cur == key else key):
+            return
+        self._track_delegate.invalidate()
+        self._refresh_tracked_summary()
+        self._refresh_track_stats()
+
+    def _refresh_track_stats(self) -> None:
+        """Counts per source, and which cell is filtering."""
+        counts = self._track_model.source_counts()
+        self._stat_track_all.set_value(str(sum(counts.values())))
+        self._stat_track_off.set_value(str(counts.get(SRC_OFFICIAL, 0)))
+        self._stat_track_aur.set_value(str(counts.get(SRC_AUR, 0)))
+        managed = sum(n for k, n in counts.items()
+                      if k not in (SRC_OFFICIAL, SRC_AUR))
+        self._stat_track_managed.set_value(str(managed))
+        cur = self._track_model.filter_source()
+        for key, card in self._track_stat_cards.items():
+            card.set_active(bool(key) and key == cur)
+
+    def _toggle_un_filter(self, key: str) -> None:
+        """One source filter for both untracked lists at once."""
+        cur = self._unapp_model.filter_source()
+        new = "" if cur == key else key
+        changed = self._unapp_model.set_source_filter(new)
+        changed = self._unpkg_model.set_source_filter(new) or changed
+        if not changed:
+            return
+        self._unapp_delegate.invalidate()
+        self._unpkg_delegate.invalidate()
+        self._refresh_untracked_summary()
+        self._refresh_un_stats()
+        self._refresh_un_placeholders()
+
+    def _refresh_un_stats(self) -> None:
+        apps = self._unapp_model.source_counts()
+        deps = sum(self._unpkg_model.source_counts().values())
+        self._stat_un_all.set_value(str(sum(apps.values()) + deps))
+        self._stat_un_flatpak.set_value(str(apps.get(SRC_FLATPAK, 0)))
+        self._stat_un_manual.set_value(str(apps.get(SRC_MANUAL, 0)))
+        self._stat_un_deps.set_value(str(deps))
+        cur = self._unapp_model.filter_source()
+        for key, card in self._un_stat_cards.items():
+            card.set_active(bool(key) and key == cur)
+
     def _refresh_empty_state(self) -> None:
         """Loading, up to date, or no matches — inside the list's frame.
 
@@ -5628,7 +6133,8 @@ class UpdateWindow(QMainWindow):
         and the stat strip are permanent (see AGENTS.md).
         """
         rows = self._model.rowCount()
-        filtered = bool(self._model.filter_text())
+        filtered = bool(self._model.filter_text()
+                        or self._model.filter_source())
         if rows == 0 and not filtered and not self._status_active:
             # "Checked just now" goes stale; re-derive it. Never over a
             # live status message, which owns the line while it is up.
@@ -5639,10 +6145,15 @@ class UpdateWindow(QMainWindow):
             self._empty_state.show_loading("Checking for updates…")
         elif filtered:
             # Keep the header: the filter box is how you get back.
+            source = self._model.filter_source()
+            what = (f"“{self._model.filter_text()}”"
+                    if self._model.filter_text()
+                    else f"the {_SOURCE_META.get(source, (source, ''))[0]} "
+                         "filter")
             self._empty_state.show_state(
                 "No matches",
-                f"Nothing here matches “{self._model.filter_text()}”. "
-                "Clear the filter to see all packages.",
+                f"Nothing here matches {what}. Clear the filter to see all "
+                "packages.",
                 icon="search", colour="muted")
         else:
             self._empty_state.show_state(
@@ -5773,16 +6284,9 @@ class UpdateWindow(QMainWindow):
         self._progress.setValue(0)
         self._progress.setFormat("")
         n = len(updates)
-        n_aur = sum(1 for p in updates if p.get("repo") == "aur")
-        n_comp = sum(1 for p in updates if p.get("compromised"))
-        self._stat_ready.set_value(str(n - n_comp))
         self._stat_ready.set_caption("ready to install")
-        self._stat_blocked.set_value(str(n_comp))
-        self._stat_blocked.set_accent(_negative_hex() if n_comp
-                                      else _secondary_hex())
         self._stat_ready.set_accent(_positive_hex())
-        self._stat_official.set_value(str(n - n_aur))
-        self._stat_aur.set_value(str(n_aur))
+        self._refresh_update_stats()
         n_cached = len(cached)
         self._set_idle_header(n_cached)
         if n_cached < n:
@@ -6121,6 +6625,7 @@ class UpdateWindow(QMainWindow):
         self._track_loading = False
         self._track_model.set_packages(installed, moves)
         self._refresh_tracked_summary()
+        self._refresh_track_stats()
         self._update_view_badges()
         # Enrich rows in the background (Open pills + descriptions);
         # they pop in as results arrive.
@@ -6608,7 +7113,8 @@ class UpdateWindow(QMainWindow):
             for n in names:
                 try:
                     still = _run(["pacman", "-Q", n],
-                                 capture_output=True, timeout=30).returncode == 0
+                                 capture_output=True,
+                                 timeout=30).returncode == 0
                 except Exception:
                     still = True
                 (failed if still else gone).append(n)
@@ -6714,6 +7220,14 @@ class UpdateWindow(QMainWindow):
             if m.row_of(name) is not None:
                 m.set_state(name, state, op=op)
 
+    def _un_source(self, name: str) -> str:
+        """Canonical source key of an untracked row ('' when unknown)."""
+        for m in self._un_models():
+            r = m.row_of(name)
+            if r is not None:
+                return _source_key(m.item(r)["repo"])
+        return ""
+
     def _un_owned(self, name: str) -> bool:
         """False for app rows no package owns (nothing to uninstall)."""
         for m in self._un_models():
@@ -6731,22 +7245,40 @@ class UpdateWindow(QMainWindow):
         self._un_loading = False
         self._unapp_model.set_items(apps)
         self._unpkg_model.set_items(pkgs)
-        if apps:
-            self._unapp_empty.hide_state()
-        else:
-            self._unapp_empty.show_state(
-                "No untracked applications",
-                "Every application with a launcher is owned by a package.",
-                icon="check-circle", colour="positive")
-        if pkgs:
-            self._unpkg_empty.hide_state()
-        else:
-            self._unpkg_empty.show_state(
-                "No stray dependencies",
-                "No dependency-installed packages were found.",
-                icon="check-circle", colour="positive")
+        self._refresh_un_placeholders()
         self._refresh_untracked_summary()
         self._update_view_badges()
+
+    def _refresh_un_placeholders(self) -> None:
+        """Empty states for both untracked lists — filter-aware, so a
+        filter that hides everything says so instead of showing a blank."""
+        self._show_un_empty(
+            self._unapp_model, self._unapp_empty,
+            "No untracked applications",
+            "Every application with a launcher is owned by a package.")
+        self._show_un_empty(
+            self._unpkg_model, self._unpkg_empty,
+            "No stray dependencies",
+            "No dependency-installed packages were found.")
+
+    def _show_un_empty(self, model, placeholder, title: str,
+                       blurb: str) -> None:
+        if model.rowCount():
+            placeholder.hide_state()
+            return
+        src = model.filter_source()
+        if src:
+            label = _SOURCE_META.get(src, (src, ""))[0]
+            placeholder.show_state(
+                "No matches",
+                f"Nothing here is {label}. Clear the filter to see "
+                "everything pacman doesn't track.",
+                icon="search", colour="muted")
+            return
+        if not self._untracked_loaded:
+            return          # the loading placeholder is already up
+        placeholder.show_state(title, blurb, icon="check-circle",
+                               colour="positive")
 
     def _refresh_untracked(self) -> None:
         """Scan again for applications and packages pacman doesn't own."""
@@ -6766,6 +7298,7 @@ class UpdateWindow(QMainWindow):
         self._update_view_badges()
 
     def _refresh_untracked_summary(self) -> None:
+        self._refresh_un_stats()
         na = self._unapp_model.rowCount()
         np = self._unpkg_model.rowCount()
         if na == 0 and np == 0 and not self._untracked_loaded:
@@ -6902,7 +7435,13 @@ class UpdateWindow(QMainWindow):
             if box.clickedButton() is not go_btn:
                 return
         force = False
-        blocked = find_blocked_obsolete_packages(known)
+        # Only pacman packages can be "still required": a Flatpak app id is
+        # not in pacman's database at all, and asking would report it as
+        # blocked forever.
+        pacman_known = [n for n in known
+                        if self._un_source(n) != SRC_FLATPAK]
+        blocked = (find_blocked_obsolete_packages(pacman_known)
+                   if pacman_known else [])
         if blocked:
             box2 = QMessageBox(self)
             box2.setWindowTitle(
@@ -6926,27 +7465,58 @@ class UpdateWindow(QMainWindow):
         for n in known:
             self._un_set_state(n, "uninstalling")
         label = known[0] if single else f"{len(known)} packages"
-        self._set_status(
-            f"Removing {label}… (a password dialog may appear)", "info")
-        self._untracked_uninstaller = ObsoleteRemover(known, force=force)
-        self._log_action(f"Removing {label}…" + (" (forced)" if force else ""))
+        # Flatpak apps are removed by Flatpak, not pacman: split the
+        # selection and run the pacman batch first (one password prompt).
+        flat = [n for n in known if self._un_source(n) == SRC_FLATPAK]
+        pacman_names = [n for n in known if n not in flat]
+        self._un_pending = []
+        if flat and pacman_names:
+            self._un_pending = flat
+        self._start_un_remover(pacman_names if pacman_names else flat,
+                               force=force, label=label)
+        self._refresh_untracked_footer()
+
+    def _start_un_remover(self, names: list[str], force: bool,
+                          label: str) -> None:
+        """Run the remover that owns this batch (pacman or Flatpak)."""
+        self._un_kind = ("flatpak" if self._un_source(names[0]) == SRC_FLATPAK
+                         else "pacman")
+        self._un_batch = list(names)
+        if self._un_kind == "flatpak":
+            self._untracked_uninstaller = FlatpakRemover(
+                names, {a: i for a, (_v, i) in _flatpak_apps().items()})
+            self._log_action(f"Removing {label} with Flatpak…")
+            self._set_status(f"Removing {label} with Flatpak…", "info")
+        else:
+            self._untracked_uninstaller = ObsoleteRemover(names, force=force)
+            self._log_action(
+                f"Removing {label}…" + (" (forced)" if force else ""))
+            self._set_status(
+                f"Removing {label}… (a password dialog may appear)", "info")
         self._untracked_uninstaller.done.connect(
             self._on_untracked_uninstall_done)
         self._untracked_uninstaller.start()
-        self._refresh_untracked_footer()
 
     def _on_untracked_uninstall_done(self, success: bool,
                                      output: str) -> None:
-        names = list(self._untracked_uninstall_names)
+        names = list(self._un_batch) or list(self._untracked_uninstall_names)
+        kind = self._un_kind
         self._release_thread("_untracked_uninstaller")
-        self._untracked_uninstall_names = []
         if not names:
+            self._un_batch = []
+            self._un_pending = []
+            self._untracked_uninstall_names = []
             return
         if not success and classify_update_failure(output)[0] == "cancelled":
-            # Circuit breaker: auth dismissed — nothing was removed.
-            for n in names:
+            # Circuit breaker: auth dismissed — nothing was removed. Drop
+            # the rest of the selection too: it needs the same password.
+            for n in [*names, *self._un_pending]:
                 self._un_set_state(n, "idle")
-            label = names[0] if len(names) == 1 else f"{len(names)} packages"
+            label = (names[0] if len(names) == 1
+                     else f"{len(names)} packages")
+            self._un_batch = []
+            self._un_pending = []
+            self._untracked_uninstall_names = []
             self._set_status(
                 "Authentication was dismissed — nothing was changed.", "info")
             self._log_action(f"Removing {label} cancelled by authentication")
@@ -6957,26 +7527,53 @@ class UpdateWindow(QMainWindow):
         gone: list[str] = []
         failed: list[str] = []
         if success:
-            for n in names:
+            if kind == "flatpak":
+                # Flatpak keeps its own list; ask it, never pacman.
                 try:
-                    still = _run(["pacman", "-Q", n],
-                                 capture_output=True, timeout=30).returncode == 0
+                    still_here = set(_flatpak_apps())
                 except Exception:
-                    still = True
-                (failed if still else gone).append(n)
+                    still_here = set(names)
+                for n in names:
+                    (failed if n in still_here else gone).append(n)
+            else:
+                for n in names:
+                    try:
+                        still = _run(["pacman", "-Q", n],
+                                     capture_output=True,
+                                     timeout=30).returncode == 0
+                    except Exception:
+                        still = True
+                    (failed if still else gone).append(n)
         else:
             failed = list(names)
+        self._un_gone.extend(gone)
+        self._un_failed.extend(failed)
+        self._un_outputs.append(output)
         for n in gone:
             for m in self._un_models():
                 m.remove_row(n)  # silent no-op when already gone
+        self._un_batch = []
+        if self._un_pending:
+            # A mixed selection runs one remover at a time: the Flatpak
+            # half goes now and the summary waits for the whole selection.
+            pending = list(self._un_pending)
+            self._un_pending = []
+            label = (pending[0] if len(pending) == 1
+                     else f"{len(pending)} packages")
+            self._start_un_remover(pending, force=False, label=label)
+            return
+        self._untracked_uninstall_names = []
+        gone, failed = self._un_gone, self._un_failed
+        output = "\n".join(o for o in self._un_outputs if o)
+        self._un_gone, self._un_failed, self._un_outputs = [], [], []
         if gone:
             what = (f"{gone[0]} uninstalled ✓" if len(gone) == 1
                     else f"{len(gone)} packages uninstalled ✓")
             self._set_status(what, "ok")
             self._log_action(what)
         if failed:
-            if success:
-                output += f"\n{', '.join(failed)} still installed"
+            if not output:
+                output = "removal failed"
             lines = [l for l in output.splitlines() if l.strip()]
             hint = " · ".join(lines[-2:]) if lines else "No output captured"
             for n in failed:
