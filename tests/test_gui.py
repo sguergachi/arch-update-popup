@@ -3,7 +3,8 @@ import time
 
 import pytest
 
-from PyQt6.QtCore import QObject, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QPointF, Qt, pyqtSignal
+from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QApplication, QLabel
 
 from conftest import load_app
@@ -153,11 +154,16 @@ class TestWindow:
         # Tabs left to right: Updates | Tracked | Untracked | Obsolete |
         # Security.
         assert not hasattr(window, "_search")
+        # The obsolete preload may land before or after this test; drive
+        # it so the tab text is deterministic.
+        window._on_obs_preload_done([])
+        qapp.processEvents()
         tabs = window._view_buttons
         assert [b.text() for b in
                 (tabs["updates"], tabs["tracked"], tabs["untracked"],
                  tabs["obsolete"], tabs["security"])] == [
-            "Updates (4)", "Tracked", "Untracked", "Obsolete", "Security"]
+            "Updates (4)", "Tracked (0)", "Untracked (0)", "Obsolete (0)",
+            "Security"]
         assert tabs["updates"].isChecked()
         head = window.centralWidget().layout().itemAt(0).layout()
         order = [head.indexOf(tabs[k]) for k in
@@ -216,7 +222,8 @@ class TestWindow:
         qapp.processEvents()
         assert window._model.rowCount() == 0
         assert window._empty_label.isVisible()
-        assert window._view_buttons["updates"].text() == "Updates"
+        # The count stays at zero: dropping it would move the switcher.
+        assert window._view_buttons["updates"].text() == "Updates (0)"
         assert "up to date" in window._sub.text()
         # The footer holds its shape: Refresh stays put, the primary is
         # just off — it never morphs into a second check button.
@@ -262,7 +269,7 @@ class TestWindow:
         qapp.processEvents()
         assert window._model.rowCount() == 0
         assert window._recheck_btn.isEnabled()
-        assert window._view_buttons["updates"].text() == "Updates"
+        assert window._view_buttons["updates"].text() == "Updates (0)"
 
     def test_update_blocked_during_recheck(self, window, qapp, monkeypatch):
         monkeypatch.setattr(app, "UpdateChecker", FakeChecker)
@@ -640,8 +647,10 @@ class TestWindow:
         assert set(tabs) == {"updates", "obsolete", "security", "tracked",
                              "untracked"}
         assert tabs["updates"].isChecked()
-        # slim progress lives in the updates page above its footer
+        # the slim progress track lives in the header, under the status line
         assert window._progress.parent() is not None
+        assert window._progress.geometry().bottom() < \
+            window._content_stack.geometry().top()
         # errors live in the side panel, above the log
         panel = content.itemAt(1).widget()
         assert panel is window._log_panel
@@ -689,24 +698,38 @@ class TestWindow:
         window._on_update_done(True, "")
         assert window._model.item(0)["state"] == "done"
 
-    def test_log_preview_opens_panel(self, window, qapp):
-        # The preview always occupies its line (nothing may shift); only
-        # its text changes.
-        assert window._log_preview.isVisible()
-        assert window._log_preview.text() == ""
+    def test_status_area_opens_the_log(self, window, qapp):
+        # The status area — line and track — is the shortcut to the log;
+        # the log itself is only ever drawn in the side panel.
+        assert not hasattr(window, "_log_preview")
+        assert window._sub.isVisible()
+        assert window._progress.isVisible()
         window._on_log_line(":: installing konsole (1/2)")
         qapp.processEvents()
-        assert "konsole" in window._log_preview.text()
-        # HTML-unsafe log output must not break the label
+        assert "konsole" in window._sub.toolTip()   # latest line on hover
+        # HTML-unsafe log output must not turn the tooltip into markup.
         window._on_log_line("<b>not a tag</b> & done")
-        assert "not a tag" in window._log_preview.text()
-        # click opens the panel, which hides the preview
-        window._log_preview.clicked.emit()
-        qapp.processEvents()
+        assert "&lt;b&gt;not a tag&lt;/b&gt; &amp; done" in \
+            window._sub.toolTip()
+        assert "Click to open the live log" in window._sub.toolTip()
+        assert not window._log_panel.isVisible()
+        # A click on the line opens the panel…
+        self._click(window._sub, qapp)
         assert window._log_panel.isVisible()
-        assert window._log_preview.text() == ""  # redundant while open
-        assert window._log_preview.isVisible()   # but the line stays
+        window._log_btn.setChecked(False)
+        qapp.processEvents()
+        # …and so does a click on the progress track under it.
+        self._click(window._progress, qapp)
+        assert window._log_panel.isVisible()
         window._on_log_toggled(False)
+
+    @staticmethod
+    def _click(widget, qapp):
+        ev = QMouseEvent(QMouseEvent.Type.MouseButtonRelease,
+                         QPointF(8, 8), QPointF(8, 8),
+                         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        qapp.sendEvent(widget, ev)
 
     def test_log_panel_squishes_list(self, window, qapp):
         w_full = window._list.width()
@@ -719,10 +742,14 @@ class TestWindow:
         qapp.processEvents()
         assert not window._log_panel.isVisible()
 
-    def test_progress_relaxes_to_divider(self, window):
+    def test_progress_track_is_the_header_hairline(self, window):
         window.on_fetch_done()
+        # Idle: an empty track, never a full green bar before work ran.
         assert window._progress.maximum() == 1
         assert window._progress.value() == 0
+        # It sits in the header, above the content, not above the footer.
+        assert window._progress.geometry().bottom() < \
+            window._content_stack.geometry().top()
 
     def test_obsolete_preload_fills_tab(self, window, qapp, monkeypatch):
         # The real preload thread races the test; drive the handler
@@ -1092,7 +1119,7 @@ class TestViews:
         assert "◆ Removing foo…" in text
         assert "◆ Opened bar" in text
         # Preview follows the latest line; the panel stays shut.
-        assert "Opened bar" in window._log_preview.text()
+        assert "Opened bar" in window._sub.toolTip()
         assert not window._log_panel.isVisible()
 
     def test_error_details_dismissable(self, window, qapp):
@@ -1490,12 +1517,16 @@ class TestNoLayoutShifts:
     empty list, or streaming log output must not move anything.
     """
 
-    STRUCTURE = ("_stats_row", "_list_header", "_list", "_log_preview",
-                 "_progress")
+    STRUCTURE = ("_stats_row", "_list_header", "_list", "_sub", "_progress")
 
     def _snap(self, window, skip=()):
         snap = {name: getattr(window, name).geometry()
                 for name in self.STRUCTURE if name not in skip}
+        # The switcher must not move either: a tab that gains or loses a
+        # count would shove its neighbours (see _update_view_badges).
+        for key, btn in window._view_buttons.items():
+            snap[f"tab:{key}"] = btn.geometry()
+        snap["_log_btn"] = window._log_btn.geometry()
         # Footer buttons may resize with their label, but their baseline
         # and right edge must not move.
         snap["_update_btn"] = (window._update_btn.geometry().right(),
@@ -1566,11 +1597,28 @@ class TestNoLayoutShifts:
         assert window._slot_security.isVisible()
         assert self._snap(window) == before
 
+    def test_the_switcher_keeps_its_width_when_the_count_drops(
+            self, window, qapp, monkeypatch):
+        # 13 updates, refresh, 0: the tab keeps the shape of its count, so
+        # neither it nor the status area beside it moves (see AGENTS.md).
+        monkeypatch.setattr(app, "UpdateChecker", self._SilentChecker)
+        window.resize(1280, 800)
+        qapp.processEvents()
+        tabs = window._view_buttons
+        tab_w = tabs["updates"].width()
+        status_w = window._sub.width()
+        window._on_recheck_empty()
+        qapp.processEvents()
+        assert tabs["updates"].text() == "Updates (0)"
+        assert tabs["updates"].width() == tab_w
+        assert window._sub.width() == status_w
+
     def test_log_line_does_not_move_the_list(self, window, qapp):
         before = window._list.geometry()
         window._on_log_line(":: installing konsole (1/2)")
         qapp.processEvents()
-        assert window._log_preview.text() != ""   # the line is used…
+        # The line is used (in the status tooltip)…
+        assert "konsole" in window._sub.toolTip()
         assert window._list.geometry() == before  # …but nothing moved
 
     def test_filter_does_not_move_the_layout(self, window, qapp):

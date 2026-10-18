@@ -3316,22 +3316,18 @@ QPlainTextEdit#details, QTextBrowser#details {
     selection-background-color: %(accent)s;
 }
 
-/* — Slim progress track. Doubles as the divider before the footer:
-     an empty hairline when idle, filling only while work runs. — */
+/* — Slim progress track under the header's status line: an empty
+     hairline when idle, filling only while work runs. — */
 QProgressBar {
     border: none; background: %(border)s; border-radius: 2px;
     min-height: 3px; max-height: 3px; color: transparent;
 }
 QProgressBar::chunk { background: %(positive)s; border-radius: 2px; }
-/* Per-card tracks in the sources panel: the property carries the state so
-   the color follows a live theme switch (no inline styles anywhere). */
+/* The property carries the state so the color follows a live theme
+   switch (no inline styles anywhere, here or in the sources panel). */
 QProgressBar[state="running"]::chunk { background: %(accent)s; }
 QProgressBar[state="done"]::chunk { background: %(positive)s; }
 QProgressBar[state="failed"]::chunk { background: %(negative)s; }
-
-/* — Clickable latest-log preview above the progress bar — */
-QLabel#log-preview { font-size: %(meta)spx; color: %(muted)s; padding: 2px 0; }
-QLabel#log-preview:hover { color: %(accent)s; }
 
 /* — The reboot call to action: filled warning, not a text hint. It is
      the only button that says "the machine needs you", so it wears the
@@ -4031,21 +4027,6 @@ def _stat_strip(cards: list[_StatCard]) -> QWidget:
         lay.addWidget(card, 1)
     lay.addStretch()
     return row
-
-
-class _ClickableLabel(QLabel):
-    """QLabel with a clicked signal (for the log preview line)."""
-
-    clicked = pyqtSignal()
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
-        super().mousePressEvent(event)
 
 
 # ── Virtualized package list ─────────────────────────────────────────────
@@ -5593,12 +5574,18 @@ class UpdateWindow(QMainWindow):
         self._restart_needed = False
         # The full status sentence, whatever the one-line label shows.
         self._status_full = ""
+        # Latest log line, carried in the status area's tooltip (see
+        # _preview_log_line) — never drawn beside the status itself.
+        self._preview_last = ""
         # Per-list "working" flags: a loading placeholder must never cover
         # rows that are still on screen.
         self._loading = False
         self._track_loading = False
         self._un_loading = False
         n = len(updates)
+        # How many rows already carry cached download info: the resting
+        # readout of the header's progress track (see Zone 1).
+        n_cached = sum(1 for i in range(n) if i in cached_info)
 
         self.setWindowTitle(f"Arch Update — {n} package{'s' if n != 1 else ''} available")
         self.setMinimumSize(_sp(1040), _sp(620))
@@ -5634,19 +5621,39 @@ class UpdateWindow(QMainWindow):
         self._sub.setObjectName("subtitle")
         # One line, always the same height: a message that wraps would push
         # the whole window down (see AGENTS.md). Long messages are elided
-        # and the full text goes in the tooltip.
+        # and the full text goes in the tooltip (which is also where the
+        # latest log line and the click hint live).
         self._sub.setWordWrap(False)
         self._sub.setFixedHeight(_sp(18))
         self._sub.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._sub.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
         title_block.addWidget(self._sub)
         # THE unified status line: every user-facing message in this
         # window renders here (see _set_status). _idle_summary holds the
         # resting text that empty messages restore.
         self._idle_summary = ""
+        # …and the run's progress, on a hairline right under it: the top
+        # left is where the window says what it is doing. The track is in
+        # the layout from construction, so idle, checking and installing
+        # are all the same height (see AGENTS.md) — only its fill and
+        # color change. Clicking either the line or the track opens the
+        # live log (see eventFilter); the log itself is only drawn in the
+        # side panel.
+        self._progress = QProgressBar()
+        self._progress.setRange(0, max(n, 1))
+        self._progress.setValue(n_cached)
+        self._progress.setTextVisible(False)
+        self._progress.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        if n_cached >= n:
+            # Everything already cached: an empty track, not a full green
+            # bar before anything has run.
+            self._progress.setRange(0, 1)
+            self._progress.setValue(0)
+        for _w in (self._sub, self._progress):
+            _w.setCursor(Qt.CursorShape.PointingHandCursor)
+            _w.installEventFilter(self)
+        title_block.addWidget(self._progress)
         # Stretch factor 1 (and no dead spacer): the block claims all
         # free header width so the status line only wraps when it must.
         head.addLayout(title_block, 1)
@@ -5658,10 +5665,15 @@ class UpdateWindow(QMainWindow):
         self._view_buttons: dict[str, QPushButton] = {}
         self._view_group = QButtonGroup(self)
         self._view_group.setExclusive(True)
-        for _key, _label in (("updates", "Updates"), ("tracked", "Tracked"),
-                             ("untracked", "Untracked"),
-                             ("obsolete", "Obsolete"),
+        for _key, _label in (("updates", f"Updates ({n})"),
+                             ("tracked", "Tracked (0)"),
+                             ("untracked", "Untracked (0)"),
+                             ("obsolete", "Obsolete (0)"),
                              ("security", "Security")):
+            # Counts from the first frame, zeros included: a tab that
+            # grows its count later would shove the whole switcher
+            # sideways (see AGENTS.md). Security is a scan, not a list,
+            # so it has no count.
             _btn = QPushButton(_label)
             _btn.setObjectName("view-tab")
             _btn.setCheckable(True)
@@ -5775,9 +5787,7 @@ class UpdateWindow(QMainWindow):
         up.addWidget(self._slot_security)
         self._refresh_view_banners()
 
-        n_cached = sum(1 for i in range(n) if i in cached_info)
         self._set_idle_header(n_cached)
-
         self._model = PackageModel(updates, cached_info)
         self._list = QListView()
         self._list.setObjectName("package-list")
@@ -5907,7 +5917,6 @@ class UpdateWindow(QMainWindow):
         self._log_view.setReadOnly(True)
         self._log_view.setMaximumBlockCount(400)
         self._log_has_content = False
-        self._preview_last = ""
         self._log_empty = QLabel("Nothing logged yet.")
         self._log_empty.setObjectName("empty-note")
         self._log_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -5921,37 +5930,16 @@ class UpdateWindow(QMainWindow):
         self._anim.setInterval(120)
         self._anim.timeout.connect(lambda: self._delegate.tick(self._model))
 
-        # ── Zone 4 · Slim progress track (divider before footer) ────────────
-        # NOTE: there is deliberately no status box down here. ALL user
-        # messages go through the single unified status line in the header
-        # (self._sub via _set_status) — one place, color-coded with icons.
-        self._progress = QProgressBar()
-        self._progress.setRange(0, n)
-        self._progress.setValue(n_cached)
-        self._progress.setTextVisible(False)
-        if n_cached >= n:
-            # Everything already cached: plain hairline divider, no
-            # misleading full-green bar before anything runs.
-            self._progress.setRange(0, 1)
-            self._progress.setValue(0)
+        # ── Zone 4 · (nothing) ──────────────────────────────────────────────
+        # NOTE: there is deliberately no status box down here. The run's
+        # status line and its progress track live in the header (Zone 1,
+        # top left) — one place, color-coded with icons — so this column
+        # belongs to the list from the banners down to the footer, and the
+        # log is only ever drawn in the side panel.
 
         # ── Failure details live in the side panel, above the log ──────────
         # (see panel construction above) — nothing here, so packages keep
         # the vertical space.
-
-        # Status + progress pinned at the bottom of the left column so the
-        # list above always gets first claim on vertical space. A clickable
-        # preview of the latest log line sits just above the progress bar;
-        # clicking it opens the side log panel. The slim progress bar
-        # doubles as the divider before the footer.
-        # Always present, one line tall: it fills in during a run, but its
-        # space is reserved either way (see AGENTS.md).
-        self._log_preview = _ClickableLabel("")
-        self._log_preview.setObjectName("log-preview")
-        self._log_preview.setFixedHeight(_sp(18))
-        self._log_preview.clicked.connect(self._show_log)
-        up.addWidget(self._log_preview)
-        up.addWidget(self._progress)
 
         # ── Zone 5 · Footers (one per view, swapped with content) ───────────
         # Selection lives here, next to the count it controls: label +
@@ -7270,24 +7258,23 @@ class UpdateWindow(QMainWindow):
     def _update_view_badges(self) -> None:
         # The tab answers "how many updates are pending", so it counts the
         # whole list; the header reports what the filter is showing.
+        # The count never disappears at zero: dropping it would narrow the
+        # switcher and slide every tab sideways — 13 updates, refresh, 0,
+        # and the header jumps (see AGENTS.md).
         n_up = self._model.source_count()
         self._list_header.set_filter_info(self._model.rowCount(), n_up)
-        self._view_buttons["updates"].setText(
-            f"Updates ({n_up})" if n_up else "Updates")
+        self._view_buttons["updates"].setText(f"Updates ({n_up})")
         if getattr(self, "_obs_loaded", False):
             n_ob = len(self._obs_names)
-            self._view_buttons["obsolete"].setText(
-                f"Obsolete ({n_ob})" if n_ob else "Obsolete")
+            self._view_buttons["obsolete"].setText(f"Obsolete ({n_ob})")
         if getattr(self, "_track_loaded", False):
             # Counts only: every tab reads the same way, and the switcher
             # never resizes just because a package became movable.
             n_tr = self._track_model.rowCount()
-            self._view_buttons["tracked"].setText(
-                f"Tracked ({n_tr})" if n_tr else "Tracked")
+            self._view_buttons["tracked"].setText(f"Tracked ({n_tr})")
         if getattr(self, "_untracked_loaded", False):
             n_un = self._un_model.rowCount()
-            self._view_buttons["untracked"].setText(
-                f"Untracked ({n_un})" if n_un else "Untracked")
+            self._view_buttons["untracked"].setText(f"Untracked ({n_un})")
 
     # — Per-package uninstall (Tracked tab) —
     def _busy_with_update(self) -> bool:
@@ -8092,16 +8079,43 @@ class UpdateWindow(QMainWindow):
         plain = html.unescape(re.sub(r"<[^>]+>", "", text))
         self._status_full = " ".join(plain.split())
         avail = self._sub.width() - 4
+        self._update_status_tooltip()
         if avail < 200:
             # Not laid out yet; the next status write will fit properly.
-            self._sub.setToolTip(self._status_full)
             return text
         fm = QFontMetrics(self._sub.font())
-        self._sub.setToolTip(self._status_full)
         if fm.horizontalAdvance(self._status_full) <= avail:
             return text
         return fm.elidedText(self._status_full, Qt.TextElideMode.ElideRight,
                              avail)
+
+    def _update_status_tooltip(self) -> None:
+        """One tooltip for the whole status area, top left.
+
+        It carries what the one-line label cannot show: the full status
+        sentence, the latest log line, and what clicking does. The log
+        itself is never drawn besides the side panel.
+        """
+        parts = [html.escape(self._status_full)] if self._status_full else []
+        if self._preview_last:
+            parts.append("Latest: " + html.escape(self._preview_last))
+        parts.append("Click to open the live log")
+        tip = "\n\n".join(parts)
+        self._sub.setToolTip(tip)
+        self._progress.setToolTip(tip)
+
+    def eventFilter(self, obj, event) -> bool:
+        """Clicking the status area — line or track — opens the live log.
+
+        The bottom of the window used to carry a clickable preview of the
+        latest log line; the status area at the top left is that shortcut
+        now (the Log button stays as the explicit toggle).
+        """
+        if obj in (self._sub, self._progress) and \
+                event.type() == QEvent.Type.MouseButtonRelease:
+            self._show_log()
+            return True
+        return super().eventFilter(obj, event)
 
     def _set_status(self, text: str, kind: str = "info") -> None:
         """Show a status message.
@@ -8120,17 +8134,18 @@ class UpdateWindow(QMainWindow):
         self._sub.setText(self._fit_status_line(text))
 
     def _set_progress_state(self, state: str, text: str = "") -> None:
-        """Recolor the divider-track: 'normal' (idle green), 'active'
-        (working blue), 'error' (red), 'ok' (done green)."""
-        chunk = {"normal": _positive_hex(), "active": _accent_hex(),
-                 "error": _negative_hex(), "ok": _positive_hex()}[state]
-        self._progress.setStyleSheet(
-            "QProgressBar { border: none; background: palette(midlight);"
-            " border-radius: 2px; min-height: 3px; max-height: 3px;"
-            " color: transparent; }"
-            "QProgressBar::chunk { background: %s; border-radius: 2px; }"
-            % chunk
-        )
+        """Recolor the header track for a new state: 'normal' (idle),
+        'active' (working), 'error', 'ok' (done).
+
+        The state rides on a Qt property so the QSS picks the color: a
+        live theme switch repaints the track with everything else.
+        """
+        key = {"normal": "idle", "active": "running",
+               "error": "failed", "ok": "done"}[state]
+        self._progress.setProperty("state", key)
+        style = self._progress.style()
+        style.unpolish(self._progress)
+        style.polish(self._progress)
         if text:
             self._progress.setFormat(text)
 
@@ -8244,8 +8259,8 @@ class UpdateWindow(QMainWindow):
             self._log_view.appendPlainText("── New run ──")
             self._refresh_log_empty()
         else:
-            self._log_preview.setText("")
             self._preview_last = ""
+            self._update_status_tooltip()
         self._note_activity()
         self._stuck_warned = False
         self._watchdog.start()
@@ -8405,26 +8420,21 @@ class UpdateWindow(QMainWindow):
         self._refresh_log_empty()
 
     def _preview_log_line(self, line: str) -> None:
-        # Keep a one-line preview above the progress bar; it hides while
-        # the full panel is open (redundant then).
+        """Remember the latest log line for the status area's tooltip.
+
+        The line is not drawn anywhere any more: the window shows one
+        status sentence at the top left, and log output has its own panel.
+        """
         if line == self._preview_last:
             return
         self._preview_last = line
         short = line.strip()
-        # Strip our own log prefix so the preview reads as plain prose.
+        # Strip our own log prefix so the tooltip reads as plain prose.
         short = re.sub(r"^\[[0-9:]+\]\s*◆\s*", "", short)
         if len(short) > 140:
             short = short[:139] + "…"
-        self._log_preview.setText(
-            f"<span style='color:{_secondary_hex()}'>▸</span> {html.escape(short)}")
-        self._log_preview.setToolTip(short)
-        self._refresh_log_preview()
-
-    def _refresh_log_preview(self) -> None:
-        """Empty the preview while the full panel is open (it is redundant
-        then) — but the line itself stays, so nothing below it moves."""
-        if self._log_panel.isVisible():
-            self._log_preview.clear()
+        self._preview_last = short
+        self._update_status_tooltip()
 
     # — Watchdog + cancel —
     def _note_activity(self) -> None:
@@ -8460,8 +8470,6 @@ class UpdateWindow(QMainWindow):
     def _on_log_toggled(self, checked: bool) -> None:
         self._log_panel.setVisible(checked)
         self._refresh_log_empty()
-        # The preview is a stand-in for the closed panel.
-        self._refresh_log_preview()
 
     def _show_log(self) -> None:
         if not self._log_btn.isChecked():
