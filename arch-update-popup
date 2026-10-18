@@ -4662,8 +4662,6 @@ class UpdateWindow(QMainWindow):
         self._orphans: set = set()  # parked threads (see _park_thread)
         self._moves_dialog: MovesDialog | None = None
         self._sources_dialog: ManagedSourcesDialog | None = None
-        self._enable_runner: _SourceEnableRunner | None = None
-        self._enable_progress: QProgressDialog | None = None
         # Buttons whose icons bake the theme's grey: re-resolved live in
         # _apply_theme(). Registered via _icon_btn(), keyed by button so a
         # repeat registration never accumulates duplicates.
@@ -8240,9 +8238,9 @@ class _MoveRow(QWidget):
 class ManagedSourcesDialog(QMainWindow):
     """Where a package can go instead of the AUR, and what backs each one.
 
-    Read-only guidance: the app never edits pacman.conf. It does say which
-    sources are already enabled, so the answer to "can I switch this off
-    the AUR today?" is visible without leaving the app.
+    Everything happens in place: no modal dialogs. Enable runs inline in
+    the card, streaming progress into the card itself; the restart button
+    appears in the footer when something was actually enabled.
     """
 
     closed = pyqtSignal()
@@ -8311,21 +8309,40 @@ class ManagedSourcesDialog(QMainWindow):
             row.addStretch()
             if steps and not on_here:
                 # One button, one job: the app enables the source for them.
-                # What it will run is shown for review before anything
-                # runs — we never edit pacman.conf silently.
-                show_btn = QPushButton("Enable")
-                show_btn.setObjectName("primary")
-                show_btn.setFixedHeight(_sp(24))
-                show_btn.setMinimumWidth(_sp(72))
-                show_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                show_btn.clicked.connect(
-                    lambda _=False, n=name, st=steps: self._enable_source(n, st))
-                row.addWidget(show_btn)
+                enable_btn = QPushButton("Enable")
+                enable_btn.setObjectName("primary")
+                enable_btn.setFixedHeight(_sp(24))
+                enable_btn.setMinimumWidth(_sp(72))
+                enable_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                enable_btn.clicked.connect(
+                    lambda _=False, n=name, st=steps, c=card, b=enable_btn:
+                    self._enable_source(n, st, c, b))
+                row.addWidget(enable_btn)
             body.addLayout(row)
             note = QLabel(why)
             note.setObjectName("text-muted")
             note.setWordWrap(True)
             body.addWidget(note)
+            # Inline progress area: hidden until an enable is running.
+            progress_area = QWidget()
+            progress_area.setVisible(False)
+            pa = QVBoxLayout(progress_area)
+            pa.setContentsMargins(0, _sp(4), 0, 0)
+            pa.setSpacing(_sp(4))
+            status_lbl = QLabel("")
+            status_lbl.setObjectName("text-muted")
+            status_lbl.setWordWrap(True)
+            pa.addWidget(status_lbl)
+            bar = QProgressBar()
+            bar.setRange(0, 0)
+            bar.setTextVisible(False)
+            pa.addWidget(bar)
+            body.addWidget(progress_area)
+            # Stash the per-card widgets so the enable flow can drive them.
+            card._enable_btn = enable_btn if (steps and not on_here) else None
+            card._progress_area = progress_area
+            card._status_lbl = status_lbl
+            card._bar = bar
             box.addWidget(card)
         box.addStretch()
         scroll.setWidget(inner)
@@ -8339,32 +8356,42 @@ class ManagedSourcesDialog(QMainWindow):
         hint.setObjectName("meta")
         hint.setWordWrap(True)
         foot.addWidget(hint, 1)
+        self._restart_btn = QPushButton("Restart to apply")
+        self._restart_btn.setObjectName("primary")
+        self._restart_btn.setFixedHeight(_sp(34))
+        self._restart_btn.setMinimumWidth(_sp(150))
+        self._restart_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._restart_btn.setToolTip(
+            "Restart Arch Update so it picks up the new configuration")
+        self._restart_btn.clicked.connect(self.restart_needed.emit)
+        self._restart_btn.setVisible(False)
+        foot.addWidget(self._restart_btn)
         close_btn = QPushButton("Close")
-        close_btn.setObjectName("primary")
+        close_btn.setObjectName("secondary")
         close_btn.setFixedHeight(_sp(34))
         close_btn.setMinimumWidth(_sp(120))
         close_btn.clicked.connect(self.close)
         foot.addWidget(close_btn)
         lay.addLayout(foot)
 
-    def _enable_source(self, name: str, steps: str) -> None:
-        """Offer to run the documented enable steps, visibly and safely."""
+    def _enable_source(self, name: str, steps: str, card: QWidget,
+                       btn: QPushButton) -> None:
+        """Enable a source inline — no modal dialogs."""
+        # Confirm first (one small dialog is fine for a system change).
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle(f"Enable {name}")
+        box.setWindowTitle(f"Enable {name}?")
         box.setText(f"Enable {name}?")
         box.setInformativeText(
             "This will change your system: it imports a signing key, "
             "installs the repo's mirrorlist and keyring, and appends the "
             "repo to /etc/pacman.conf. Nothing runs until you confirm.")
         box.setDetailedText(steps)
-        # The single action the user asked for: Enable. The commands are
-        # behind "Show Details" for anyone who wants to review them.
+        box.setStyleSheet(_themed_qss())
         run_btn = box.addButton("Enable", QMessageBox.ButtonRole.AcceptRole)
         copy_btn = box.addButton("Copy commands",
                                  QMessageBox.ButtonRole.ActionRole)
         box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        box.setStyleSheet(_themed_qss())
 
         def _copy() -> None:
             QApplication.clipboard().setText(steps)
@@ -8374,105 +8401,52 @@ class ManagedSourcesDialog(QMainWindow):
         box.exec()
         if box.clickedButton() is not run_btn:
             return
-        # Run the whole script under one sudo -A prompt, so the user
-        # authenticates once. Reuse the existing askpass flow; the
-        # script cleans up after itself.
-        # Keep the reference: a QThread destroyed while running aborts
-        # the whole process ("QThread: Destroyed while thread is still
-        # running"). Released in _on_enable_done, like every other runner.
-        # (No _show_log/_set_status here: this runs on the dialog, which
-        # has neither. The main window's status line is updated via the
-        # logged signal and the progress dialog's label.)
-        progress = QProgressDialog(
-            f"Enabling {name}…", "Cancel", 0, 0, self)
-        progress.setWindowTitle(f"Enable {name}")
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-        progress.show()
-        self._enable_progress = progress
+
+        # Inline progress: the button becomes "Enabling…", a bar + status
+        # line appear below the description, and the runner streams output.
+        btn.setEnabled(False)
+        btn.setText("Enabling…")
+        card._progress_area.setVisible(True)
+        card._status_lbl.setText("Starting…")
+        self.logged.emit(f"Enabling {name}…")
         self._enable_runner = _SourceEnableRunner(steps)
         self._enable_runner.line.connect(
-            lambda line, n=name: progress.setLabelText(
-                f"Enabling {n} — {line}"))
+            lambda line, c=card: c._status_lbl.setText(line))
         self._enable_runner.line.connect(self.logged.emit)
         self._enable_runner.done.connect(
-            lambda ok, out, n=name, pg=progress:
-            self._on_enable_done(ok, out, n, pg))
-        progress.canceled.connect(self._enable_runner.terminate)
+            lambda ok, out, n=name, c=card, b=btn:
+            self._on_enable_done(ok, out, n, c, b))
         self._enable_runner.start()
 
-    def _restart_app(self) -> None:
-        """Restart the app in place (same PID, fresh state)."""
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle("Restart Arch Update?")
-        box.setText("Restart to apply the changes?")
-        box.setInformativeText(
-            "The app will quit and relaunch immediately. Your window "
-            "position and the current update list are not preserved, but "
-            "the next check runs on its own schedule.")
-        box.setStandardButtons(QMessageBox.StandardButton.Yes |
-                               QMessageBox.StandardButton.Cancel)
-        box.setStyleSheet(_themed_qss())
-        box.exec()
-        if box.clickedButton() != box.button(
-                QMessageBox.StandardButton.Yes):
-            return
-        # Close the window cleanly first (saves geometry), then replace the
-        # process in place. execv keeps the PID, so systemd's tracking
-        # stays intact.
-        self.close()
-        os.execv(sys.argv[0], sys.argv)
-
     def _on_enable_done(self, success: bool, output: str, name: str,
-                        progress: QProgressDialog = None) -> None:
+                        card: QWidget, btn: QPushButton) -> None:
         runner = getattr(self, "_enable_runner", None)
         self._enable_runner = None
         if runner is not None:
             runner.wait(5000)
-        if progress is not None:
-            progress.close()
-            progress.deleteLater()
-        self._enable_progress = None
         if success:
-            # The button lives on the main window, not on this dialog: the
-            # restart_needed signal (connected in _open_sources_dialog) flips
-            # it. Touching it here would crash — the dialog has no such
-            # attribute.
+            card._status_lbl.setText(f"{name} enabled ✓")
+            card._bar.setVisible(False)
+            btn.setText("Enabled ✓")
+            btn.setEnabled(False)
             self.restart_needed.emit()
             self.logged.emit(f"{name} enabled — restart to apply")
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Icon.Information)
-            box.setWindowTitle("Source enabled")
-            box.setText(f"{name} is now enabled.")
-            box.setInformativeText(
-                "Arch Update needs to restart to pick up the new repo and "
-                'offer switches for your packages. Click "Restart to apply" '
-                "in the footer, or restart it yourself.")
-            box.setDetailedText(output)
-            box.setStyleSheet(_themed_qss())
-            box.exec()
         else:
-            if classify_update_failure(output)[0] == "cancelled":
-                # Dismissed authentication: nothing ran.
-                self.logged.emit(f"Enabling {name} cancelled by authentication")
-                return
             lines = [l for l in output.splitlines() if l.strip()]
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Icon.Critical)
-            box.setWindowTitle("Arch Update — enable failed")
-            box.setText(f"Enabling {name} failed.")
-            box.setInformativeText(
-                "Nothing was changed. Run the commands from the details "
-                "manually, or paste them into a terminal.")
-            box.setDetailedText(
-                "\n".join(lines[-40:]) if lines else "(no output captured)")
-            box.setStyleSheet(_themed_qss())
-            box.exec()
+            hint = " · ".join(lines[-2:]) if lines else "No output captured"
+            card._status_lbl.setText(f"Failed: {hint}")
+            card._status_lbl.setStyleSheet(
+                f"color: {_negative_hex()};")
+            btn.setText("Enable")
+            btn.setEnabled(True)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        runner = getattr(self, "_enable_runner", None)
+        if runner is not None:
+            if runner.isRunning():
+                runner.terminate()
+                runner.wait(8000)
+            self._enable_runner = None
         super().closeEvent(event)
         self.closed.emit()
 
