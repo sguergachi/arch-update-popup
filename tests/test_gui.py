@@ -171,6 +171,52 @@ class TestWindow:
         assert order == sorted(order)
         assert head.indexOf(window._log_btn) > order[-1]
 
+    def test_pages_have_no_summary_lines(self, window, qapp):
+        # The numbers live in the stat strip; loading info lives on the
+        # one status line, top left. No page carries a line of its own.
+        for gone in ("_track_summary", "_un_summary", "_obs_summary",
+                     "_sec_status"):
+            assert not hasattr(window, gone)
+
+    def test_a_load_reports_on_the_status_line(self, window, qapp):
+        # A list reading itself says so at the top left — while you are
+        # looking at it, which is where the page's own loading line used
+        # to sit. The box inside the frame says it too.
+        window._switch_view("tracked")
+        window._track_loaded = False
+        window._track_loading = True
+        window._refresh_tracked_summary()
+        assert "Reading the installed package list" in window._sub.text()
+        # Leaving the page hands the line back to the resting summary…
+        window._switch_view("updates")
+        assert "Reading the installed package list" not in window._sub.text()
+        # …and coming back shows it again, until the load is done.
+        window._switch_view("tracked")
+        assert "Reading the installed package list" in window._sub.text()
+        window._track_loading = False
+        window._track_loaded = True
+        window._refresh_tracked_summary()
+        assert "Reading the installed package list" not in window._sub.text()
+
+    def test_a_load_never_steals_the_line_from_a_job(self, window, qapp):
+        # Background reads are quiet: a check or install owns the line,
+        # and a load ending must not wipe that message either.
+        window._switch_view("tracked")
+        window._set_status("Installing <b>konsole</b> — 50%", "info")
+        window._track_loaded = False
+        window._track_loading = True
+        window._refresh_tracked_summary()
+        assert "Installing" in window._sub.text()
+        assert "Reading" not in window._sub.text()
+        window._track_loading = False
+        window._track_loaded = True
+        window._refresh_tracked_summary()
+        assert "Installing" in window._sub.text()
+        # The job is what ends it, and then the resting text is back.
+        window._set_status("")
+        assert "Installing" not in window._sub.text()
+        assert "Reading" not in window._sub.text()
+
     def _stage_recheck(self, window, monkeypatch):
         monkeypatch.setattr(app, "UpdateChecker", FakeChecker)
         monkeypatch.setattr(app, "InfoFetcher", FakeInfoFetcher)
@@ -941,7 +987,7 @@ class TestViews:
         qapp.processEvents()
         assert window._obs_cards == {}
         assert not window._obs_remove_btn.isEnabled()
-        assert "Nothing obsolete" in window._obs_summary.text()
+        assert window._obs_empty.title.text() == "Nothing to clean up"
 
     def test_obsolete_switch_never_blocks(self, window, qapp, monkeypatch):
         # Even if pacman hangs, switching tabs must return instantly:
@@ -952,8 +998,10 @@ class TestViews:
         monkeypatch.setattr(app, "get_obsolete_packages", _boom)
         window._obs_loaded = False
         window._switch_view("obsolete")  # would raise if sync
+        # The page owns no loading line of its own: the status line says
+        # so at once, and the box keeps the frame (see AGENTS.md).
+        assert "no repository provides" in window._sub.text()
         qapp.processEvents()
-        assert "Scanning" in window._obs_summary.text()
         window._on_obs_preload_done(["x"])
         assert set(window._obs_cards) == {"x"}
 
@@ -978,6 +1026,13 @@ class TestViews:
         window._switch_view("security")
         window._run_security_scan()
         assert window._sec_scanner is not None
+        # The scan reports itself on the status line, and its progress
+        # rides the header track (the page has no line of its own).
+        assert "Scanning installed packages" in window._sub.text()
+        window._sec_scanner.progress.emit(1, 2, "evil")
+        qapp.processEvents()
+        assert "Scanning… 1/2" in window._sub.text()
+        assert window._progress.value() == 1
         window._sec_scanner.done.emit([
             {"name": "evil", "version": "1", "repo": "aur",
              "compromised": True, "reasons": ["listed"]},
@@ -990,6 +1045,7 @@ class TestViews:
         assert "1 compromised of 2 checked" in \
             window._sec_footer_label.text()
         assert "✕" in window._sub.text()
+        assert window._progress.value() == window._progress.maximum()
         assert window._sec_scan_btn.isEnabled()
 
     def test_tray_opens_empty_window(self, qapp, monkeypatch):
@@ -1239,8 +1295,9 @@ class TestViews:
         assert window._untracked_loaded is True
         assert window._un_model.rowCount() == 2   # one app + one package
         assert window._view_buttons["untracked"].text() == "Untracked (2)"
-        assert "1</b> application" in window._un_summary.text()
-        assert "1</b> dependency package" in window._un_summary.text()
+        # The strip carries the numbers; the page has no summary line.
+        assert window._stat_un_apps._value.text() == "1"
+        assert window._un_stat_cards["dependencies"]._value.text() == "1"
         # App row shows the title; ops use the package name.
         d = window._un_view.itemDelegate()
         from PyQt6.QtWidgets import QStyleOptionViewItem as _Opt

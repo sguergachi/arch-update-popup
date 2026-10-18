@@ -25,6 +25,22 @@ slot; it may never move the slots.
   warning banner, the AUR→official banner, and opening the log panel. Nothing
   else may move.
 
+## Where information lives
+
+One place per fact, and no page owns a line of its own:
+
+- **Numbers live in the stat strip.** How many packages, from where — the
+  cards above the list say it. A page never repeats them in a paragraph.
+- **Loading info lives on the status line, top left** (with the header progress
+  track under it). Not beside the list, not in a footer: a list in flight
+  reports itself there (`_set_load_status`), and only while its own page is the
+  one on screen — which is exactly where the removed per-page line used to sit.
+  A running job (check, install, removal, scan) always keeps that line.
+- **The list's own placeholder carries the verdict** ("Nothing tracked",
+  "Not scanned yet") and the list footer the count (`5 tracked`). Explanations
+  that are the same for every row — like what "obsolete" means — go once, in a
+  tooltip on the control that acts on them.
+
 Why: pressing Refresh with 13 updates and getting 0 must not make the window
 jump. Movement is read as a bug even when the new state is correct.
 

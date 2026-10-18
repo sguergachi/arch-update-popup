@@ -3616,10 +3616,10 @@ class _ScanRow(QWidget):
 
 
 class _ObsoleteRow(QWidget):
-    """One obsolete package: name, then a single muted line of context.
+    """One obsolete package: the name, and nothing else.
 
-    The explanation is identical for every row, so it lives once in the
-    page summary — repeating it per row was just noise.
+    The explanation is identical for every row and lives on the page's
+    Remove button (a tooltip), not repeated under every name.
     """
 
     def __init__(self, name: str) -> None:
@@ -3631,8 +3631,9 @@ class _ObsoleteRow(QWidget):
         title = QLabel(name)
         title.setObjectName("package-name")
         body.addWidget(title)
-        # No per-row badge: every row would carry the identical
-        # "no repository" pill — the page summary above says it once.
+        # No per-row badge either: every row would carry the identical
+        # "no repository" pill, and the tab, the footer count and the
+        # Remove button all say what this list is.
 
 
 # ── Bundled status/action icon set ─────────────────────────────────────
@@ -5567,6 +5568,14 @@ class UpdateWindow(QMainWindow):
         # True while _sub carries a live message rather than the resting
         # summary (see _set_status / _refresh_empty_state).
         self._status_active = False
+        # What owns the one status line: "" (resting), "load" (a page list
+        # reading itself in the background) or "job" (a check, install or
+        # removal the user started). A load may speak only while no job
+        # does — see _set_load_status.
+        self._status_owner = ""
+        # view key -> what that page is reading, while it reads (see
+        # _set_load_status).
+        self._loads: dict[str, str] = {}
         # Single-flight guard for the failure dialog (see _show_error_dialog).
         self._error_dialog_open = False
         # Set when a change (e.g. enabling a source) needs a restart to
@@ -6011,9 +6020,9 @@ class UpdateWindow(QMainWindow):
         ob = QVBoxLayout(self._obs_page)
         ob.setContentsMargins(0, 0, 0, 0)
         ob.setSpacing(_sp(16))
-        self._obs_summary = QLabel("")
-        self._obs_summary.setObjectName("meta")
-        ob.addWidget(self._obs_summary)
+        # No summary line above the list: how many, and what to do about
+        # them, is in the footer and the rows; a scan in progress reports
+        # itself on the status line, top left (see AGENTS.md).
         self._obs_scroll = QScrollArea()
         self._obs_scroll.setObjectName("package-list")
         self._obs_scroll.setWidgetResizable(True)
@@ -6051,6 +6060,9 @@ class UpdateWindow(QMainWindow):
         self._obs_remove_btn.setObjectName("primary")
         self._obs_remove_btn.setFixedHeight(_sp(34))
         self._obs_remove_btn.setMinimumWidth(170)
+        self._obs_remove_btn.setToolTip(
+            "Obsolete packages are usually split packages dropped upstream "
+            "— removing them is safe.")
         self._obs_remove_btn.clicked.connect(self._remove_obsolete_from_view)
         fo.addWidget(self._obs_remove_btn)
         self._footer_stack.addWidget(self._foot_obsolete)
@@ -6060,10 +6072,9 @@ class UpdateWindow(QMainWindow):
         se = QVBoxLayout(self._sec_page)
         se.setContentsMargins(0, 0, 0, 0)
         se.setSpacing(_sp(16))
-        self._sec_status = QLabel(_SEC_SCAN_HINT)
-        self._sec_status.setObjectName("meta")
-        self._sec_status.setWordWrap(True)
-        se.addWidget(self._sec_status)
+        # No line above the list: what a scan is for is in the box until
+        # the first scan, and a scan in progress reports itself on the
+        # status line, top left, with the header track filling (AGENTS.md).
         self._sec_scroll = QScrollArea()
         self._sec_scroll.setObjectName("package-list")
         self._sec_scroll.setWidgetResizable(True)
@@ -6094,9 +6105,9 @@ class UpdateWindow(QMainWindow):
         tr = QVBoxLayout(self._track_page)
         tr.setContentsMargins(0, 0, 0, 0)
         tr.setSpacing(_sp(16))
-        self._track_summary = QLabel("Loading tracked packages…")
-        self._track_summary.setObjectName("meta")
-        tr.addWidget(self._track_summary)
+        # No summary line above the strip: the cards below already say how
+        # many packages there are and where they come from, and what is
+        # loading goes on the status line, top left (see AGENTS.md).
         # Source strip: what the installed set is made of, and the filter
         # for it (see AGENTS.md — the strip never moves between states).
         self._stat_track_all = _StatCard("0", "installed", _accent_hex())
@@ -6263,9 +6274,6 @@ class UpdateWindow(QMainWindow):
         self._un_header = _ListHeader("", with_search=False)
         self._un_header.select_all.connect(self._select_untracked_all)
         self._un_sel_label = self._un_header.count
-        self._un_summary = QLabel("Open this tab to scan for untracked software…")
-        self._un_summary.setObjectName("meta")
-        un.addWidget(self._un_summary)
         un.addWidget(self._un_header)
         self._un_model = TrackedModel()
         self._un_view, self._un_delegate = self._make_card_list(
@@ -6426,9 +6434,7 @@ class UpdateWindow(QMainWindow):
             # The placeholder inside the list carries the verdict and the
             # last-checked time, so the header just states the fact.
             self._idle_summary = "No updates pending"
-            self._sub.setText(self._fit_status_line(self._idle_summary))
-            return
-        if n_cached < n:
+        elif n_cached < n:
             self._idle_summary = (
                 f"<b>{n}</b> package{'s' if n != 1 else ''} available "
                 f"<span style='color:{_secondary_hex()}'>· fetching release notes…</span>"
@@ -6438,6 +6444,10 @@ class UpdateWindow(QMainWindow):
                 f"<b>{n}</b> package{'s' if n != 1 else ''} available "
                 f"<span style='color:{_secondary_hex()}'>· release notes loaded ✓</span>"
             )
+        if self._status_owner:
+            # A live message — a job or a load — owns the line right now;
+            # this becomes the resting text when it ends.
+            return
         self._sub.setText(self._fit_status_line(self._idle_summary))
 
     # — Selection —
@@ -6491,18 +6501,24 @@ class UpdateWindow(QMainWindow):
         self._content_stack.setCurrentIndex(idx)
         self._footer_stack.setCurrentIndex(idx)
         self._view_buttons[key].setChecked(True)
+        # The status line follows the page you are looking at: a load on
+        # this page speaks, a load on another one goes quiet (see
+        # _render_resting_status).
+        self._render_resting_status()
         if key == "obsolete" and not self._obs_loaded:
             # Never compute on the GUI thread (pacman spawns freeze
-            # the UI) — show a loading note; the checker fills it in.
-            self._obs_summary.setText("Scanning for obsolete packages…")
+            # the UI) — say so on the status line and in the box; the
+            # checker fills it in.
+            self._set_load_status("obsolete",
+                                  "Looking for packages no repository "
+                                  "provides…")
             self._load_obsolete_async()
         if key == "untracked" and not self._untracked_loaded \
                 and self._untracked_loader is None:
-            # Same lazy pattern: scan only when first opened.
+            # Same lazy pattern: scan only when first opened (the page's
+            # own refresh puts the box and the status line right).
             self._un_loading = True
-            self._un_summary.setText("Scanning for untracked software…")
-            self._un_empty.show_loading(
-                "Looking for software pacman doesn't track…")
+            self._refresh_untracked_summary()
             self._untracked_loader = UntrackedLoader()
             self._untracked_loader.done.connect(self._on_untracked_loaded)
             self._untracked_loader.start()
@@ -6762,6 +6778,9 @@ class UpdateWindow(QMainWindow):
         self._refresh_update_stats()
         n_cached = len(cached)
         self._set_idle_header(n_cached)
+        # The check that produced these rows is done speaking: the line
+        # goes back to rest (or to whatever the visible page is reading).
+        self._end_job_status()
         if n_cached < n:
             self._progress.setRange(0, max(n, 1))
             self._progress.setValue(n_cached)
@@ -6880,7 +6899,8 @@ class UpdateWindow(QMainWindow):
             return
         self._log_action("Rescanning for obsolete packages…")
         self._obs_loaded = False
-        self._obs_summary.setText("Rescanning for obsolete packages…")
+        self._set_load_status("obsolete",
+                              "Looking for packages no repository provides…")
         if not self._obs_cards:
             self._obs_empty.show_loading(
                 "Looking for packages no repository provides…")
@@ -6925,20 +6945,12 @@ class UpdateWindow(QMainWindow):
             self._obs_cards[name] = card
             self._obs_lay.insertWidget(self._obs_lay.count() - 1, card)
         if names:
-            self._obs_summary.setText(
-                f"<b>{len(names)}</b> package"
-                f"{'s' if len(names) != 1 else ''} no longer provided by any "
-                "repository — usually split packages dropped upstream. "
-                "Safe to remove.")
             self._obs_empty.hide_state()
             self._obs_footer_label.setText(
                 f"{len(names)} obsolete package{'s' if len(names) != 1 else ''}")
             self._obs_remove_btn.setText(
                 f"Remove {len(names)} obsolete")
         else:
-            self._obs_summary.setText(
-                "Nothing obsolete — every installed package is still "
-                "provided by a repository.")
             self._obs_empty.show_state(
                 "Nothing to clean up",
                 "Every installed package is still provided by a repository.",
@@ -6946,6 +6958,7 @@ class UpdateWindow(QMainWindow):
             self._obs_footer_label.setText("Nothing to remove")
             self._obs_remove_btn.setText("Remove obsolete")
         self._obs_remove_btn.setEnabled(bool(names))
+        self._set_load_status("obsolete", "")
         self._update_view_badges()
 
     def _remove_obsolete_from_view(self) -> None:
@@ -6985,7 +6998,12 @@ class UpdateWindow(QMainWindow):
         if self._sec_scanner is not None and self._sec_scanner.isRunning():
             return
         self._sec_scan_btn.setEnabled(False)
-        self._sec_status.setText("Scanning installed packages…")
+        self._set_status("Scanning installed packages against known "
+                         "supply-chain attacks…", "info")
+        # The header track carries the scan's progress (it has a total to
+        # fill against as soon as the first package reports in).
+        self._set_progress_state("active")
+        self._progress.setRange(0, 0)
         self._sec_empty.show_loading("Checking installed packages against "
                                      "known supply-chain attacks…")
         for card in self._sec_cards.values():
@@ -6999,7 +7017,9 @@ class UpdateWindow(QMainWindow):
         self._sec_scanner.start()
 
     def _on_sec_progress(self, current: int, total: int, pkg: str) -> None:
-        self._sec_status.setText(f"Scanning… {current}/{total}  ({pkg})")
+        self._set_status(f"Scanning… {current}/{total}  ({pkg})", "info")
+        self._progress.setRange(0, max(total, 1))
+        self._progress.setValue(current)
 
     def _on_sec_done(self, results: list[dict]) -> None:
         self._release_thread("_sec_scanner")
@@ -7018,26 +7038,27 @@ class UpdateWindow(QMainWindow):
         self._log_action(
             f"Security scan complete — {n} checked, "
             f"{n_comp} compromised")
+        # The track rests at full in the verdict's colour, the way a
+        # finished update run leaves it; the next check resets it.
+        self._progress.setRange(0, max(n, 1))
+        self._progress.setValue(max(n, 1))
         if n_comp:
             self._sec_empty.hide_state()
-            self._sec_status.setText(
-                f"<b style='color:{_negative_hex()}'>{n_comp} compromised package"
-                f"{'s' if n_comp != 1 else ''} found</b> — review "
-                f"{'it' if n_comp == 1 else 'them'} before updating.")
             self._set_status(
                 f"Security scan: {n_comp} compromised package"
                 f"{'s' if n_comp != 1 else ''} found — see Security view.",
                 "error")
+            self._set_progress_state("error")
         else:
             self._sec_empty.show_state(
                 "Nothing found", f"{n} packages checked — none compromised.",
                 icon="check-circle", colour="positive")
-            # Back to the standing instruction: the count is in the footer
-            # and the verdict is in the empty state, so nothing repeats.
-            self._sec_status.setText(_SEC_SCAN_HINT)
+            # The verdict is in the empty state and the count is in the
+            # footer, so nothing repeats.
             self._set_status(
                 f"Security scan complete — {n} packages checked, "
                 "none compromised.", "ok")
+            self._set_progress_state("ok")
 
     # ── Tracked view ─────────────────────────────────────────────────────────
     def _on_tracked_loaded(self, installed: list[dict]) -> None:
@@ -7151,10 +7172,13 @@ class UpdateWindow(QMainWindow):
         return True
 
     def _refresh_tracked_summary(self) -> None:
+        """The tracked page's own state: placeholder, status line, footer.
+
+        The page has no summary line any more — the strip above the list
+        carries the numbers (see _refresh_track_stats), and a read in
+        progress reports itself on the status line, top left.
+        """
         n = self._track_model.rowCount()
-        counts = self._track_model.source_counts()
-        n_aur = counts.get(SRC_AUR, 0)
-        n_flat = counts.get(SRC_FLATPAK, 0)
         if n:
             self._track_empty.hide_state()
         elif self._track_loading:
@@ -7169,30 +7193,9 @@ class UpdateWindow(QMainWindow):
             # Not loaded yet: this is a load in progress, not an empty list.
             self._track_empty.show_loading("Reading the installed package "
                                            "list…")
-        if n == 0 and not self._track_loaded:
-            self._track_summary.setText("Loading tracked packages…")
-            self._refresh_tracked_footer()
-            return
-        # One honest line about what is on screen right now: the sources
-        # that are actually here, named in the order they matter.
-        what = f"<b>{n}</b> package{'s' if n != 1 else ''}"
-        if n_flat == n and n:
-            what = f"<b>{n}</b> Flatpak app{'s' if n != 1 else ''}"
-        elif counts.get(SRC_APPIMAGE, 0) == n and n:
-            what = f"<b>{n}</b> AppImage{'s' if n != 1 else ''}"
-        else:
-            n_img = counts.get(SRC_APPIMAGE, 0)
-            extra = []
-            if n_aur:
-                extra.append(f"{n_aur} from the AUR")
-            if n_flat:
-                extra.append(f"{n_flat} Flatpak app"
-                             f"{'s' if n_flat != 1 else ''}")
-            if n_img:
-                extra.append(f"{n_img} AppImage{'s' if n_img != 1 else ''}")
-            if extra:
-                what += " · " + " · ".join(extra)
-        self._track_summary.setText(what + ".")
+        self._set_load_status(
+            "tracked", "" if self._track_loaded
+            else "Reading the installed package list…")
         self._refresh_tracked_footer()
 
     def _refresh_tracked(self) -> None:
@@ -7751,25 +7754,23 @@ class UpdateWindow(QMainWindow):
         self._update_view_badges()
 
     def _refresh_untracked_summary(self) -> None:
+        """The untracked page's own state: strip, status line, footer.
+
+        No summary line above the strip any more: the applications and
+        dependencies cards carry those numbers, and a scan in progress
+        reports itself on the status line, top left (see AGENTS.md).
+        """
         self._refresh_un_stats()
-        na = self._stat_un_apps._value.text()
-        np = self._un_stat_cards["dependencies"]._value.text()
-        if (self._un_model.rowCount() == 0
-                and not self._untracked_loaded):
-            self._un_summary.setText("Scanning for untracked software…")
+        if self._un_loading:
+            self._un_empty.show_loading(
+                "Looking for software pacman doesn't track…")
+            self._set_load_status("untracked",
+                                  "Scanning for untracked software…")
             self._un_footer_label.setText("Loading…")
-            if self._un_loading:
-                self._un_empty.show_loading(
-                    "Looking for software pacman doesn't track…")
-            else:
-                self._un_empty.hide_state()
         else:
-            self._un_summary.setText(
-                f"<b>{na}</b> application{'s' if na != '1' else ''} · "
-                f"<b>{np}</b> dependency package{'s' if np != '1' else ''} — "
-                "not explicitly installed")
-            self._un_footer_label.setText(
-                f"{self._un_model.rowCount()} untracked")
+            self._set_load_status("untracked", "")
+            if self._untracked_loaded:
+                self._refresh_un_placeholders()
         self._refresh_untracked_footer()
 
     def _refresh_untracked_footer(self) -> None:
@@ -8123,15 +8124,62 @@ class UpdateWindow(QMainWindow):
         kind: "info" (plain), "error" (red ✕), "ok" (green ✓).
         """
         if not text:
+            self._status_owner = ""
             self._status_active = False
-            self._sub.setText(self._fit_status_line(self._idle_summary))
+            self._render_resting_status()
             return
         if kind == "error":
             text = f"<b style='color:{_negative_hex()}'>✕</b> {text}"
         elif kind == "ok":
             text = f"<b style='color:{_positive_hex()}'>✓</b> {text}"
         self._status_active = True
+        self._status_owner = "job"
         self._sub.setText(self._fit_status_line(text))
+
+    def _set_load_status(self, key: str, text: str) -> None:
+        """Report a page list loading — on the one status line, top left.
+
+        Pages carry no summary line of their own any more (see AGENTS.md):
+        the stat strip holds the numbers, and what is loading is said on
+        the status line instead. A load speaks only while its own page is
+        the one on screen — that is where the removed line lived — and
+        never over a running job. `key` is the view the load belongs to.
+        """
+        if text:
+            self._loads[key] = text
+        else:
+            self._loads.pop(key, None)
+        self._render_resting_status()
+
+    def _end_job_status(self) -> None:
+        """The job that owned the status line is over: hand the line back.
+
+        Whatever rests behind it speaks next (see _render_resting_status).
+        """
+        self._status_owner = ""
+        self._status_active = False
+        self._render_resting_status()
+
+    def _render_resting_status(self) -> None:
+        """The line when no job owns it: what this page is loading, else
+        the resting summary.
+
+        _idle_summary is what the window says when nothing is happening; a
+        list reading itself on the page you are looking at is more
+        interesting than that. A job (a check or an install) always keeps
+        the line until _end_job_status says it is done.
+        """
+        if self._status_owner == "job":
+            return
+        text = self._loads.get(self._current_view)
+        if text:
+            self._status_owner = "load"
+            self._status_active = True
+            self._sub.setText(self._fit_status_line(text))
+            return
+        self._status_owner = ""
+        self._status_active = False
+        self._sub.setText(self._fit_status_line(self._idle_summary))
 
     def _set_progress_state(self, state: str, text: str = "") -> None:
         """Recolor the header track for a new state: 'normal' (idle),
@@ -8203,6 +8251,9 @@ class UpdateWindow(QMainWindow):
             return
         if not self._updating:
             self._set_idle_header(len(self._updates))
+            # The check is done speaking: the line goes back to rest (or
+            # to whatever the visible page is still reading).
+            self._end_job_status()
             # Release notes in: relax to an empty hairline divider.
             self._set_progress_state("normal")
             self._progress.setRange(0, 1)
@@ -9010,7 +9061,6 @@ class UpdateWindow(QMainWindow):
             self._cancel_btn.setEnabled(True)
             self._show_cancel(False)
             self._refresh_selection_ui()
-            self._obs_summary.setText("Scanning for obsolete packages…")
             self._load_obsolete_async()
             return
         self._set_status("Obsolete packages removed — retrying update…", "info")
@@ -9333,9 +9383,6 @@ class _SourceEnableRunner(QThread):
 
 
 # ── AUR → official moves dialog ──────────────────────────────────────────
-
-_SEC_SCAN_HINT = ("Scan all installed packages against known "
-                  "supply-chain attacks.")
 
 
 class ManagedSourcesDialog(QMainWindow):
