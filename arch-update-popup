@@ -2121,13 +2121,18 @@ def _foreign_pkg_set() -> set[str]:
 
 
 def _tracked_row(name: str, version: str, repo: str, title: str = "",
-                 desktop: str = "", desc: str = "", url: str = "") -> dict:
-    """A complete TrackedModel-compatible row dict."""
+                 desktop: str = "", desc: str = "", url: str = "",
+                 kind: str = "") -> dict:
+    """A complete TrackedModel-compatible row dict.
+
+    `kind` separates the two things the Untracked list holds: "app" (a
+    launcher on disk) and "dependency" (a package pulled in by another).
+    """
     return {"name": name, "title": title, "version": version, "repo": repo,
             "target": "", "source": "", "relation": "",
             "state": "idle", "failed_op": "",
             "desktop": desktop or None, "desc": desc, "checked": False,
-            "url": url, "path": ""}
+            "url": url, "path": "", "kind": kind}
 
 
 class FlatpakRemover(QThread):
@@ -2415,7 +2420,7 @@ class UntrackedLoader(QThread):
             row = _tracked_row(
                 name, version, repo, title=a["title"],
                 desktop=a["file"] if launchable else "",
-                desc=a["comment"], url=a.get("url", ""))
+                desc=a["comment"], url=a.get("url", ""), kind="app")
             # Same app shipped twice (system + user copy, .bak-style
             # twins): collapse on title + launch command.
             key = ((row["title"] or row["name"]).lower(), a["exec"])
@@ -2443,7 +2448,8 @@ class UntrackedLoader(QThread):
                 continue
             rows.append(_tracked_row(
                 parts[0], parts[1],
-                "aur" if parts[0] in foreign else "official"))
+                "aur" if parts[0] in foreign else "official",
+                kind="dependency"))
         rows.sort(key=lambda it: it["name"].lower())
         return rows
 
@@ -4739,17 +4745,23 @@ class PackageDelegate(QStyledItemDelegate):
 class TrackedModel(_FilterableModel, QAbstractListModel):
     """One dict per explicitly installed package."""
 
-    def __init__(self, own_source: str = "") -> None:
+    def __init__(self) -> None:
         super().__init__()
         self._items: list[dict] = []
-        # A list that is itself one source (the dependency packages in the
-        # Untracked tab) answers to that source, not to each row's repo.
-        self._own_source = own_source
         self._init_filter()
 
     def _item_source(self, item: dict) -> str:
-        if self._own_source:
-            return self._own_source
+        """The source a row is filtered by.
+
+        In the Untracked list that is the *kind* of row — an application
+        found on disk or a package pulled in as a dependency — while the
+        badge keeps showing where it actually came from.
+        """
+        kind = item.get("kind")
+        if kind == "dependency":
+            return "dependencies"
+        if kind == "app":
+            return "applications"
         return _source_key(item.get("repo", ""))
 
     def set_packages(self, installed: list[dict],
@@ -6151,21 +6163,23 @@ class UpdateWindow(QMainWindow):
         ft.addWidget(self._track_move_all_btn)
         self._footer_stack.addWidget(self._foot_tracked)
         # ── Untracked page: GUI apps found on disk + dependency packages ──
-        # Both lists reuse the Tracked card design (TrackedModel rows +
-        # TrackedDelegate): checkbox multi-select, Open pill for apps
-        # with a launcher, Uninstall everywhere, View package link.
+        # One list, not two: what is an application and what is a stray
+        # dependency is a filter (the strip above), not a second scroll
+        # area with its own header. The rows reuse the Tracked card
+        # design (checkbox, Open pill, Uninstall, View package).
         self._un_page = QWidget()
         un = QVBoxLayout(self._un_page)
         un.setContentsMargins(0, 0, 0, 0)
         un.setSpacing(_sp(16))
-        # Source strip for the untracked page: what is here and where it
-        # came from. One click narrows both lists; clicking again clears.
+        # Source strip for the untracked page: applications, the stray
+        # dependencies, or everything. One click narrows the list; another
+        # click clears it again.
         self._stat_un_all = _StatCard("0", "untracked", _accent_hex())
         self._stat_un_apps = _StatCard("0", "applications", _accent_hex())
         self._stat_un_deps = _StatCard("0", "dependencies", _warning_hex())
         self._un_stat_cards = {
             "": self._stat_un_all,
-            SRC_MANUAL: self._stat_un_apps,
+            "applications": self._stat_un_apps,
             "dependencies": self._stat_un_deps,
         }
         for key, card in self._un_stat_cards.items():
@@ -6182,22 +6196,11 @@ class UpdateWindow(QMainWindow):
         self._un_summary.setObjectName("meta")
         un.addWidget(self._un_summary)
         un.addWidget(self._un_header)
-        self._unapp_model = TrackedModel()
-        self._unapp_view, self._unapp_delegate = self._make_card_list(
-            self._unapp_model)
-        self._unapp_empty = _placeholder_overlay(self._unapp_view)
-        self._unapp_label = QLabel("APPLICATIONS")
-        self._unapp_label.setObjectName("eyebrow")
-        un.addWidget(self._unapp_label)
-        un.addWidget(self._unapp_view, 3)
-        self._unpkg_model = TrackedModel(own_source="dependencies")
-        self._unpkg_view, self._unpkg_delegate = self._make_card_list(
-            self._unpkg_model)
-        self._unpkg_empty = _placeholder_overlay(self._unpkg_view)
-        self._unpkg_label = QLabel("DEPENDENCY PACKAGES")
-        self._unpkg_label.setObjectName("eyebrow")
-        un.addWidget(self._unpkg_label)
-        un.addWidget(self._unpkg_view, 2)
+        self._un_model = TrackedModel()
+        self._un_view, self._un_delegate = self._make_card_list(
+            self._un_model)
+        self._un_empty = _placeholder_overlay(self._un_view)
+        un.addWidget(self._un_view, 1)
         self._content_stack.addWidget(self._un_page)
         self._untracked_loaded = False
         self._untracked_loader: UntrackedLoader | None = None
@@ -6228,7 +6231,7 @@ class UpdateWindow(QMainWindow):
         self._un_uninstall_btn.setFixedHeight(_sp(34))
         self._un_uninstall_btn.setMinimumWidth(190)
         self._un_uninstall_btn.setToolTip(
-            "Remove every checked app / package (pacman -Rns)")
+            "Remove every checked app / package")
         self._un_uninstall_btn.clicked.connect(
             self._uninstall_untracked_selected)
         fu.addWidget(self._un_uninstall_btn)
@@ -6427,10 +6430,8 @@ class UpdateWindow(QMainWindow):
             # Same lazy pattern: scan only when first opened.
             self._un_loading = True
             self._un_summary.setText("Scanning for untracked software…")
-            self._unapp_empty.show_loading(
-                "Looking for applications pacman doesn't own…")
-            self._unpkg_empty.show_loading(
-                "Looking for dependency packages…")
+            self._un_empty.show_loading(
+                "Looking for software pacman doesn't track…")
             self._untracked_loader = UntrackedLoader()
             self._untracked_loader.done.connect(self._on_untracked_loaded)
             self._untracked_loader.start()
@@ -6507,26 +6508,23 @@ class UpdateWindow(QMainWindow):
             card.set_active(bool(key) and key == cur)
 
     def _toggle_un_filter(self, key: str) -> None:
-        """One source filter for both untracked lists at once."""
-        cur = self._unapp_model.filter_source()
-        new = "" if cur == key else key
-        changed = self._unapp_model.set_source_filter(new)
-        changed = self._unpkg_model.set_source_filter(new) or changed
-        if not changed:
+        """Filter the untracked list: applications, dependencies, or all."""
+        cur = self._un_model.filter_source()
+        if not self._un_model.set_source_filter("" if cur == key else key):
             return
-        self._unapp_delegate.invalidate()
-        self._unpkg_delegate.invalidate()
+        self._un_delegate.invalidate()
         self._refresh_untracked_summary()
         self._refresh_un_stats()
         self._refresh_un_placeholders()
 
     def _refresh_un_stats(self) -> None:
-        apps = self._unapp_model.source_counts()
-        deps = sum(self._unpkg_model.source_counts().values())
-        self._stat_un_all.set_value(str(sum(apps.values()) + deps))
-        self._stat_un_apps.set_value(str(sum(apps.values())))
+        counts = self._un_model.source_counts()
+        deps = counts.get("dependencies", 0)
+        apps = counts.get("applications", 0)
+        self._stat_un_all.set_value(str(apps + deps))
+        self._stat_un_apps.set_value(str(apps))
         self._stat_un_deps.set_value(str(deps))
-        cur = self._unapp_model.filter_source()
+        cur = self._un_model.filter_source()
         for key, card in self._un_stat_cards.items():
             card.set_active(bool(key) and key == cur)
 
@@ -7229,8 +7227,7 @@ class UpdateWindow(QMainWindow):
             self._view_buttons["tracked"].setText(
                 f"Tracked ({n_tr})" if n_tr else "Tracked")
         if getattr(self, "_untracked_loaded", False):
-            n_un = (self._unapp_model.rowCount()
-                    + self._unpkg_model.rowCount())
+            n_un = self._un_model.rowCount()
             self._view_buttons["untracked"].setText(
                 f"Untracked ({n_un})" if n_un else "Untracked")
 
@@ -7739,7 +7736,7 @@ class UpdateWindow(QMainWindow):
             Qt.ItemDataRole.CheckStateRole)
 
     def _un_models(self):
-        return (self._unapp_model, self._unpkg_model)
+        return (self._un_model,)
 
     def _un_selected_names(self) -> list[str]:
         seen: list[str] = []
@@ -7778,34 +7775,24 @@ class UpdateWindow(QMainWindow):
         self._release_thread("_untracked_loader")
         self._untracked_loaded = True
         self._un_loading = False
-        self._unapp_model.set_items(apps)
-        self._unpkg_model.set_items(pkgs)
+        # One list: applications first, then the stray dependencies, so
+        # the two kinds stay grouped even unfiltered.
+        self._un_model.set_items([*apps, *pkgs])
         self._refresh_un_placeholders()
         self._refresh_untracked_summary()
         self._update_view_badges()
 
     def _refresh_un_placeholders(self) -> None:
-        """Empty states for both untracked lists — filter-aware, so a
-        filter that hides everything says so instead of showing a blank."""
-        self._show_un_empty(
-            self._unapp_model, self._unapp_empty,
-            "No untracked applications",
-            "Every application with a launcher is owned by a package — "
-            "or came from Flatpak, which lives in Tracked.")
-        self._show_un_empty(
-            self._unpkg_model, self._unpkg_empty,
-            "No stray dependencies",
-            "No dependency-installed packages were found.")
-
-    def _show_un_empty(self, model, placeholder, title: str,
-                       blurb: str) -> None:
-        if model.rowCount():
-            placeholder.hide_state()
+        """The list's empty state — filter-aware, so a filter that hides
+        everything says so instead of showing a blank."""
+        if self._un_model.rowCount():
+            self._un_empty.hide_state()
             return
-        src = model.filter_source()
+        src = self._un_model.filter_source()
         if src:
-            label = _SOURCE_META.get(src, (src, ""))[0]
-            placeholder.show_state(
+            label = {"applications": "an application",
+                     "dependencies": "a dependency package"}.get(src, src)
+            self._un_empty.show_state(
                 "No matches",
                 f"Nothing here is {label}. Clear the filter to see "
                 "everything pacman doesn't track.",
@@ -7813,8 +7800,12 @@ class UpdateWindow(QMainWindow):
             return
         if not self._untracked_loaded:
             return          # the loading placeholder is already up
-        placeholder.show_state(title, blurb, icon="check-circle",
-                               colour="positive")
+        self._un_empty.show_state(
+            "Nothing untracked",
+            "Every application with a launcher is owned by a package — or "
+            "came from Flatpak, which lives in Tracked — and no stray "
+            "dependencies were found.",
+            icon="check-circle", colour="positive")
 
     def _refresh_untracked(self) -> None:
         """Scan again for applications and packages pacman doesn't own."""
@@ -7824,8 +7815,7 @@ class UpdateWindow(QMainWindow):
         self._log_action("Scanning for untracked software…")
         self._untracked_loaded = False
         self._un_loading = True
-        self._unapp_model.set_items([])
-        self._unpkg_model.set_items([])
+        self._un_model.set_items([])
         self._release_thread("_untracked_loader")
         self._untracked_loader = UntrackedLoader()
         self._untracked_loader.done.connect(self._on_untracked_loaded)
@@ -7835,31 +7825,30 @@ class UpdateWindow(QMainWindow):
 
     def _refresh_untracked_summary(self) -> None:
         self._refresh_un_stats()
-        na = self._unapp_model.rowCount()
-        np = self._unpkg_model.rowCount()
-        if na == 0 and np == 0 and not self._untracked_loaded:
+        na = self._stat_un_apps._value.text()
+        np = self._un_stat_cards["dependencies"]._value.text()
+        if (self._un_model.rowCount() == 0
+                and not self._untracked_loaded):
             self._un_summary.setText("Scanning for untracked software…")
             self._un_footer_label.setText("Loading…")
             if self._un_loading:
-                self._unapp_empty.show_loading(
-                    "Looking for applications pacman doesn't own…")
-                self._unpkg_empty.show_loading(
-                    "Looking for dependency packages…")
+                self._un_empty.show_loading(
+                    "Looking for software pacman doesn't track…")
             else:
-                self._unapp_empty.hide_state()
-                self._unpkg_empty.hide_state()
+                self._un_empty.hide_state()
         else:
             self._un_summary.setText(
-                f"<b>{na}</b> application{'s' if na != 1 else ''} · "
-                f"<b>{np}</b> dependency package{'s' if np != 1 else ''} — "
+                f"<b>{na}</b> application{'s' if na != '1' else ''} · "
+                f"<b>{np}</b> dependency package{'s' if np != '1' else ''} — "
                 "not explicitly installed")
-            self._un_footer_label.setText(f"{na} apps · {np} packages")
+            self._un_footer_label.setText(
+                f"{self._un_model.rowCount()} untracked")
         self._refresh_untracked_footer()
 
     def _refresh_untracked_footer(self) -> None:
         sel = self._un_selected_names()
         n_sel = len(sel)
-        n = (self._unapp_model.rowCount() + self._unpkg_model.rowCount())
+        n = self._un_model.rowCount()
         # The header's count is kept current even while the scan runs, so
         # that strip never looks half-empty.
         self._un_header.set_state(n_sel, n)
@@ -7882,11 +7871,8 @@ class UpdateWindow(QMainWindow):
                 f"Uninstall {n_sel} selected")
             self._un_uninstall_btn.setEnabled(True)
             return
-        na = self._unapp_model.rowCount()
-        np = self._unpkg_model.rowCount()
         self._un_footer_label.setText(
-            f"{na} app{'s' if na != 1 else ''} · "
-            f"{np} package{'s' if np != 1 else ''}")
+            f"{self._un_model.rowCount()} untracked")
         self._un_uninstall_btn.setText("Uninstall selected")
         self._un_uninstall_btn.setEnabled(False)
 

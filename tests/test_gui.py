@@ -1342,8 +1342,9 @@ class TestViews:
     def _stage_untracked(self, window, qapp):
         apps = [app._tracked_row("firefox", "1.0-1", "official",
                                  title="Firefox", desktop="/u/firefox.desktop",
-                                 desc="Web browser")]
-        pkgs = [app._tracked_row("libfoo", "2-1", "official")]
+                                 desc="Web browser", kind="app")]
+        pkgs = [app._tracked_row("libfoo", "2-1", "official",
+                                 kind="dependency")]
         window._on_untracked_loaded(apps, pkgs)
         qapp.processEvents()
         return apps, pkgs
@@ -1381,32 +1382,32 @@ class TestViews:
     def test_untracked_loads_and_badges(self, window, qapp):
         self._stage_untracked(window, qapp)
         assert window._untracked_loaded is True
-        assert window._unapp_model.rowCount() == 1
-        assert window._unpkg_model.rowCount() == 1
+        assert window._un_model.rowCount() == 2   # one app + one package
         assert window._view_buttons["untracked"].text() == "Untracked (2)"
         assert "1</b> application" in window._un_summary.text()
         assert "1</b> dependency package" in window._un_summary.text()
         # App row shows the title; ops use the package name.
-        d = window._unapp_view.itemDelegate()
+        d = window._un_view.itemDelegate()
         from PyQt6.QtWidgets import QStyleOptionViewItem as _Opt
-        idx = window._unapp_model.index(0)
+        idx = window._un_model.index(0)
         opt = _Opt()
-        opt.rect = window._unapp_view.visualRect(idx)
-        opt.palette = window._unapp_view.palette()
-        opt.font = window._unapp_view.font()
-        lay = d._geom(0, window._unapp_model.item(0), opt.rect.width())
+        opt.rect = window._un_view.visualRect(idx)
+        opt.palette = window._un_view.palette()
+        opt.font = window._un_view.font()
+        lay = d._geom(0, window._un_model.item(0), opt.rect.width())
         assert lay["title"] == "Firefox"
 
     def test_untracked_batch_footer(self, window, qapp):
         self._stage_untracked(window, qapp)
         assert window._un_uninstall_btn.text() == "Uninstall selected"
         assert not window._un_uninstall_btn.isEnabled()
-        window._unapp_model.set_all(True)
+        window._un_model.set_all(True)
         window._refresh_untracked_footer()
         qapp.processEvents()
-        assert window._un_uninstall_btn.text() == "Uninstall 1 selected"
+        # One list now: the app and the dependency package are both here.
+        assert window._un_uninstall_btn.text() == "Uninstall 2 selected"
         assert window._un_uninstall_btn.isEnabled()
-        assert "1 of 2 selected" in window._un_sel_label.text()
+        assert "All 2" in window._un_sel_label.text()
 
     def test_untracked_uninstall_success(self, window, qapp, monkeypatch):
         monkeypatch.setattr(app, "QMessageBox", self._AcceptBox)
@@ -1422,11 +1423,12 @@ class TestViews:
         self._stage_untracked(window, qapp)
         window._request_untracked_uninstall("libfoo")
         assert isinstance(window._untracked_uninstaller, FakeRunner)
-        assert window._unpkg_model.item(0)["state"] == "uninstalling"
+        row = window._un_model.row_of("libfoo")
+        assert window._un_model.item(row)["state"] == "uninstalling"
         window._untracked_uninstaller.done.emit(True, "")
         qapp.processEvents()
-        assert window._unpkg_model.row_of("libfoo") is None
-        assert window._unapp_model.rowCount() == 1  # untouched
+        assert window._un_model.row_of("libfoo") is None
+        assert window._un_model.row_of("firefox") is not None  # untouched
         assert "uninstalled" in window._sub.text()
 
     def test_untracked_unowned_app_skipped(self, window, qapp, monkeypatch):
@@ -1876,14 +1878,14 @@ class TestCardListRemeasure:
         window._switch_view("tracked")
         qapp.processEvents()
         # One real row so sizeHint is exercised, then narrow via log panel.
-        window._unapp_model.set_items([
+        window._un_model.set_items([
             app._tracked_row("zed", "1.0-1", "aur")])
         window._log_btn.setChecked(True)
         qapp.processEvents()
         new_w = window._track_list.viewport().width()
         d = window._track_list.itemDelegate()
         assert d is not window._list.itemDelegate()
-        idx = window._unapp_model.index(0)
+        idx = window._un_model.index(0)
         if idx.isValid():
             from PyQt6.QtWidgets import QStyleOptionViewItem
             from PyQt6.QtCore import QRect
@@ -1933,7 +1935,7 @@ class TestPlaceholdersEverywhere:
         qapp.processEvents()
         w._switch_view("untracked")
         qapp.processEvents()
-        for holder in (w._unapp_empty, w._unpkg_empty):
+        for holder in (w._un_empty,):
             assert not holder.isHidden()   # never a blank box
         w.close()
 
@@ -2686,23 +2688,22 @@ class TestStatStripFilters:
         window._on_untracked_loaded(
             [_row("zen", "Zen", "manual"), _row("whisper-flow", "WF",
                                                 "manual")],
-            [_row("libfoo", "libfoo", "official")])
+            [_row("libfoo", "libfoo", "official", kind="dependency")])
         qapp.processEvents()
         cells = window._un_stat_cards
         assert {k: c._value.text() for k, c in cells.items()} == {
-            "": "3", "manual": "2", "dependencies": "1"}
+            "": "3", "applications": "2", "dependencies": "1"}
         cells["dependencies"].clicked.emit()
         qapp.processEvents()
-        assert window._unapp_model.rowCount() == 0
-        assert window._unpkg_model.rowCount() == 1
-        cells["manual"].clicked.emit()
+        assert window._un_model.rowCount() == 1
+        assert window._un_model.item(0)["name"] == "libfoo"
+        cells["applications"].clicked.emit()
         qapp.processEvents()
-        assert window._unapp_model.rowCount() == 2
-        assert window._unpkg_model.rowCount() == 0
-        cells["manual"].clicked.emit()
+        assert window._un_model.rowCount() == 2
+        assert window._un_model.row_of("libfoo") is None
+        cells["applications"].clicked.emit()
         qapp.processEvents()
-        assert window._unapp_model.rowCount() == 2
-        assert window._unpkg_model.rowCount() == 1
+        assert window._un_model.rowCount() == 3
 
     def test_every_strip_is_the_same_height(self, window, qapp):
         # Thin and uniform: the strips are one row of 38px cells.
@@ -2733,10 +2734,11 @@ def _settle_loaders(window, qapp):
     qapp.processEvents()
 
 
-def _row(name, title, repo):
+def _row(name, title, repo, kind="app"):
     return {"name": name, "title": title, "version": "1", "repo": repo,
             "target": "", "source": "", "relation": "", "state": "idle",
-            "failed_op": "", "desktop": None, "desc": "", "checked": False}
+            "failed_op": "", "desktop": None, "desc": "", "checked": False,
+            "url": "", "path": "", "kind": kind}
 
 
 class TestFlatpakRows:
@@ -2903,7 +2905,7 @@ class TestFlatpakRows:
         window._request_untracked_uninstall("com.discordapp.Discord")
         window._untracked_uninstaller.done.emit(True, "uninstalled")
 
-        assert window._unapp_model.row_of("com.discordapp.Discord") is None
+        assert window._un_model.row_of("com.discordapp.Discord") is None
         assert "uninstalled" in window._sub.text()
 
 
