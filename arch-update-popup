@@ -78,31 +78,39 @@ _MANAGED_SOURCES: list[tuple[str, str, str, str]] = [
      "is run on your machine to get one. Already enabled here."),
     ("Chaotic-AUR", "chaotic-aur", """#!/bin/bash
 set -e
-# Trust the Chaotic-AUR signing key.
+# 1. Trust the Chaotic-AUR signing key (must come before anything else).
 pacman-key --recv-key FBA220DFC880C036 --keyserver keyserver.ubuntu.com
 pacman-key --lsign-key FBA220DFC880C036
-# Install its keyring and mirrorlist.
-pacman -Sy --noconfirm chaotic-keyring chaotic-mirrorlist
-# Add the repo (idempotent) and refresh.
+# 2. Add the repo to pacman.conf (idempotent) — the keyring package below
+#    comes FROM this repo, so it must be registered first.
 if ! grep -q '^\\[chaotic-aur\\]' /etc/pacman.conf; then
     printf '\\n[chaotic-aur]\\nInclude = /etc/pacman.d/chaotic-mirrorlist\\n' \
         >> /etc/pacman.conf
 fi
+# 3. Refresh so pacman can see the new repo.
+pacman -Sy
+# 4. Install the keyring and mirrorlist from the new repo.
+pacman -Sy --noconfirm chaotic-keyring chaotic-mirrorlist
+# 5. Refresh again with the new keyring in place.
 pacman -Sy""",
      "A semi-automated AUR build farm: packages are signed, the PKGBUILD and "
      "its sources are statically scanned before a build, and a package is "
      "held back unless every AUR maintainer involved is trusted."),
     ("archlinuxcn", "archlinuxcn", """#!/bin/bash
 set -e
-# Import the archlinuxcn signing key.
+# 1. Import and trust the archlinuxcn signing key.
 pacman-key --recv-key 7931B6D628C8D3BA --keyserver keyserver.ubuntu.com
 pacman-key --lsign-key 7931B6D628C8D3BA
-# Add the repo (idempotent), then install its keyring and refresh.
+# 2. Add the repo (idempotent) — the keyring package comes from it.
 if ! grep -q '^\\[archlinuxcn\\]' /etc/pacman.conf; then
     printf '\\n[archlinuxcn]\\nServer = https://repo.archlinuxcn.org/$arch\\n' \
         >> /etc/pacman.conf
 fi
+# 3. Refresh so pacman can see the new repo.
+pacman -Sy
+# 4. Install the keyring from the new repo.
 pacman -Sy --noconfirm archlinuxcn-keyring
+# 5. Refresh again with the new keyring in place.
 pacman -Sy""",
      "A long-running community repo with prebuilt AUR packages. Convenient, "
      "but one maintainer team stands behind all of it."),
