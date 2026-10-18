@@ -2947,3 +2947,93 @@ class TestViewPackageLinks:
         lay = d._geom(0, window._track_model.item(0), 1240)
         assert lay["link"].isNull()
         assert opened == []
+
+
+class TestOpeningFlatpakApps:
+    """Open on a Flatpak row runs Flatpak, and says why when it can't."""
+
+    def _stage(self, window, qapp, monkeypatch):
+        _settle_loaders(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "com.discordapp.Discord", "version": "1",
+              "repo": "flatpak", "title": "Discord",
+              "desktop": "/var/lib/flatpak/exports/share/applications/"
+                         "com.discordapp.Discord.desktop"}])
+        qapp.processEvents()
+
+    def test_open_runs_flatpak_run_with_the_app_id(self, window, qapp,
+                                                  monkeypatch):
+        calls = []
+        monkeypatch.setattr(app, "flatpak_portal_missing", lambda: False)
+        monkeypatch.setattr(
+            app.QProcess, "startDetached",
+            staticmethod(lambda prog, args=None: (
+                calls.append((prog, list(args or []))), True)[1]))
+        self._stage(window, qapp, monkeypatch)
+
+        window._open_tracked_app("com.discordapp.Discord")
+
+        assert calls == [("flatpak", ["run", "com.discordapp.Discord"])]
+        assert "Opened" in window._log_view.toPlainText()
+
+    def test_a_dead_document_portal_is_named_as_the_reason(
+            self, window, qapp, monkeypatch):
+        # The real failure that reads as "Flatpak apps don't open any
+        # more": bwrap dies on the missing doc dir, everywhere.
+        monkeypatch.setattr(app, "flatpak_portal_missing", lambda: True)
+        started = []
+        monkeypatch.setattr(app.QProcess, "startDetached",
+                            staticmethod(lambda *a: started.append(a)))
+        _accept_box(monkeypatch, "Not now")
+        self._stage(window, qapp, monkeypatch)
+
+        window._open_tracked_app("com.discordapp.Discord")
+
+        assert started == []
+        # The status line is elided to one line, so check the log too.
+        text = window._sub.text() + window._log_view.toPlainText()
+        assert "document portal" in text
+        assert "xdg-document-portal" in text
+
+    def test_it_offers_to_restart_the_portal_and_then_opens(
+            self, window, qapp, monkeypatch):
+        ran = []
+        missing = {"yes": True}
+
+        class R:
+            returncode = 0
+
+        monkeypatch.setattr(app, "flatpak_portal_missing",
+                            lambda: missing["yes"])
+        monkeypatch.setattr(
+            app, "_run",
+            lambda cmd, **k: (ran.append(cmd), missing.update(yes=False),
+                              R())[2])
+        started = []
+        monkeypatch.setattr(
+            app.QProcess, "startDetached",
+            staticmethod(lambda prog, args=None: (
+                started.append((prog, list(args or []))), True)[1]))
+        _accept_box(monkeypatch, "Restart it")
+        self._stage(window, qapp, monkeypatch)
+
+        window._open_tracked_app("com.discordapp.Discord")
+
+        assert ran == [["systemctl", "--user", "restart",
+                        "xdg-document-portal"]]
+        assert started == [("flatpak", ["run", "com.discordapp.Discord"])]
+
+    def test_other_rows_still_launch_their_desktop_entry(self, window, qapp,
+                                                         monkeypatch):
+        seen = []
+        monkeypatch.setattr(app, "_launch_desktop",
+                            lambda path: (seen.append(path), True)[1])
+        _settle_loaders(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "zen", "version": "1", "repo": "manual",
+              "title": "Zen", "desktop": "/u/zen.desktop"}])
+        qapp.processEvents()
+
+        window._open_tracked_app("zen")
+
+        assert seen == ["/u/zen.desktop"]

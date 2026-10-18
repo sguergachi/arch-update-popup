@@ -1622,26 +1622,39 @@ def _desktop_launchable(path: str) -> bool:
         and ("true" not in low.get("terminal", ""))
 
 
+def desktop_argv(path: str) -> list[str]:
+    """The command line a .desktop file's Exec= means, for a plain launch.
+
+    The spec's field codes (%f %F %u %U …) are runtime-provided and empty
+    here, and Flatpak's file-forwarding markers (@@u %U @@) only make
+    sense around a file that is actually being forwarded — left behind,
+    they become arguments the app never asked for.
+    """
+    entry = _desktop_entry(path)
+    exec_line = entry.get("Exec", "").strip()
+    if not exec_line:
+        return []
+    # Expand the codes we can, drop the rest (spec: %f %F %u %U %d %D
+    # %n %N %v %m are runtime-provided and empty here).
+    prog = exec_line.replace("%%", "\0")
+    # %c is the app's name: one argument, even when it has spaces in it.
+    prog = prog.replace("%k", shlex.quote(path))
+    prog = prog.replace("%c", shlex.quote(entry.get("Name", "")))
+    prog = re.sub(r"%[fFuUdDnNvVmik]", "", prog).replace("\0", "%")
+    try:
+        argv = shlex.split(prog, posix=True)
+    except ValueError:
+        return []
+    return [a for a in argv if a and not a.startswith("@@")]
+
+
 def _launch_desktop(path: str) -> bool:
     """Really launch a .desktop file: parse Exec= and start it detached.
 
     openUrl() on a .desktop file just opens the file itself — this runs
     the app instead. Returns True when the process was started.
     """
-    entry = _desktop_entry(path)
-    exec_line = entry.get("Exec", "").strip()
-    if not exec_line:
-        return False
-    # Expand the codes we can, drop the rest (spec: %f %F %u %U %d %D
-    # %n %N %v %m are runtime-provided and empty here).
-    prog = exec_line.replace("%%", "\0")
-    prog = prog.replace("%k", path).replace("%c", entry.get("Name", ""))
-    prog = re.sub(r"%[fFuUdDnNvVmik]", "", prog).replace("\0", "%")
-    try:
-        argv = shlex.split(prog, posix=True)
-    except ValueError:
-        return False
-    argv = [a for a in argv if a]
+    argv = desktop_argv(path)
     if not argv:
         return False
     program = argv[0]
@@ -1922,6 +1935,17 @@ def _appimage_row(path: str, launcher: dict | None) -> dict:
         # The file itself is the removal target — no package owns it.
         "path": path,
     }
+
+
+def flatpak_portal_missing() -> bool:
+    """True when Flatpak's document portal is not providing its doc dir.
+
+    Every Flatpak app is bound to /run/user/<uid>/doc/by-app/<app id>;
+    with the portal down that path is missing and bwrap kills the launch
+    ("Can't find source path") — from the desktop menu as much as from
+    here, which reads as "Flatpak apps don't open any more".
+    """
+    return not os.path.isdir(f"/run/user/{os.getuid()}/doc/by-app")
 
 
 def _flatpak_apps() -> dict[str, tuple[str, str]]:
@@ -6894,17 +6918,78 @@ class UpdateWindow(QMainWindow):
 
     def _open_tracked_app(self, name: str) -> None:
         r = self._track_model.row_of(name)
-        desktop = self._track_model.item(r)["desktop"] if r is not None else ""
-        if not desktop:
+        if r is None:
             return
-        try:
-            ok = _launch_desktop(desktop)
-        except Exception:
-            ok = False
+        item = self._track_model.item(r)
+        if _source_key(item["repo"]) == SRC_FLATPAK:
+            # Flatpak's own launcher: `flatpak run <app id>`. Its desktop
+            # Exec is written for the *desktop entry* to run — branch and
+            # arch flags plus file-forwarding markers — and none of that
+            # belongs on a plain command line.
+            if not self._ensure_flatpak_portal(name):
+                return
+            ok = bool(QProcess.startDetached("flatpak", ["run", name]))
+        else:
+            desktop = item["desktop"] or ""
+            if not desktop:
+                return
+            try:
+                ok = _launch_desktop(desktop)
+            except Exception:
+                ok = False
         if ok:
             self._log_action(f"Opened {name}")
         else:
             self._set_status(f"Couldn't open {name}", "error")
+
+    def _ensure_flatpak_portal(self, name: str) -> bool:
+        """Flatpak can only start an app when its document portal is up.
+
+        Every app is bound to /run/user/<uid>/doc/by-app/<app id>; with the
+        portal down bwrap kills the launch — from this app and from the
+        desktop menu alike, which reads as "Flatpak apps don't open any
+        more". Restarting the user service is the whole fix, so offer it.
+        """
+        if not flatpak_portal_missing():
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Flatpak apps can't start")
+        box.setText("Flatpak's document portal isn't running.")
+        box.setInformativeText(
+            "Every Flatpak app needs it, and none can start without it — "
+            "from this app and from your desktop menu alike.\n\n"
+            "Restart it now?")
+        go_btn = box.addButton("Restart it",
+                               QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Not now", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is not go_btn:
+            self._set_status(
+                f"Couldn't open {name} — Flatpak's document portal isn't "
+                "running.", "error")
+            self._log_action(
+                f"Opening {name} failed: the Flatpak document portal is down "
+                "— restart it with: systemctl --user restart "
+                "xdg-document-portal")
+            return False
+        try:
+            res = _run(["systemctl", "--user", "restart",
+                        "xdg-document-portal"],
+                       capture_output=True, text=True, timeout=30)
+            restarted = res.returncode == 0
+        except Exception:
+            restarted = False
+        if not restarted or flatpak_portal_missing():
+            self._set_status(
+                "Couldn't restart Flatpak's document portal — try: "
+                "systemctl --user restart xdg-document-portal", "error")
+            self._log_action(
+                "Restarting Flatpak's document portal failed — run: "
+                "systemctl --user restart xdg-document-portal")
+            return False
+        self._log_action("Restarted Flatpak's document portal")
+        return True
 
     def _refresh_tracked_summary(self) -> None:
         n = self._track_model.rowCount()

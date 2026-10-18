@@ -904,3 +904,48 @@ class TestDependencyRows:
         assert by_name["libbar"]["desc"] == \
             "No explicitly installed package needs it."
         assert by_name["libfoo"]["kind"] == "dependency"
+
+
+class TestDesktopLaunch:
+    """A .desktop Exec is not a command line."""
+
+    def test_field_codes_are_dropped(self, tmp_path):
+        f = tmp_path / "zen.desktop"
+        f.write_text("[Desktop Entry]\nName=Zen\nExec=/usr/bin/zen %U\n"
+                     "Type=Application\n")
+        assert app.desktop_argv(str(f)) == ["/usr/bin/zen"]
+
+    def test_flatpak_forwarding_markers_are_dropped(self, tmp_path):
+        # The shape Flatpak writes: @@u %U @@ around the forwarded file.
+        # With no file to forward, the markers are arguments the app never
+        # asked for — and bwrap used to die on them.
+        f = tmp_path / "com.discordapp.Discord.desktop"
+        f.write_text(
+            "[Desktop Entry]\nName=Discord\n"
+            "Exec=/usr/bin/flatpak run --branch=stable --arch=x86_64 "
+            "--command=com.discordapp.Discord --file-forwarding "
+            "com.discordapp.Discord @@u %U @@\nType=Application\n")
+        argv = app.desktop_argv(str(f))
+        assert argv[:2] == ["/usr/bin/flatpak", "run"]
+        assert argv[-1] == "com.discordapp.Discord"
+        assert not [a for a in argv if a.startswith("@@")]
+
+    def test_a_launcher_with_no_exec_launches_nothing(self, tmp_path):
+        f = tmp_path / "empty.desktop"
+        f.write_text("[Desktop Entry]\nName=Nothing\nType=Application\n")
+        assert app.desktop_argv(str(f)) == []
+
+    def test_name_and_icon_codes_expand(self, tmp_path):
+        f = tmp_path / "app.desktop"
+        f.write_text("[Desktop Entry]\nName=My App\n"
+                     "Exec=/usr/bin/app --name %c\nType=Application\n")
+        assert app.desktop_argv(str(f)) == ["/usr/bin/app", "--name", "My App"]
+
+    def test_the_document_portal_check_follows_the_doc_dir(self, monkeypatch,
+                                                           tmp_path):
+        doc = tmp_path / "doc"
+        monkeypatch.setattr(app.os, "getuid", lambda: 1234)
+        monkeypatch.setattr(app.os.path, "isdir",
+                            lambda p: p == str(doc) if "doc" in p else False)
+        # No by-app under it → the portal is not providing anything.
+        assert app.flatpak_portal_missing() is True
