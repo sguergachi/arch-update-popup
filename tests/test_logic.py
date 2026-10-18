@@ -389,7 +389,7 @@ class TestManagedSources:
             assert app._source_key(repo) == app.SRC_MANAGED
             # Named, not swallowed into "official": which farm built it
             # matters when you are deciding what to trust.
-            assert app._source_label(repo) == "third-party"
+            assert app._source_label(repo) == repo
 
     def test_parse_sync_info_reads_the_repo(self):
         out = (
@@ -630,13 +630,128 @@ class TestSourceKeys:
         assert app._source_key("flatpak") == app.SRC_FLATPAK
         assert app._source_key("") == app.SRC_MANUAL
         assert app._source_label("flatpak") == "flatpak"
-        assert app._source_label("cachyos-v3") == "third-party"
+        assert app._source_label("cachyos-v3") == "cachyos"
 
     def test_every_source_has_a_badge_colour(self):
         for repo in ("official", "aur", "flatpak", "", "cachyos-v3",
                      "extra-testing"):
             rgb, fg = app._repo_tint(repo)
             assert len(rgb) == 3 and fg.startswith("#")
+
+
+class TestRepoBadges:
+    """A row's pill names the repo that actually provides the package."""
+
+    def test_archs_own_repos_are_one_word(self):
+        for repo in ("official", "core", "extra", "multilib",
+                     "extra-testing"):
+            assert app._repo_badge(repo) == "OFFICIAL"
+
+    def test_a_cachyos_build_never_wears_archs_badge(self):
+        # The four cachyos-* repos are one build farm, and the pill has no
+        # room for "cachyos-extra-v3": the whole family reads CACHYOS.
+        for repo in ("cachyos", "cachyos-v3", "cachyos-extra-v3",
+                     "cachyos-core-v3"):
+            assert app._repo_family(repo) == "CachyOS"
+            assert app._repo_badge(repo) == "CACHYOS"
+
+    def test_other_farms_keep_their_own_name(self):
+        assert app._repo_badge("chaotic-aur") == "CHAOTIC-AUR"
+        assert app._repo_badge("archlinuxcn") == "ARCHLINUXCN"
+        assert app._repo_badge("alhp") == "ALHP"
+
+    def test_a_pseudo_source_names_itself(self):
+        assert app._repo_badge("aur") == "AUR"
+        assert app._repo_badge("flatpak") == "FLATPAK"
+        assert app._repo_badge("appimage") == "APPIMAGE"
+        assert app._repo_badge("manual") == "MANUAL"
+
+    def test_nothing_known_means_no_pill(self):
+        assert app._repo_badge("") == ""
+
+
+class TestInstalledRepos:
+    """Where a tracked package came from: pacman's own local DB."""
+
+    def _db(self, tmp_path, entries):
+        for entry, name, repo in entries:
+            d = tmp_path / entry
+            d.mkdir()
+            text = f"%NAME%\n{name}\n\n%VERSION%\n1\n\n"
+            if repo:
+                text += f"%INSTALLED_DB%\n{repo}\n\n"
+            (d / "desc").write_text(text, encoding="utf-8")
+        return str(tmp_path)
+
+    def test_local_db_records_are_read(self, monkeypatch, tmp_path):
+        root = self._db(tmp_path, [
+            ("cachy-update-4.4.3-1", "cachy-update", "cachyos"),
+            ("coreutils-9.12-2.1", "coreutils", "core"),
+            ("oldtimer-1.0-1", "oldtimer", None)])
+        monkeypatch.setattr(app, "PACMAN_LOCAL_DB", root)
+        assert app._installed_db_repos() == {"cachy-update": "cachyos",
+                                             "coreutils": "core"}
+
+    def test_a_missing_db_is_no_map(self, monkeypatch):
+        monkeypatch.setattr(app, "PACMAN_LOCAL_DB", "/nonexistent/db")
+        assert app._installed_db_repos() == {}
+
+    def test_explicit_packages_are_labelled_by_where_they_came_from(
+            self, monkeypatch):
+        class R:
+            stdout, returncode = "konsole 24.1-1\ncachy-update 4.4.3-1\n" \
+                                 "yay-bin 12.0-1\n", 0
+
+        monkeypatch.setattr(app, "_run", lambda *a, **k: R())
+        monkeypatch.setattr(app, "_installed_repo_map", lambda: {
+            "konsole": "extra", "cachy-update": "cachyos",
+            "yay-bin": "aur"})
+        repos = {p["name"]: p["repo"] for p in app.get_installed_packages()}
+        assert repos == {"konsole": "extra", "cachy-update": "cachyos",
+                         "yay-bin": "aur"}
+
+    def test_a_package_from_before_installed_db_keeps_its_old_answer(
+            self, monkeypatch):
+        class R:
+            stdout, returncode = "konsole 24.1-1\n", 0
+
+        monkeypatch.setattr(app, "_run", lambda *a, **k: R())
+        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
+        assert app.get_installed_packages() == [
+            {"name": "konsole", "version": "24.1-1", "repo": "official"}]
+
+    def test_where_it_came_from_beats_who_provides_it_now(self, monkeypatch):
+        monkeypatch.setattr(app, "_installed_db_repos",
+                            lambda: {"konsole": "extra"})
+        monkeypatch.setattr(app, "_sync_repo_map",
+                            lambda: {"konsole": "cachyos-extra-v3",
+                                     "ghost": "extra"})
+        monkeypatch.setattr(app, "_foreign_pkg_set", lambda: {"yay-bin"})
+        assert app._installed_repo_map() == {
+            "konsole": "extra", "ghost": "extra", "yay-bin": "aur"}
+
+    def test_the_sync_map_keeps_the_first_repo_a_name_appears_in(
+            self, monkeypatch):
+        class R:
+            stdout = ("konsole\tcachyos-extra-v3\n"
+                      "konsole\textra\n"
+                      "firefox\tcachyos-extra-v3\n")
+            returncode = 0
+
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/expac")
+        monkeypatch.setattr(app, "_run", lambda *a, **k: R())
+        assert app._sync_repo_map() == {"konsole": "cachyos-extra-v3",
+                                        "firefox": "cachyos-extra-v3"}
+
+    def test_without_expac_there_is_no_sync_map(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: None)
+        assert app._sync_repo_map() == {}
+
+    def test_a_cachyos_package_lands_in_the_cachyos_bucket(self):
+        # The strip filters by source key, so the honest repo name has to
+        # keep counting as "managed" — not as official.
+        assert app._source_key("cachyos-extra-v3") == app.SRC_MANAGED
+        assert app._source_key("extra") == app.SRC_OFFICIAL
 
 
 class TestFlatpakDetection:
@@ -796,10 +911,16 @@ class TestPackageLinks:
             "https://flathub.org/apps/com.discordapp.Discord"
 
     def test_repo_packages_go_to_the_arch_search(self):
-        for repo in ("official", "core", "extra", "cachyos-v3",
-                     "chaotic-aur"):
+        for repo in ("official", "core", "extra", "extra-testing"):
             url = app._package_url("konsole", repo)
             assert url == "https://archlinux.org/packages/?q=konsole"
+
+    def test_a_cachyos_build_links_to_cachyos_own_search(self):
+        # Not Arch's page for the name: the package you are running came
+        # off CachyOS's build farm, and their search shows that build.
+        for repo in ("cachyos", "cachyos-extra-v3", "cachyos-core-v3"):
+            assert app._package_url("cachyos-hello", repo) == \
+                "https://packages.cachyos.org/?q=cachyos-hello"
 
     def test_an_appimage_links_only_to_its_own_page(self):
         # A file has no registry: no URL in the launcher, no link.
@@ -872,7 +993,7 @@ class TestDependencyRows:
             returncode = 0
 
         monkeypatch.setattr(app, "_run", lambda *a, **k: R())
-        monkeypatch.setattr(app, "_foreign_pkg_set", lambda: set())
+        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
         monkeypatch.setattr(app, "required_by_map",
                             lambda: {"libfoo": ["steam"]})
         monkeypatch.setattr(app, "_explicit_package_set", lambda: {"steam"})
@@ -897,7 +1018,7 @@ class TestDependencyRows:
             returncode = 0
 
         monkeypatch.setattr(app, "_run", lambda *a, **k: R())
-        monkeypatch.setattr(app, "_foreign_pkg_set", lambda: set())
+        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
         monkeypatch.setattr(app, "required_by_map",
                             lambda: {"libfoo": ["gaze-bin"]})
         monkeypatch.setattr(app, "_explicit_package_set", lambda: {"gaze-bin"})
@@ -911,7 +1032,7 @@ class TestDependencyRows:
             returncode = 0
 
         monkeypatch.setattr(app, "_run", lambda *a, **k: R())
-        monkeypatch.setattr(app, "_foreign_pkg_set", lambda: set())
+        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
         monkeypatch.setattr(app, "required_by_map", lambda: {})
         monkeypatch.setattr(app, "all_package_descs", lambda: {})
         rows = app.UntrackedLoader()._load_deps({})

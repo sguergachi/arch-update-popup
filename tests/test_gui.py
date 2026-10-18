@@ -108,7 +108,7 @@ class FakeChecker(QObject):
 
 class FakeInfoFetcher(QObject):
     """InfoFetcher stub: rows arrive only when the test emits them."""
-    row_ready = pyqtSignal(int, str, str, str, str, str, str, str, str)
+    row_ready = pyqtSignal(int, str, str, str, str, str, str, str, str, str)
     finished = pyqtSignal()
 
     def __init__(self, *args, **kwargs):
@@ -255,7 +255,7 @@ class TestWindow:
         assert isinstance(window._recheck_fetcher, FakeInfoFetcher)
         window._recheck_fetcher.row_ready.emit(
             0, "newpkg", "2-1", "Desc!", "notes", "2026-01-01",
-            "full", "", "")
+            "full", "", "", "extra")
         assert window._model.item(0)["desc"] == "Desc!"
         window._recheck_fetcher.finished.emit()
         qapp.processEvents()
@@ -869,6 +869,23 @@ class TestWindow:
         assert lay["notes"].height() <= (
             app.PackageDelegate.NOTES_LINES * spacing + 8)
         assert lay["hint"].top() >= lay["notes"].top()
+
+    def test_the_fetcher_swaps_a_guessed_repo_for_the_real_one(self, window):
+        # checkupdates prints no repo, so every repo row starts out
+        # "official". The fetcher reads the truth off pacman itself, and
+        # the pill has to follow it.
+        window.on_info_ready(0, "desc", "notes", "2026-01-01", "full",
+                             "CachyOS release", "https://example.com",
+                             "cachyos-extra-v3")
+        assert window._model.item(0)["repo"] == "cachyos-extra-v3"
+        lay = window._delegate._layout(0, window._model.item(0), 900)
+        assert lay["badge_txt"] == "CACHYOS"
+
+    def test_a_feed_without_a_repo_leaves_the_pill_alone(self, window):
+        before = window._model.item(0)["repo"]
+        window.on_info_ready(0, "desc", "notes", "2026-01-01", "full",
+                             "", "", "")
+        assert window._model.item(0)["repo"] == before
 
     def test_single_run(self, window, monkeypatch):
         monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
@@ -2712,6 +2729,7 @@ class TestFlatpakRows:
         monkeypatch.setattr(app, "_flatpak_apps",
                             lambda: {"com.discordapp.Discord":
                                      ("1.0.151", "system")})
+        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
         rows, _titles = app.UntrackedLoader()._load_apps()
         names = {r["name"] for r in rows}
         assert "com.discordapp.Discord" not in names
@@ -2946,6 +2964,7 @@ class TestAppImageRows:
                                 {"file": str(tmp_path / "other.desktop"),
                                  "title": "Other", "comment": "",
                                  "exec": "/usr/bin/other"}])
+        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
         rows, _titles = app.UntrackedLoader()._load_apps()
         names = {r["name"] for r in rows}
         assert "zen" not in names

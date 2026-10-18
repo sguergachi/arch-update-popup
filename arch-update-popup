@@ -64,6 +64,10 @@ OFFICIAL_REPOS = {
     "gnome-unstable", "kde-unstable",
 }
 
+# pacman's local database: one directory per installed package, whose desc
+# file records the repo it was installed from.
+PACMAN_LOCAL_DB = "/var/lib/pacman/local"
+
 # ── Sources ──────────────────────────────────────────────────────────────
 # One vocabulary for "where did this come from", shared by the badges, the
 # stat-strip filters and the source panel, so Flatpak and the managed repos
@@ -99,8 +103,16 @@ def _source_key(repo: str) -> str:
 
 
 def _source_label(repo: str) -> str:
-    """Human name for a source, for a tooltip or a filter caption."""
-    return _SOURCE_META[_source_key(repo)][0]
+    """Human name for a source, for a tooltip or a filter caption.
+
+    A managed repo names the farm that built the package (cachyos,
+    chaotic-aur, …): "third-party" told the reader nothing it could act
+    on once the badge started saying where the package really came from.
+    """
+    key = _source_key(repo)
+    if key == SRC_MANAGED:
+        return _repo_family(repo).lower()
+    return _SOURCE_META[key][0]
 
 
 # Where a package can live instead of the AUR, and what backs each one.
@@ -160,6 +172,40 @@ flatpak remote-add --if-not-exists flathub \
      "Sandboxed, signed and curated per application. Not a pacman repo: "
      "moving over means removing the package and installing the Flatpak."),
 ]
+
+
+def _repo_family(repo: str) -> str:
+    """The signer behind a managed repo: cachyos-extra-v3 → CachyOS.
+
+    The four cachyos-* repos are one source with one build farm, and a
+    pill has no room for "cachyos-extra-v3". Known families take the name
+    _MANAGED_SOURCES gives them; anything else stands as itself.
+    """
+    low = (repo or "").strip().lower()
+    for name, key, _script, _why in _MANAGED_SOURCES:
+        if key and (low == key or low.startswith(key + "-")):
+            return name
+    return (repo or "").strip()
+
+
+def _repo_badge(repo: str) -> str:
+    """Badge text for a row: which repo actually provides the package.
+
+    Arch's own repos are one word — OFFICIAL — because that is the bucket
+    the strip filters by. Everything else names the project that builds
+    and signs the package, so one CachyOS compiled can never read as if
+    Arch shipped it. Pseudo-sources (AUR, Flatpak, an AppImage, a manual
+    install) already name themselves.
+    """
+    r = (repo or "").strip()
+    if not r:
+        return ""
+    key = _source_key(r)
+    if key == SRC_OFFICIAL:
+        return "OFFICIAL"
+    if key == SRC_MANAGED:
+        return _repo_family(r).upper()
+    return r.upper()
 
 
 def enabled_repos() -> set[str]:
@@ -1151,6 +1197,74 @@ def check_aur_supply_chain_attack(pkg_name: str) -> tuple[bool, list[str], dict 
     return True, reasons, meta
 
 
+def _installed_db_repos() -> dict[str, str]:
+    """{package: the repo pacman installed it from}, from its local DB.
+
+    Every installed package's metadata records which database it came out
+    of (%INSTALLED_DB%: "extra", "cachyos-extra-v3", …). That is pacman's
+    own answer to "where did this come from" — written at install time,
+    and not confused by a repo that has since been added, renamed or
+    dropped. Reads files, runs nothing.
+    """
+    repos: dict[str, str] = {}
+    try:
+        entries = os.listdir(PACMAN_LOCAL_DB)
+    except OSError:
+        return repos
+    for entry in entries:
+        path = os.path.join(PACMAN_LOCAL_DB, entry, "desc")
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue  # not a package dir (ALPM_DB_VERSION, …)
+        name = re.search(r"^%NAME%\n(.+)$", text, re.M)
+        repo = re.search(r"^%INSTALLED_DB%\n(.+)$", text, re.M)
+        if name and repo:
+            repos[name.group(1).strip()] = repo.group(1).strip()
+    return repos
+
+
+def _sync_repo_map() -> dict[str, str]:
+    """{package: the repo that provides it now}, from the sync databases.
+
+    The fallback for packages older than pacman's %INSTALLED_DB% field.
+    expac walks the sync databases in pacman.conf order, so the first
+    repo a name appears in is the one pacman itself would install from.
+    Without expac there is no map: callers keep their old answer, never
+    a guess.
+    """
+    if not shutil.which("expac"):
+        return {}
+    try:
+        r = _run(["expac", "-S", "%n\t%r"], capture_output=True, text=True)
+    except Exception:
+        return {}
+    if r.returncode != 0:
+        return {}
+    repos: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        name, _, repo = line.partition("\t")
+        if name and repo:
+            repos.setdefault(name, repo)
+    return repos
+
+
+def _installed_repo_map() -> dict[str, str]:
+    """{installed package: where it came from} — honest for every name.
+
+    pacman's own local record first (%INSTALLED_DB%, written at install
+    time); for packages from before that field existed, whichever enabled
+    repo provides the name today. Either way a foreign package is the AUR:
+    no configured repo carries it any more.
+    """
+    repos = _sync_repo_map()
+    repos.update(_installed_db_repos())
+    for name in _foreign_pkg_set():
+        repos[name] = "aur"
+    return repos
+
+
 def get_installed_packages() -> list[dict]:
     """Get list of all explicitly installed packages with their repos."""
     pkgs: list[dict] = []
@@ -1161,16 +1275,11 @@ def get_installed_packages() -> list[dict]:
             if len(parts) >= 2:
                 pkgs.append({"name": parts[0], "version": parts[1]})
 
-    r2 = _run(["pacman", "-Qm"], capture_output=True, text=True)
-    foreign = set()
-    if r2.returncode == 0:
-        for line in r2.stdout.strip().splitlines():
-            parts = line.split()
-            if parts:
-                foreign.add(parts[0])
-
+    # Which repo a package came from, not just "not the AUR": a package
+    # CachyOS built must never be labelled as if Arch shipped it.
+    repos = _installed_repo_map()
     for pkg in pkgs:
-        pkg["repo"] = "aur" if pkg["name"] in foreign else "official"
+        pkg["repo"] = repos.get(pkg["name"]) or "official"
 
     return pkgs
 
@@ -2423,18 +2532,21 @@ class UntrackedLoader(QThread):
 
     def run(self) -> None:
         try:
-            apps, titles = self._load_apps()
+            repos = _installed_repo_map()
+            apps, titles = self._load_apps(repos)
             if self.isInterruptionRequested():
                 return
-            pkgs = self._load_deps(titles)
+            pkgs = self._load_deps(titles, repos)
         except Exception:
             return
         self.done.emit(apps, pkgs)
 
-    def _load_apps(self) -> tuple[list[dict], dict[str, str]]:
+    def _load_apps(self, repos: dict[str, str] | None = None,
+                   ) -> tuple[list[dict], dict[str, str]]:
         """(app rows, {package: launcher title}) — the titles cover every
         package that ships a launcher, explicit or not, so a dependency can
         name the applications that need it."""
+        repos = repos if repos is not None else _installed_repo_map()
         found = scan_desktop_files()
         owners: dict[str, tuple[str | None, str]] = {}
         files = [a["file"] for a in found if not _flatpak_id_for(a)]
@@ -2472,7 +2584,6 @@ class UntrackedLoader(QThread):
             if owner and app.get("title"):
                 titles.setdefault(owner, app["title"])
         versions = _installed_version_map()
-        foreign = _foreign_pkg_set()
         rows = []
         seen: set[tuple[str, str]] = set()
         explicit = _explicit_package_set()
@@ -2495,7 +2606,9 @@ class UntrackedLoader(QThread):
                 version = ""
                 repo = SRC_MANUAL
             if owner:
-                repo = "aur" if name in foreign else "official"
+                # The repo it actually came from — never a stand-in
+                # "official" for whatever the distro ships alongside.
+                repo = repos.get(name) or "official"
             launchable = (a["exec"] and _desktop_launchable(a["file"]))
             row = _tracked_row(
                 name, version, repo, title=a["title"],
@@ -2511,14 +2624,15 @@ class UntrackedLoader(QThread):
         rows.sort(key=lambda it: (it["title"] or it["name"]).lower())
         return rows, titles
 
-    def _load_deps(self, titles: dict[str, str] | None = None) -> list[dict]:
+    def _load_deps(self, titles: dict[str, str] | None = None,
+                   repos: dict[str, str] | None = None) -> list[dict]:
         try:
             r = _run(["pacman", "-Qd"], capture_output=True, text=True)
         except Exception:
             return []
         if r.returncode != 0:
             return []
-        foreign = _foreign_pkg_set()
+        repos = repos if repos is not None else _installed_repo_map()
         titles = titles or {}
         # What needs what, so a stray dependency can name the applications
         # that pulled it in — that is the only reason to keep it.
@@ -2537,8 +2651,7 @@ class UntrackedLoader(QThread):
                       _explicit_requirers(parts[0], required_by, explicit)]
                      if known else [])
             rows.append(_tracked_row(
-                parts[0], parts[1],
-                "aur" if parts[0] in foreign else "official",
+                parts[0], parts[1], repos.get(parts[0]) or "official",
                 desc=descs.get(parts[0], ""), kind="dependency",
                 needs=needs, needs_known=known))
         rows.sort(key=lambda it: it["name"].lower())
@@ -2551,8 +2664,10 @@ class InfoFetcher(QThread):
     Results are persisted to the on-disk cache as they arrive so the update
     window is already populated the next time the same versions are offered.
     """
-    # row, name, new_ver, desc, notes, date, full, source_label, source_url
-    row_ready = pyqtSignal(int, str, str, str, str, str, str, str, str)
+    # row, name, new_ver, desc, notes, date, full, source_label, source_url,
+    # repo (the repo that actually provides the new version: pacman's own
+    # answer, so a CachyOS build never wears Arch's badge)
+    row_ready = pyqtSignal(int, str, str, str, str, str, str, str, str, str)
 
     def __init__(self, updates: list[dict]) -> None:
         super().__init__()
@@ -2583,7 +2698,7 @@ class InfoFetcher(QThread):
                 del self._cache[key]
             save_pkg_info_cache(self._cache)
             self.row_ready.emit(i, pkg["name"], pkg["new"], desc, notes, date,
-                                full, source, source_url)
+                                full, source, source_url, info["repo"])
 
 
 class SystemScanner(QThread):
@@ -3471,9 +3586,11 @@ def _package_url(name: str, repo: str, url: str = "") -> str:
     """Where to read about this package or app — '' when nowhere honest.
 
     Each source has its own home: a Flatpak app is on Flathub, an AUR
-    package on the AUR, a repo package in Arch's search. An AppImage is
-    just a file: its launcher's URL if it has one, otherwise no link at
-    all — a wrong page is worse than no link.
+    package on the AUR, a managed repo on its own builder's search — the
+    page that actually describes the build you are running, not Arch's
+    copy of the name. An AppImage is just a file: its launcher's URL if
+    it has one, otherwise no link at all — a wrong page is worse than no
+    link.
     """
     key = _source_key(repo)
     if key == SRC_FLATPAK:
@@ -3482,6 +3599,8 @@ def _package_url(name: str, repo: str, url: str = "") -> str:
         return f"https://aur.archlinux.org/packages/{name}"
     if key in (SRC_APPIMAGE, SRC_MANUAL):
         return (url or "").strip()
+    if key == SRC_MANAGED and _repo_family(repo) == "CachyOS":
+        return f"https://packages.cachyos.org/?q={name}"
     return f"https://archlinux.org/packages/?q={name}"
 
 
@@ -3534,7 +3653,9 @@ def _repo_tint_key(repo: str) -> str:
         return "positive"
     if key == SRC_APPIMAGE:
         return "visited"
-    if key == SRC_MANUAL:
+    if key in (SRC_MANUAL, SRC_MANAGED):
+        # A managed repo is nobody's official: quiet grey, never the
+        # accent an Arch-shipped package wears (see _repo_tint).
         return "muted"
     r = (repo or "").lower()
     if "testing" in r:
@@ -3547,8 +3668,10 @@ def _repo_tint(repo: str) -> tuple[tuple[int, int, int], str]:
 
     Colors come from the active scheme: AUR is the desktop's neutral/warning
     hue, testing its visited/purple, Flatpak its positive/green, a manual
-    install the muted foreground, official the accent. Callers choose the
-    format — stylesheets take CSS rgba(), QPainter takes QColor(*rgb, alpha).
+    install the muted foreground, official the accent, and a managed repo
+    (CachyOS, Chaotic-AUR, …) the secondary grey — its own quiet colour, so
+    a farm's build never wears Arch's blue. Callers choose the format —
+    stylesheets take CSS rgba(), QPainter takes QColor(*rgb, alpha).
     """
     r = (repo or "").lower()
     key = _source_key(repo)
@@ -3558,7 +3681,7 @@ def _repo_tint(repo: str) -> tuple[tuple[int, int, int], str]:
         SRC_APPIMAGE: _visited_hex(),
         SRC_MANUAL: _secondary_hex(),
         SRC_OFFICIAL: _accent_hex(),
-        SRC_MANAGED: _accent_hex(),
+        SRC_MANAGED: _secondary_hex(),
     }
     if "testing" in r:
         hexes[key] = _visited_hex()
@@ -4293,14 +4416,19 @@ class PackageModel(_FilterableModel, QAbstractListModel):
                 self.dataChanged.emit(idx, idx, [])
 
     def set_info(self, row: int, desc: str, notes: str, date: str,
-                 full: str, source: str, source_url: str) -> None:
+                 full: str, source: str, source_url: str,
+                 repo: str = "") -> None:
         """Row here is the *source* index the info fetcher reports."""
         if not 0 <= row < len(self._items):
             return
         it = self._items[row]
         it.update(desc=desc or it["desc"], notes=notes or it["notes"],
                   date=date or "", full=full or notes,
-                  source=source, source_url=source_url)
+                  source=source, source_url=source_url,
+                  # The fetcher read the repo off pacman itself: swap the
+                  # badge the check could only guess at ("official") for
+                  # the repo that really offers this version.
+                  repo=repo or it["repo"])
         it["_rev"] += 1
         try:
             visible = self._visible.index(row)
@@ -4470,7 +4598,7 @@ class PackageDelegate(QStyledItemDelegate):
                     if _package_url(item["name"], item.get("repo", ""),
                                     item.get("url", "")) else "")
         link_w = fm.horizontalAdvance(link_txt) if link_txt else 0
-        badge_txt = (item["repo"] or "").upper()
+        badge_txt = _repo_badge(item["repo"])
         badge_w = (QFontMetrics(self._f_badge).horizontalAdvance(badge_txt) + 14
                    if badge_txt else 0)
         # +14 slack: rendered text can exceed horizontalAdvance by a few px
@@ -5218,7 +5346,7 @@ class TrackedDelegate(QStyledItemDelegate):
         # Display title: usually the package name; Untracked app rows
         # show the human-readable application name instead.
         title = item.get("title") or item["name"]
-        badge_txt = (item["repo"] or "").upper()
+        badge_txt = _repo_badge(item["repo"])
         badge_w = (QFontMetrics(self._f_badge).horizontalAdvance(badge_txt) + 14
                    if badge_txt else 0)
         name_avail = max(60, right - link_w - 20 - x0 - badge_w - 12)
@@ -6218,7 +6346,7 @@ class UpdateWindow(QMainWindow):
         self._stat_track_all = _StatCard("0", "installed", _accent_hex())
         self._stat_track_off = _StatCard("0", "official", _accent_hex())
         self._stat_track_aur = _StatCard("0", "aur", _warning_hex())
-        self._stat_track_managed = _StatCard("0", "third-party",
+        self._stat_track_managed = _StatCard("0", "cachyos",
                                              _secondary_hex())
         self._stat_track_flatpak = _StatCard("0", "flatpak", _positive_hex())
         self._stat_track_image = _StatCard("0", "appimage",
@@ -6964,12 +7092,13 @@ class UpdateWindow(QMainWindow):
 
     def _on_recheck_row(self, gen: int, row: int, name: str, new_ver: str,
                         desc: str, notes: str, date: str, full: str,
-                        source: str, source_url: str) -> None:
+                        source: str, source_url: str,
+                        repo: str = "") -> None:
         if gen == self._info_gen:
             # Pass the generation through: on_info_ready drops
             # generation-less (tray) feeds once a recheck has landed.
             self.on_info_ready(row, desc, notes, date, full, source,
-                               source_url, gen=gen)
+                               source_url, repo, gen=gen)
 
     def _on_recheck_fetch_done(self, gen: int) -> None:
         if gen == self._info_gen:
@@ -8335,7 +8464,7 @@ class UpdateWindow(QMainWindow):
 
     def on_info_ready(self, row: int, desc: str, notes: str, date: str,
                       full: str = "", source: str = "", source_url: str = "",
-                      gen: int | None = None) -> None:
+                      repo: str = "", gen: int | None = None) -> None:
         # Tray feeds carry no generation: once an in-window recheck has
         # replaced the model, they describe the OLD list — drop them.
         if gen is None and self._info_gen != 0:
@@ -8345,7 +8474,7 @@ class UpdateWindow(QMainWindow):
         # would silently never receive its release notes.
         if 0 <= row < self._model.source_count():
             self._model.set_info(row, desc, notes, date, full, source,
-                                 source_url)
+                                 source_url, repo)
         if not self._updating:
             if self._progress.maximum() <= 1:
                 # Hairline → determinate on first fresh arrival.
@@ -9926,11 +10055,12 @@ class TrayApp(QObject):
 
     def _on_row_cached(self, row: int, name: str, new_ver: str,
                        desc: str, notes: str, date: str,
-                       full: str, source: str, source_url: str) -> None:
+                       full: str, source: str, source_url: str,
+                       repo: str = "") -> None:
         self._cached_info[row] = (desc, notes, date, full, source, source_url)
         if self._window is not None:
             self._window.on_info_ready(row, desc, notes, date,
-                                       full, source, source_url)
+                                       full, source, source_url, repo)
 
     def _on_fetch_done(self) -> None:
         if self._window is not None:
