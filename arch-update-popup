@@ -4662,6 +4662,7 @@ class UpdateWindow(QMainWindow):
         self._moves_dialog: MovesDialog | None = None
         self._sources_dialog: ManagedSourcesDialog | None = None
         self._enable_runner: _SourceEnableRunner | None = None
+        self._enable_progress: QProgressDialog | None = None
         # Buttons whose icons bake the theme's grey: re-resolved live in
         # _apply_theme(). Registered via _icon_btn(), keyed by button so a
         # repeat registration never accumulates duplicates.
@@ -7921,6 +7922,10 @@ class UpdateWindow(QMainWindow):
                 runner.terminate()
                 runner.wait(8000)
             self._enable_runner = None
+        progress = getattr(self, "_enable_progress", None)
+        if progress is not None:
+            progress.close()
+            self._enable_progress = None
         self._save_ui_state()
         super().closeEvent(event)
         self.closed.emit()
@@ -8233,6 +8238,7 @@ class ManagedSourcesDialog(QMainWindow):
     """
 
     closed = pyqtSignal()
+    logged = pyqtSignal(str)   # action lines for the window's activity log
 
     def __init__(self) -> None:
         super().__init__()
@@ -8365,15 +8371,26 @@ class ManagedSourcesDialog(QMainWindow):
         # Keep the reference: a QThread destroyed while running aborts
         # the whole process ("QThread: Destroyed while thread is still
         # running"). Released in _on_enable_done, like every other runner.
-        self._enable_runner = _SourceEnableRunner(steps)
-        self._enable_runner.line.connect(
-            lambda line, n=name: self._set_status(
-                f"Enabling {n} — {line}", "info"))
-        self._enable_runner.line.connect(self._log_action)
         self._show_log()
         self._set_status(f"Enabling {name}…", "info")
+        progress = QProgressDialog(
+            f"Enabling {name}…", "Cancel", 0, 0, self)
+        progress.setWindowTitle(f"Enable {name}")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+        self._enable_progress = progress
+        self._enable_runner = _SourceEnableRunner(steps)
+        self._enable_runner.line.connect(
+            lambda line, n=name: progress.setLabelText(
+                f"Enabling {n} — {line}"))
+        self._enable_runner.line.connect(self.logged.emit)
         self._enable_runner.done.connect(
-            lambda ok, out, n=name: self._on_enable_done(ok, out, n))
+            lambda ok, out, n=name, pg=progress:
+            self._on_enable_done(ok, out, n, pg))
+        progress.canceled.connect(self._enable_runner.terminate)
         self._enable_runner.start()
 
     def _restart_app(self) -> None:
@@ -8399,11 +8416,16 @@ class ManagedSourcesDialog(QMainWindow):
         self.close()
         os.execv(sys.argv[0], sys.argv)
 
-    def _on_enable_done(self, success: bool, output: str, name: str) -> None:
+    def _on_enable_done(self, success: bool, output: str, name: str,
+                        progress: QProgressDialog = None) -> None:
         runner = getattr(self, "_enable_runner", None)
         self._enable_runner = None
         if runner is not None:
             runner.wait(5000)
+        if progress is not None:
+            progress.close()
+            progress.deleteLater()
+        self._enable_progress = None
         if success:
             self._restart_needed = True
             self._restart_btn.setVisible(True)
