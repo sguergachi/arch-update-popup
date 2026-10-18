@@ -697,3 +697,143 @@ class TestUntrackedScan:
         m.set_all(True)
         assert m.checked_names() == ["b", "a"]
         assert len(seen) == 1
+
+
+class _R:
+    """Stand-in for a subprocess.CompletedProcess."""
+
+    def __init__(self, stdout="", returncode=0):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+class TestEnrichMaps:
+    """Launchers and descriptions for the whole list, in two calls.
+
+    Asking pacman once per package took ~65 s for a tracked list, and a
+    row had no launcher (no Open pill) until its turn came — which reads
+    as "I can't open that app".
+    """
+
+    def test_launchers_come_from_one_call(self, monkeypatch):
+        calls = []
+        out = ("1password|opt/1Password/1password\x1f"
+               "usr/share/applications/1password.desktop\x1f"
+               "usr/share/doc/1password/README\n"
+               "zsh|usr/share/zsh/functions/README\n")
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/expac")
+        monkeypatch.setattr(
+            app, "_run",
+            lambda cmd, **kw: (calls.append(cmd), _R(out))[1])
+
+        got = app.all_package_launchers()
+
+        # Only .desktop files, with the leading slash pacman -Ql gives.
+        assert got == {"1password": ["/usr/share/applications/"
+                                     "1password.desktop"]}
+        assert calls == [["expac", "-Q", "-l", "\x1f", "%n|%F"]]
+
+    def test_descriptions_skip_the_null_placeholder(self, monkeypatch):
+        out = "1password|Password manager and secure wallet\n" \
+              "linux|(null)\n" \
+              "zsh|The Z shell\n"
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/expac")
+        monkeypatch.setattr(app, "_run", lambda cmd, **kw: _R(out))
+
+        assert app.all_package_descs() == {
+            "1password": "Password manager and secure wallet",
+            "zsh": "The Z shell"}
+
+    def test_without_expac_there_is_no_map(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: None)
+        monkeypatch.setattr(app, "_run",
+                            lambda *a, **k: pytest.fail("ran a query"))
+
+        assert app.all_package_launchers() == {}
+        assert app.all_package_descs() == {}
+
+    def test_a_failed_query_is_no_map(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/expac")
+        monkeypatch.setattr(app, "_run",
+                            lambda cmd, **kw: _R("", returncode=1))
+
+        assert app.all_package_launchers() == {}
+        assert app.all_package_descs() == {}
+
+
+class TestTrackedEnricher:
+    """Rows get their launcher and description from those two maps."""
+
+    @pytest.fixture()
+    def desk(self, tmp_path):
+        f = tmp_path / "zen.desktop"
+        f.write_text("[Desktop Entry]\nName=Zen\nExec=/usr/bin/zen %U\n"
+                     "Type=Application\n")
+        return f
+
+    def test_a_row_is_one_lookup(self, qapp, monkeypatch, desk):
+        monkeypatch.setattr(app, "all_package_launchers",
+                            lambda: {"zen": [str(desk)]})
+        monkeypatch.setattr(app, "all_package_descs",
+                            lambda: {"zen": "A browser"})
+        monkeypatch.setattr(app, "_run",
+                            lambda *a, **k: pytest.fail("asked pacman"))
+        enr = app.TrackedEnricher(["zen", "linux"])
+        got = {"found": [], "titled": [], "described": []}
+        enr.found.connect(lambda n, d: got["found"].append((n, d)))
+        enr.titled.connect(lambda n, t: got["titled"].append((n, t)))
+        enr.described.connect(lambda n, d: got["described"].append((n, d)))
+
+        enr._enrich()
+
+        assert got["found"] == [("zen", str(desk))]
+        assert got["titled"] == [("zen", "Zen")]
+        # "linux" ships nothing: no launcher, no description, no pill.
+        assert got["described"] == [("zen", "A browser")]
+
+    def test_without_a_map_each_row_asks_pacman(self, qapp, monkeypatch):
+        asked = []
+        monkeypatch.setattr(app, "all_package_launchers", lambda: {})
+        monkeypatch.setattr(app, "all_package_descs", lambda: {})
+        monkeypatch.setattr(
+            app.TrackedEnricher, "_resolve_desktop",
+            staticmethod(lambda n: asked.append(n) or ""))
+        monkeypatch.setattr(app.TrackedEnricher, "_resolve_desc",
+                            staticmethod(lambda n: ""))
+
+        app.TrackedEnricher(["linux"])._enrich()
+
+        assert asked == ["linux"]
+
+    def test_flatpak_rows_are_resolved_first(self, qapp, monkeypatch):
+        order = []
+        monkeypatch.setattr(app, "all_package_launchers", lambda: {})
+        monkeypatch.setattr(app, "all_package_descs", lambda: {})
+        monkeypatch.setattr(
+            app.TrackedEnricher, "_flatpak_desktop",
+            staticmethod(lambda n: order.append(n) or ""))
+        monkeypatch.setattr(app.TrackedEnricher, "_flatpak_desc",
+                            staticmethod(lambda n: ""))
+        monkeypatch.setattr(
+            app.TrackedEnricher, "_desktop_for",
+            lambda self, n, l: order.append(n) or "")
+
+        app.TrackedEnricher(["aaa", "org.x.App", "zzz"],
+                            flatpak={"org.x.App"})._enrich()
+
+        assert order == ["org.x.App", "aaa", "zzz"]
+
+    def test_an_interrupted_pass_emits_nothing(self, qapp, monkeypatch):
+        monkeypatch.setattr(app, "all_package_launchers",
+                            lambda: {"zen": ["/x/zen.desktop"]})
+        monkeypatch.setattr(app, "all_package_descs", lambda: {})
+        monkeypatch.setattr(app.TrackedEnricher, "_resolve_desc",
+                            staticmethod(lambda n: "d"))
+        enr = app.TrackedEnricher(["zen"])
+        monkeypatch.setattr(enr, "isInterruptionRequested", lambda: True)
+        got = []
+        enr.described.connect(lambda n, d: got.append((n, d)))
+
+        enr._enrich()
+
+        assert got == []

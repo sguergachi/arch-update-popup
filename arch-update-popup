@@ -1666,12 +1666,66 @@ def _launch_desktop(path: str) -> bool:
     return bool(QProcess.startDetached(program, argv[1:]))
 
 
+# expac prints a package's file list as one field per file; this joiner
+# can never appear in a path, so nothing needs escaping.
+_EXPAC_LIST_SEP = "\x1f"
+
+
+def all_package_launchers() -> dict[str, list[str]]:
+    """Every installed package's .desktop files, from ONE `expac` call.
+
+    Querying `pacman -Ql` per package cost ~65 s for a full tracked list,
+    and a row had no launcher (so no Open pill) until its turn came —
+    which reads as "I can't open that app". Returns {} when expac is
+    missing or fails, and callers fall back to the per-package query.
+    """
+    if not shutil.which("expac"):
+        return {}
+    try:
+        r = _run(["expac", "-Q", "-l", _EXPAC_LIST_SEP, "%n|%F"],
+                 capture_output=True, text=True)
+    except Exception:
+        return {}
+    if r.returncode != 0:
+        return {}
+    out: dict[str, list[str]] = {}
+    for line in r.stdout.splitlines():
+        name, sep, files = line.partition("|")
+        if not sep:
+            continue
+        found = ["/" + f for f in files.split(_EXPAC_LIST_SEP)
+                 if f.endswith(".desktop")]
+        if found:
+            out[name] = found
+    return out
+
+
+def all_package_descs() -> dict[str, str]:
+    """Every installed package's description, from ONE `expac` call."""
+    if not shutil.which("expac"):
+        return {}
+    try:
+        r = _run(["expac", "-Q", "%n|%d"], capture_output=True, text=True)
+    except Exception:
+        return {}
+    if r.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        name, sep, desc = line.partition("|")
+        if sep and desc and desc != "(null)":
+            out[name] = desc
+    return out
+
+
 class TrackedEnricher(QThread):
     """Fills in Tracked rows in the background: GUI launchers for the
     Open pill, plus package descriptions Updates-style.
 
-    One `pacman -Ql` / `-Qi` per package; rows update as results arrive.
-    Pure compute — safe to interrupt + park on shutdown.
+    Two `expac` calls cover every row, so launchers and descriptions are
+    a lookup away and the pills arrive with the list instead of
+    trickling in over a minute. Without expac, one `pacman -Ql` / `-Qi`
+    per row. Pure compute — safe to interrupt + park on shutdown.
     """
     found = pyqtSignal(str, str)      # (name, desktop_path)
     titled = pyqtSignal(str, str)    # (name, human title)
@@ -1688,27 +1742,45 @@ class TrackedEnricher(QThread):
         self._names = names
         self._flatpak = set(flatpak or ())
 
+    def _desktop_for(self, name: str, launchers: dict[str, list[str]]) -> str:
+        """The launcher a package ships (expac map, else per-package)."""
+        if launchers:
+            return pick_desktop_file(name, launchers.get(name, []))
+        return self._resolve_desktop(name)
+
     def run(self) -> None:
         try:
-            for name in self._names:
-                if self.isInterruptionRequested():
-                    return
-                desktop = (self._flatpak_desktop(name)
-                           if name in self._flatpak
-                           else self._resolve_desktop(name))
-                if desktop:
-                    self.found.emit(name, desktop)
-                    title = _desktop_title(desktop)
-                    if title:
-                        self.titled.emit(name, title)
-                if self.isInterruptionRequested():
-                    return
-                desc = (self._flatpak_desc(name) if name in self._flatpak
-                        else self._resolve_desc(name))
-                if desc:
-                    self.described.emit(name, desc)
+            self._enrich()
         except Exception:
             pass
+
+    def _enrich(self) -> None:
+        """One pass over the rows: launchers, titles, descriptions."""
+        launchers = all_package_launchers()
+        descs = all_package_descs()
+        # Flatpak rows are plain file lookups: resolve them first so the
+        # apps are ready the moment the list is.
+        ordered = ([n for n in self._names if n in self._flatpak]
+                   + [n for n in self._names if n not in self._flatpak])
+        for name in ordered:
+            if self.isInterruptionRequested():
+                return
+            if name in self._flatpak:
+                desktop = self._flatpak_desktop(name)
+                desc = self._flatpak_desc(name)
+            else:
+                desktop = self._desktop_for(name, launchers)
+                desc = descs.get(name, "") if descs \
+                    else self._resolve_desc(name)
+            if desktop:
+                self.found.emit(name, desktop)
+                title = _desktop_title(desktop)
+                if title:
+                    self.titled.emit(name, title)
+            if self.isInterruptionRequested():
+                return
+            if desc:
+                self.described.emit(name, desc)
 
     @staticmethod
     def _flatpak_desktop(name: str) -> str:
