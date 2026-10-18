@@ -8437,8 +8437,11 @@ class ManagedSourcesDialog(QMainWindow):
             progress.deleteLater()
         self._enable_progress = None
         if success:
-            self._restart_needed = True
-            self._restart_btn.setVisible(True)
+            # The button lives on the main window, not on this dialog: the
+            # restart_needed signal (connected in _open_sources_dialog) flips
+            # it. Touching it here would crash — the dialog has no such
+            # attribute.
+            self.restart_needed.emit()
             self.logged.emit(f"{name} enabled — restart to apply")
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Information)
