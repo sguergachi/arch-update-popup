@@ -7544,9 +7544,16 @@ class UpdateWindow(QMainWindow):
             return
         self._sources_dialog = ManagedSourcesDialog()
         self._sources_dialog.closed.connect(self._on_sources_closed)
+        self._sources_dialog.logged.connect(self._log_action)
+        self._sources_dialog.restart_needed.connect(self._on_source_enabled)
         self._sources_dialog.show()
         self._sources_dialog.raise_()
         self._sources_dialog.activateWindow()
+
+    def _on_source_enabled(self) -> None:
+        self._restart_needed = True
+        self._restart_btn.setVisible(True)
+        self._log_action("Source enabled — restart to apply")
 
     def _on_sources_closed(self) -> None:
         self._sources_dialog = None
@@ -8239,6 +8246,7 @@ class ManagedSourcesDialog(QMainWindow):
 
     closed = pyqtSignal()
     logged = pyqtSignal(str)   # action lines for the window's activity log
+    restart_needed = pyqtSignal()   # a source was enabled: offer a restart
 
     def __init__(self) -> None:
         super().__init__()
