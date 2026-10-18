@@ -71,6 +71,7 @@ OFFICIAL_REPOS = {
 SRC_OFFICIAL = "official"
 SRC_AUR = "aur"
 SRC_FLATPAK = "flatpak"
+SRC_APPIMAGE = "appimage"
 SRC_MANUAL = "manual"        # on disk, owned by no package manager
 SRC_MANAGED = "managed"      # a third-party pacman repo (cachyos, …)
 
@@ -79,6 +80,7 @@ _SOURCE_META: dict[str, tuple[str, str]] = {
     SRC_OFFICIAL: ("official", "official"),
     SRC_AUR: ("aur", "aur"),
     SRC_FLATPAK: ("flatpak", "flatpak"),
+    SRC_APPIMAGE: ("appimage", "appimage"),
     SRC_MANUAL: ("manual install", "manual"),
     SRC_MANAGED: ("third-party", "third-party"),
 }
@@ -89,7 +91,7 @@ def _source_key(repo: str) -> str:
     r = (repo or "").lower()
     if not r:
         return SRC_MANUAL
-    if r in (SRC_FLATPAK, SRC_MANUAL, SRC_AUR, SRC_OFFICIAL):
+    if r in (SRC_FLATPAK, SRC_APPIMAGE, SRC_MANUAL, SRC_AUR, SRC_OFFICIAL):
         return r
     if r in OFFICIAL_REPOS:
         return SRC_OFFICIAL
@@ -1622,6 +1624,10 @@ def load_tracked() -> tuple[list[dict], list[dict]]:
     except Exception:
         pass
     try:
+        installed += appimage_rows()
+    except Exception:
+        pass
+    try:
         moves = find_repo_moves()
     except Exception:
         moves = []
@@ -1862,6 +1868,139 @@ def _flatpak_id_for(app: dict) -> str:
     return _flatpak_app_id(app["file"]) or _flatpak_exec_id(app.get("exec", ""))
 
 
+APPIMAGE_SUFFIX = ".appimage"
+
+
+def _appimage_dirs() -> list[str]:
+    """Where an AppImage lives when it is meant to be used, not just kept.
+
+    Downloads is deliberately absent: a `.AppImage` you just fetched is a
+    download. One you put in an app folder — or wired a launcher to — is
+    software you have.
+    """
+    home = os.path.expanduser("~")
+    return [os.path.join(home, "Applications"),
+            os.path.join(home, "AppImages"),
+            os.path.join(home, ".local/bin"),
+            "/opt", "/usr/local/bin"]
+
+
+def _appimage_version(path: str) -> str:
+    """The version in an AppImage's filename, or ''.
+
+    There is no field to read and running one to ask is not an option, but
+    releases are named after themselves: `T3-Code-0.0.24-x86_64.AppImage`.
+    """
+    stem = os.path.basename(path)
+    if stem.lower().endswith(APPIMAGE_SUFFIX):
+        stem = stem[:-len(APPIMAGE_SUFFIX)]
+    match = re.search(r"[-_]v?(\d+(?:\.\d+)+)", stem)
+    return match.group(1) if match else ""
+
+
+def _appimage_in_exec(exec_line: str) -> str:
+    """The AppImage path an Exec line runs, or ''.
+
+    Launchers quote and wrap their command ('env … "/path/App.AppImage" %U'),
+    so the path is found by its suffix rather than by splitting cleanly.
+    """
+    line = exec_line or ""
+    for quote in ('"', "'"):
+        start = 0
+        while True:
+            i = line.find(quote, start)
+            if i < 0:
+                break
+            j = line.find(quote, i + 1)
+            if j < 0:
+                break
+            token = line[i + 1:j]
+            if token.lower().endswith(APPIMAGE_SUFFIX):
+                return token
+            start = j + 1
+    for token in line.replace("\t", " ").split():
+        if token.lower().endswith(APPIMAGE_SUFFIX):
+            return token
+    return ""
+
+
+def _appimages_in(folder: str, depth: int = 1) -> list[str]:
+    """AppImage files in `folder` (one level down for /opt-style trees)."""
+    found: list[str] = []
+    try:
+        entries = sorted(os.listdir(folder))
+    except OSError:
+        return found
+    for entry in entries:
+        path = os.path.join(folder, entry)
+        if entry.lower().endswith(APPIMAGE_SUFFIX):
+            if os.path.isfile(path):
+                found.append(path)
+        elif depth > 0 and os.path.isdir(path):
+            found.extend(_appimages_in(path, depth - 1))
+    return found
+
+
+def _launcher_appimages() -> dict[str, dict]:
+    """{AppImage path: launcher} for every launcher that runs one."""
+    out: dict[str, dict] = {}
+    for app in scan_desktop_files(include_hidden=True):
+        path = _appimage_in_exec(app.get("exec", ""))
+        if path and os.path.exists(path):
+            out.setdefault(path, app)
+    return out
+
+
+def appimage_rows() -> list[dict]:
+    """Installed AppImages as Tracked rows.
+
+    Two ways in: a launcher runs it (wherever it lives — several people
+    keep them in Downloads and wire a .desktop to them), or it sits in an
+    app folder. Same file found both ways is one row.
+    """
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for path, app in sorted(_launcher_appimages().items()):
+        rows.append(_appimage_row(path, app))
+        seen.add(os.path.realpath(path))
+    for folder in _appimage_dirs():
+        for path in _appimages_in(folder):
+            if os.path.realpath(path) in seen:
+                continue
+            seen.add(os.path.realpath(path))
+            rows.append(_appimage_row(path, None))
+    return rows
+
+
+def _appimage_pretty(stem: str) -> str:
+    """'WhisperFlow-0.4.409-x86_64' → 'WhisperFlow' (the app's own name)."""
+    pretty = re.sub(r"[-_]v?\d+(?:\.\d+)+.*$", "", stem).strip("-_ ")
+    return pretty or stem
+
+
+def _appimage_row(path: str, launcher: dict | None) -> dict:
+    """One AppImage as a Tracked row (name, version, title, Open target).
+
+    The row's *name* stays the filename stem — two builds of one app in
+    the same folder must stay two rows, and removal needs the file — while
+    the row *shows* the app's own name.
+    """
+    stem = os.path.basename(path)
+    if stem.lower().endswith(APPIMAGE_SUFFIX):
+        stem = stem[:-len(APPIMAGE_SUFFIX)]
+    launcher = launcher or {}
+    return {
+        "name": stem,
+        "version": _appimage_version(path),
+        "repo": SRC_APPIMAGE,
+        "title": launcher.get("title", "") or _appimage_pretty(stem),
+        "desktop": launcher.get("file", ""),
+        "desc": launcher.get("comment", ""),
+        # The file itself is the removal target — no package owns it.
+        "path": path,
+    }
+
+
 def _flatpak_apps() -> dict[str, tuple[str, str]]:
     """{application id: (version, installation)} for installed apps.
 
@@ -1885,12 +2024,17 @@ def _flatpak_apps() -> dict[str, tuple[str, str]]:
     return apps
 
 
-def scan_desktop_files(dirs: list[str] | None = None) -> list[dict]:
+def scan_desktop_files(dirs: list[str] | None = None,
+                       include_hidden: bool = False) -> list[dict]:
     """Find installed GUI applications by searching .desktop files.
 
-    Returns [{file, title, comment, exec}] for visible entries with a
-    Name, deduped by basename with user-local files winning over system
-    ones. Pure filesystem read — no subprocesses.
+    Returns [{file, title, comment, exec}] for entries with a Name, deduped
+    by basename with user-local files winning over system ones. Pure
+    filesystem read — no subprocesses.
+
+    `include_hidden` keeps NoDisplay/Hidden entries, which are not
+    launchers but still prove a file is wired into the desktop (an
+    AppImage registered as a URL handler, for instance).
     """
     if dirs is None:
         home = os.path.expanduser("~")
@@ -1917,8 +2061,8 @@ def scan_desktop_files(dirs: list[str] | None = None) -> list[dict]:
             if not entry or not entry.get("Name"):
                 continue
             low = {k.lower(): v.lower() for k, v in entry.items()}
-            if "true" in low.get("nodisplay", "") \
-                    or "true" in low.get("hidden", ""):
+            if not include_hidden and ("true" in low.get("nodisplay", "")
+                                       or "true" in low.get("hidden", "")):
                 continue
             found[fn] = {"file": path, "title": entry["Name"],
                          "comment": entry.get("Comment", ""),
@@ -2098,6 +2242,96 @@ class FlatpakRemover(QThread):
                 pass
 
 
+class AppImageRemover(QThread):
+    """Deletes AppImages, and the launchers that point at them.
+
+    No package manager is involved: the file is the installation. A
+    launcher wired to it (and any icon it brought) goes too, or the menu
+    keeps an entry that runs nothing. User-owned paths are deleted
+    directly; anything root-owned goes through the usual `sudo -A`
+    askpass, because /opt-style installs are not the user's to remove.
+    """
+
+    line = pyqtSignal(str)
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, paths: list[str]) -> None:
+        super().__init__()
+        self._paths = list(paths)
+        self._askpass: str | None = None
+
+    def _child_env(self) -> dict:
+        env = os.environ.copy()
+        if self._askpass:
+            env["SUDO_ASKPASS"] = self._askpass
+        return env
+
+    def _cleanup(self) -> None:
+        if self._askpass:
+            try:
+                os.unlink(self._askpass)
+            except OSError:
+                pass
+            self._askpass = None
+
+    @staticmethod
+    def _launchers_for(path: str) -> list[str]:
+        """Desktop entries that run this AppImage (they die with it)."""
+        out = []
+        for app in scan_desktop_files(include_hidden=True):
+            if _appimage_in_exec(app.get("exec", "")) == path:
+                out.append(app["file"])
+        return out
+
+    def run(self) -> None:
+        lines: list[str] = []
+        mine: list[str] = []
+        theirs: list[str] = []
+        try:
+            for path in self._paths:
+                targets = [path, *self._launchers_for(path)]
+                for target in targets:
+                    if os.access(target, os.W_OK) and os.access(
+                            os.path.dirname(target) or "/", os.W_OK):
+                        mine.append(target)
+                    else:
+                        theirs.append(target)
+            ok = True
+            for target in mine:
+                try:
+                    os.remove(target)
+                    lines.append(f"removed {target}")
+                    self.line.emit(f"removed {target}")
+                except OSError as e:
+                    ok = False
+                    lines.append(f"{target}: {e}")
+            if theirs:
+                self._askpass = make_askpass_script(
+                    "Enter sudo password to remove these files:")
+                env = self._child_env()
+                try:
+                    proc = subprocess.Popen(
+                        ["sudo", "-A", "rm", "-f", *theirs],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL, env=env, text=True)
+                    out, _ = proc.communicate(timeout=120)
+                    for ln in (out or "").splitlines():
+                        if ln.strip():
+                            lines.append(ln.strip())
+                            self.line.emit(ln.strip())
+                    if proc.returncode != 0:
+                        ok = False
+                except Exception as e:      # noqa: BLE001 - report, never raise
+                    ok = False
+                    lines.append(str(e))
+            for path in self._paths:
+                if os.path.exists(path):
+                    ok = False
+        finally:
+            self._cleanup()
+        self.done.emit(ok, "\n".join(lines[-40:]))
+
+
 class UntrackedLoader(QThread):
     """Finds untracked software in the background.
 
@@ -2154,8 +2388,8 @@ class UntrackedLoader(QThread):
         seen: set[tuple[str, str]] = set()
         explicit = _explicit_package_set()
         for a in found:
-            if _flatpak_id_for(a):
-                continue    # a Flatpak app is a Tracked row, not an orphan
+            if _flatpak_id_for(a) or _appimage_in_exec(a.get("exec", "")):
+                continue    # a Flatpak app / AppImage is a Tracked row
             owner, ver = owners.get(a["file"], (None, ""))
             if owner:
                 # Genuinely untracked means "not in your explicit set":
@@ -3194,6 +3428,8 @@ def _repo_tint_key(repo: str) -> str:
         return "warning"
     if key == SRC_FLATPAK:
         return "positive"
+    if key == SRC_APPIMAGE:
+        return "visited"
     if key == SRC_MANUAL:
         return "muted"
     r = (repo or "").lower()
@@ -3215,6 +3451,7 @@ def _repo_tint(repo: str) -> tuple[tuple[int, int, int], str]:
     hexes = {
         SRC_AUR: _warning_hex(),
         SRC_FLATPAK: _positive_hex(),
+        SRC_APPIMAGE: _visited_hex(),
         SRC_MANUAL: _secondary_hex(),
         SRC_OFFICIAL: _accent_hex(),
         SRC_MANAGED: _accent_hex(),
@@ -4501,9 +4738,11 @@ class TrackedModel(_FilterableModel, QAbstractListModel):
             items.append({
                 "name": pkg["name"], "version": pkg.get("version", ""),
                 "repo": pkg.get("repo", ""),
-                # Rows that arrive knowing their own title (Flatpak apps)
-                # keep it; the enricher fills the rest in later.
+                # Rows that arrive knowing their own title (Flatpak apps,
+                # AppImages) keep it; the enricher fills the rest in later.
                 "title": pkg.get("title", ""),
+                # AppImage rows: the file to delete on Uninstall.
+                "path": pkg.get("path", ""),
                 "target": m["target"] if m else "",
                 "source": m["source"] if m else "",
                 "relation": m["relation"] if m else "",
@@ -5750,12 +5989,15 @@ class UpdateWindow(QMainWindow):
         self._stat_track_managed = _StatCard("0", "third-party",
                                              _secondary_hex())
         self._stat_track_flatpak = _StatCard("0", "flatpak", _positive_hex())
+        self._stat_track_image = _StatCard("0", "appimage",
+                                           _visited_hex())
         self._track_stat_cards = {
             "": self._stat_track_all,
             SRC_OFFICIAL: self._stat_track_off,
             SRC_AUR: self._stat_track_aur,
             SRC_MANAGED: self._stat_track_managed,
             SRC_FLATPAK: self._stat_track_flatpak,
+            SRC_APPIMAGE: self._stat_track_image,
         }
         for key, card in self._track_stat_cards.items():
             card.setToolTip(
@@ -6224,8 +6466,10 @@ class UpdateWindow(QMainWindow):
         self._stat_track_off.set_value(str(counts.get(SRC_OFFICIAL, 0)))
         self._stat_track_aur.set_value(str(counts.get(SRC_AUR, 0)))
         self._stat_track_flatpak.set_value(str(counts.get(SRC_FLATPAK, 0)))
+        self._stat_track_image.set_value(str(counts.get(SRC_APPIMAGE, 0)))
         managed = sum(n for k, n in counts.items()
-                      if k not in (SRC_OFFICIAL, SRC_AUR, SRC_FLATPAK))
+                      if k not in (SRC_OFFICIAL, SRC_AUR, SRC_FLATPAK,
+                                   SRC_APPIMAGE))
         self._stat_track_managed.set_value(str(managed))
         cur = self._track_model.filter_source()
         for key, card in self._track_stat_cards.items():
@@ -6826,13 +7070,18 @@ class UpdateWindow(QMainWindow):
         what = f"<b>{n}</b> package{'s' if n != 1 else ''}"
         if n_flat == n and n:
             what = f"<b>{n}</b> Flatpak app{'s' if n != 1 else ''}"
+        elif counts.get(SRC_APPIMAGE, 0) == n and n:
+            what = f"<b>{n}</b> AppImage{'s' if n != 1 else ''}"
         else:
+            n_img = counts.get(SRC_APPIMAGE, 0)
             extra = []
             if n_aur:
                 extra.append(f"{n_aur} from the AUR")
             if n_flat:
                 extra.append(f"{n_flat} Flatpak app"
                              f"{'s' if n_flat != 1 else ''}")
+            if n_img:
+                extra.append(f"{n_img} AppImage{'s' if n_img != 1 else ''}")
             if extra:
                 what += " · " + " · ".join(extra)
         if movable:
@@ -7148,6 +7397,13 @@ class UpdateWindow(QMainWindow):
                 started = True
         return started
 
+    def _track_label(self, name: str) -> str:
+        """What to call a Tracked row in a dialog: its title, not its id."""
+        r = self._track_model.row_of(name)
+        if r is None:
+            return name
+        return self._track_model.item(r).get("title") or name
+
     def _track_source(self, name: str) -> str:
         """Canonical source key of a Tracked row ('' when unknown)."""
         r = self._track_model.row_of(name)
@@ -7177,11 +7433,20 @@ class UpdateWindow(QMainWindow):
             return
         single = len(names) == 1
         flatpak_ids = [n for n in names if self._track_source(n) == SRC_FLATPAK]
-        pacman_names = [n for n in names if n not in flatpak_ids]
+        image_names = [n for n in names if self._track_source(n) == SRC_APPIMAGE]
+        pacman_names = [n for n in names
+                        if n not in flatpak_ids and n not in image_names]
         if not confirmed:
-            how = ("uninstalled by Flatpak" if flatpak_ids and not pacman_names
-                   else "pacman -Rns" if not flatpak_ids
-                   else "pacman -Rns, Flatpak for the rest")
+            if pacman_names:
+                how = "pacman -Rns"
+                if flatpak_ids or image_names:
+                    how += " · Flatpak / the AppImage file for the rest"
+            elif flatpak_ids and not image_names:
+                how = "uninstalled by Flatpak"
+            elif image_names and not flatpak_ids:
+                how = "deleted — an AppImage is the file, nothing else"
+            else:
+                how = "Flatpak for one, the file for the other"
             box = QMessageBox(self)
             box.setWindowTitle(
                 f"Remove {names[0]}?" if single
@@ -7189,8 +7454,8 @@ class UpdateWindow(QMainWindow):
             box.setIcon(QMessageBox.Icon.Warning)
             if single:
                 box.setText(
-                    f"Remove <b>{names[0]}</b> and any dependencies that "
-                    f"become unneeded ({how})?\n\n"
+                    f"Remove <b>{self._track_label(names[0])}</b> and any "
+                    f"dependencies that become unneeded ({how})?\n\n"
                     "Configuration files in your home directory are kept.")
             else:
                 listed = "<br>".join(f"  • <b>{n}</b>" for n in names[:12])
@@ -7208,8 +7473,8 @@ class UpdateWindow(QMainWindow):
             if box.clickedButton() is not go_btn:
                 return
         force = False
-        # Only pacman packages can be "still required": a Flatpak app id is
-        # not in pacman's database at all.
+        # Only pacman packages can be "still required": a Flatpak app id
+        # and an AppImage file are not in pacman's database at all.
         blocked = (find_blocked_obsolete_packages(pacman_names)
                    if pacman_names else [])
         if blocked:
@@ -7235,28 +7500,37 @@ class UpdateWindow(QMainWindow):
         self._track_uninstall_current = names[0] if single else None
         for n in names:
             self._track_model.set_state(n, "uninstalling")
-        label = names[0] if single else f"{len(names)} packages"
-        # One remover at a time: the pacman half goes first (one password
-        # prompt), the Flatpak half follows it.
-        self._track_pending = (flatpak_ids
-                               if flatpak_ids and pacman_names else [])
+        label = (self._track_label(names[0]) if single
+                 else f"{len(names)} packages")
+        # One remover at a time, pacman first (one password prompt for
+        # the privileged half), then whatever else was selected.
+        batches = [b for b in (pacman_names, flatpak_ids, image_names) if b]
+        self._track_pending = batches[1:]
         self._track_gone: list[str] = []
         self._track_failed: list[str] = []
         self._track_outputs: list[str] = []
-        self._start_track_remover(pacman_names or flatpak_ids, force, label)
+        self._start_track_remover(batches[0], force, label)
         self._refresh_tracked_footer()
 
     def _start_track_remover(self, names: list[str], force: bool,
                              label: str) -> None:
-        """Run the remover that owns this batch (pacman or Flatpak)."""
+        """Run the remover that owns this batch (pacman, Flatpak, file)."""
         self._track_kind = ("flatpak" if self._track_source(names[0])
-                            == SRC_FLATPAK else "pacman")
+                            == SRC_FLATPAK else
+                            "appimage" if self._track_source(names[0])
+                            == SRC_APPIMAGE else "pacman")
         self._track_batch = list(names)
         if self._track_kind == "flatpak":
             self._track_uninstaller = FlatpakRemover(
                 names, {a: i for a, (_v, i) in _flatpak_apps().items()})
             self._log_action(f"Removing {label} with Flatpak…")
             self._set_status(f"Removing {label} with Flatpak…", "info")
+        elif self._track_kind == "appimage":
+            paths = [self._track_path(n) for n in names]
+            self._track_uninstaller = AppImageRemover(
+                [p for p in paths if p])
+            self._log_action(f"Removing {label} (the file itself)…")
+            self._set_status(f"Removing {label}…", "info")
         else:
             self._track_uninstaller = ObsoleteRemover(names, force=force)
             self._log_action(
@@ -7265,6 +7539,13 @@ class UpdateWindow(QMainWindow):
                 f"Removing {label}… (a password dialog may appear)", "info")
         self._track_uninstaller.done.connect(self._on_track_uninstall_done)
         self._track_uninstaller.start()
+
+    def _track_path(self, name: str) -> str:
+        """The file behind an AppImage row ('' for anything else)."""
+        r = self._track_model.row_of(name)
+        if r is None:
+            return ""
+        return self._track_model.item(r).get("path", "")
 
     def _removal_step(self, names: list[str], kind: str,
                       success: bool, output: str) -> tuple[list[str], list[str]]:
@@ -7277,7 +7558,12 @@ class UpdateWindow(QMainWindow):
         failed: list[str] = []
         if not success:
             return gone, list(names)
-        if kind == "flatpak":
+        if kind == "appimage":
+            # An AppImage is a file: it is gone when the file is gone.
+            for n in names:
+                path = self._track_path(n)
+                (failed if path and os.path.exists(path) else gone).append(n)
+        elif kind == "flatpak":
             # Flatpak keeps its own list; ask it, never pacman.
             try:
                 still_here = set(_flatpak_apps())
@@ -7330,13 +7616,12 @@ class UpdateWindow(QMainWindow):
             self._track_model.remove_row(n)
         self._track_batch = []
         if self._track_pending:
-            # A mixed selection runs one remover at a time: the Flatpak
-            # half goes now and the summary waits for the whole selection.
-            pending = list(self._track_pending)
-            self._track_pending = []
-            label = (pending[0] if len(pending) == 1
-                     else f"{len(pending)} packages")
-            self._start_track_remover(pending, force=False, label=label)
+            # A mixed selection runs one remover at a time; the summary
+            # waits for the whole selection.
+            nxt = self._track_pending.pop(0)
+            label = (self._track_label(nxt[0]) if len(nxt) == 1
+                     else f"{len(nxt)} packages")
+            self._start_track_remover(nxt, force=False, label=label)
             return
         self._track_uninstall_names = []
         self._track_uninstall_current = None

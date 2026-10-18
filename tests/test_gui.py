@@ -2668,7 +2668,7 @@ class TestStatStripFilters:
         cells = window._track_stat_cards
         assert {k: c._value.text() for k, c in cells.items()} == {
             "": "3", "official": "1", "aur": "1", "managed": "1",
-            "flatpak": "0"}
+            "flatpak": "0", "appimage": "0"}
         # The "everything" cell is a readout, not a filter: nothing is
         # highlighted until a real filter is on.
         assert not any(c.property("active") for c in cells.values())
@@ -2759,6 +2759,7 @@ class TestFlatpakRows:
                             lambda: [{"name": "konsole", "version": "1-1",
                                       "repo": "official"}])
         monkeypatch.setattr(app, "find_repo_moves", lambda names=None: [])
+        monkeypatch.setattr(app, "appimage_rows", lambda: [])
         monkeypatch.setattr(app, "_flatpak_apps",
                             lambda: {"com.discordapp.Discord":
                                      ("1.0.151", "system")})
@@ -2771,6 +2772,7 @@ class TestFlatpakRows:
         monkeypatch.setattr(app, "get_installed_packages",
                             lambda: [{"name": "konsole", "version": "1-1",
                                       "repo": "official"}])
+        monkeypatch.setattr(app, "appimage_rows", lambda: [])
         monkeypatch.setattr(app, "find_repo_moves", lambda names=None: [])
 
         def boom():
@@ -2957,3 +2959,151 @@ class TestRebootButton:
         _accept_box(monkeypatch, "Reboot now")
         window._reboot_now()
         assert "power menu" in window._sub.text()
+
+
+class TestAppImageRows:
+    """An AppImage is software too — tracked, titled, removable."""
+
+    def test_a_launcher_that_runs_one_makes_it_installed(self, monkeypatch,
+                                                         tmp_path):
+        image = tmp_path / "WhisperFlow-0.4.409-x86_64.AppImage"
+        image.write_text("#!/bin/sh\n")
+        monkeypatch.setattr(app, "scan_desktop_files",
+                            lambda dirs=None, include_hidden=False: [
+                                {"file": "/home/s/.local/share/applications/"
+                                         "whisper-flow.desktop",
+                                 "title": "WhisperFlow", "comment": "Dictation",
+                                 "exec": f'"{image}"'}])
+        monkeypatch.setattr(app, "_appimage_dirs", lambda: [])
+        rows = app.appimage_rows()
+        assert len(rows) == 1
+        assert rows[0]["name"] == "WhisperFlow-0.4.409-x86_64"
+        assert rows[0]["title"] == "WhisperFlow"
+        assert rows[0]["version"] == "0.4.409"
+        assert rows[0]["repo"] == "appimage"
+        assert rows[0]["path"] == str(image)
+
+    def test_an_app_folder_counts_even_without_a_launcher(self, monkeypatch,
+                                                          tmp_path):
+        apps = tmp_path / "Applications"
+        apps.mkdir()
+        (apps / "Claude.AppImage").write_text("#!/bin/sh\n")
+        (apps / "notes.txt").write_text("not an app\n")
+        monkeypatch.setattr(app, "scan_desktop_files",
+                            lambda dirs=None, include_hidden=False: [])
+        monkeypatch.setattr(app, "_appimage_dirs", lambda: [str(apps)])
+        rows = app.appimage_rows()
+        assert [r["name"] for r in rows] == ["Claude"]
+        assert rows[0]["title"] == "Claude"
+
+    def test_the_same_file_found_twice_is_one_row(self, monkeypatch,
+                                                  tmp_path):
+        apps = tmp_path / "Applications"
+        apps.mkdir()
+        image = apps / "T3-Code-0.0.24-x86_64.AppImage"
+        image.write_text("#!/bin/sh\n")
+        monkeypatch.setattr(app, "scan_desktop_files",
+                            lambda dirs=None, include_hidden=False: [
+                                {"file": "/x/t3code.desktop",
+                                 "title": "T3 Code", "comment": "",
+                                 "exec": f'"{image}" %U'}])
+        monkeypatch.setattr(app, "_appimage_dirs", lambda: [str(apps)])
+        rows = app.appimage_rows()
+        assert len(rows) == 1
+        assert rows[0]["title"] == "T3 Code"
+
+    def test_version_and_name_come_from_the_filename(self):
+        assert app._appimage_version("/x/T3-Code-0.0.24-x86_64.AppImage") \
+            == "0.0.24"
+        assert app._appimage_version("/x/paper-desktop-0.1.10x86_64.AppImage") \
+            == "0.1.10"
+        assert app._appimage_version("/x/FreeBoomShare-latest.AppImage") == ""
+        assert app._appimage_pretty("WhisperFlow-0.4.409-x86_64") \
+            == "WhisperFlow"
+        assert app._appimage_pretty("Claude") == "Claude"
+
+    def test_exec_parsing_handles_quotes_and_env(self):
+        assert app._appimage_in_exec('"/home/s/Applications/Claude.AppImage" '
+                                     '--no-sandbox %u') \
+            == "/home/s/Applications/Claude.AppImage"
+        assert app._appimage_in_exec(
+            'env "WINEPREFIX=/tmp/x" wine start %u') == ""
+        assert app._appimage_in_exec("/usr/bin/zen %U") == ""
+
+    def test_untracked_leaves_appimage_launchers_to_tracked(
+            self, monkeypatch, tmp_path):
+        image = tmp_path / "Zen-1.0.AppImage"
+        image.write_text("#!/bin/sh\n")
+        monkeypatch.setattr(app, "scan_desktop_files",
+                            lambda dirs=None, include_hidden=False: [
+                                {"file": str(tmp_path / "zen.desktop"),
+                                 "title": "Zen", "comment": "",
+                                 "exec": f'"{image}" %U'},
+                                {"file": str(tmp_path / "other.desktop"),
+                                 "title": "Other", "comment": "",
+                                 "exec": "/usr/bin/other"}])
+        rows = app.UntrackedLoader()._load_apps()
+        names = {r["name"] for r in rows}
+        assert "zen" not in names
+        assert "other" in names
+
+    def test_removing_one_deletes_the_file_and_its_launcher(
+            self, monkeypatch, tmp_path):
+        apps = tmp_path / "Applications"
+        apps.mkdir()
+        image = apps / "Claude.AppImage"
+        image.write_text("#!/bin/sh\n")
+        launcher = tmp_path / "claude-desktop.desktop"
+        launcher.write_text("[Desktop Entry]\nName=Claude\n"
+                            f"Exec={image}\nType=Application\n")
+        monkeypatch.setattr(
+            app.AppImageRemover, "_launchers_for",
+            staticmethod(lambda path: [str(launcher)]))
+        seen = []
+        remover = app.AppImageRemover([str(image)])
+        remover.done.connect(lambda ok, out: seen.append((ok, out)))
+        remover.run()
+        assert seen and seen[0][0] is True
+        assert not image.exists()
+        assert not launcher.exists()
+
+    def test_a_tracked_appimage_uninstalls_as_a_file(self, window, qapp,
+                                                     monkeypatch):
+        started = []
+
+        class FakeImages(QObject):
+            line = pyqtSignal(str)
+            done = pyqtSignal(bool, str)
+
+            def __init__(self, paths):
+                super().__init__()
+                started.append(list(paths))
+
+            def isRunning(self):
+                return False
+
+            def wait(self, ms=0):
+                return True
+
+            def start(self):
+                pass
+
+            def terminate(self):
+                pass
+
+        monkeypatch.setattr(app, "AppImageRemover", FakeImages)
+        monkeypatch.setattr(app, "find_blocked_obsolete_packages",
+                            lambda pkgs: [])
+        _accept_box(monkeypatch, "Remove")
+        _settle_loaders(window, qapp)
+        window._on_tracked_loaded(
+            [{"name": "Claude", "version": "", "repo": "appimage",
+              "title": "Claude", "path": "/home/s/Applications/Claude.AppImage",
+              "desktop": ""}], [])
+        qapp.processEvents()
+        assert window._track_source("Claude") == "appimage"
+
+        window._request_track_uninstall("Claude")
+
+        assert started == [["/home/s/Applications/Claude.AppImage"]]
+        assert window._track_kind == "appimage"
