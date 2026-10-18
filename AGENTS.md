@@ -15,15 +15,19 @@ slot; it may never move the slots.
   a message wrap and push the content down.
 - **Rows are all the same height**, and the list uses `ResizeMode.Fixed`.
   Variable row heights make the view re-anchor itself as rows are measured,
-  which looks exactly like the list scrolling on its own.
+  which looks exactly like the list scrolling on its own. The one exception is
+  the row the user just unfolded by hand: "Show more" grows *that* row to hold
+  what it was hiding (full release notes, the whole requirer list) and folds
+  back on "Show less" — see `_relayout_after_row_event`, which holds the scroll
+  offset so the clicked row never moves. Nothing else may resize a row.
 - **An empty list still looks like a list.** Keep its frame, its header and its
   stat cards; the placeholder lives *inside* the frame and only swaps an icon
   and two lines of text.
 - **Lists show "Loading…" while they load** — inside that same frame, in that
   same placeholder, with a line saying what is being loaded. Never a blank box.
 - **The only allowed shifts are deliberate, rare and worth it:** the security
-  warning banner, the AUR→official banner, and opening the log panel. Nothing
-  else may move.
+  warning banner, the AUR→official banner, opening the log panel, and unfolding
+  a row with "Show more". Nothing else may move.
 
 ## Where information lives
 

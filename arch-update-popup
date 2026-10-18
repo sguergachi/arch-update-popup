@@ -46,7 +46,7 @@ from PyQt6.QtWidgets import (
     QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QProgressDialog,
     QPushButton, QScrollArea,
     QSizePolicy, QStackedWidget, QStyle, QStyledItemDelegate,
-    QStyleOptionButton, QSystemTrayIcon, QTextBrowser, QTextEdit, QVBoxLayout,
+    QStyleOptionButton, QSystemTrayIcon, QTextEdit, QVBoxLayout,
     QWidget,
 )
 
@@ -3309,7 +3309,7 @@ QLabel#details-label {
 }
 QLabel#empty-note { font-size: %(meta)spx; color: %(muted)s; padding: 12px 2px; }
 
-QPlainTextEdit#details, QTextBrowser#details {
+QPlainTextEdit#details {
     background: %(canvas)s; color: palette(text);
     border: 1px solid %(border)s; border-radius: %(radius)spx;
     font-family: monospace; font-size: %(meta)spx; padding: 8px;
@@ -3386,7 +3386,7 @@ QPushButton#view-tab:checked {
 QPushButton#view-tab:checked:hover { background: %(accent_hover)s; }
 QPushButton#view-tab:disabled { color: %(muted)s; }
 
-/* — Slim overlay scrollbars (list, log, details, popover) — */
+/* — Slim overlay scrollbars (list, log, details) — */
 QScrollBar:vertical {
     background: transparent; width: 8px; margin: 2px 1px 2px 0;
 }
@@ -4309,7 +4309,20 @@ class PackageModel(_FilterableModel, QAbstractListModel):
         idx = self.index(visible)
         self.dataChanged.emit(idx, idx, [])
 
-    # — Show-more popover (see UpdateWindow.show_popover) —
+
+def _relayout_after_row_event(view: QAbstractItemView, model) -> None:
+    """Re-measure every row after one of them grew or folded back.
+
+    The view caches row heights, so a row whose height changes needs a
+    layout pass. Only that row changed above everything below it, so
+    holding the scroll offset holds the row the user clicked exactly where
+    it was — the view never jumps under the pointer.
+    """
+    sb = view.verticalScrollBar()
+    keep = sb.value()
+    model.layoutChanged.emit()
+    sb.setValue(keep)
+    view.viewport().update()
 
 
 class PackageDelegate(QStyledItemDelegate):
@@ -4319,6 +4332,11 @@ class PackageDelegate(QStyledItemDelegate):
     link_activated = pyqtSignal(str)    # external URL clicked
     more_requested = pyqtSignal(int)    # show more / less
     action_requested = pyqtSignal(str)  # retry / install-anyway for pkg
+
+    # How many lines an unfolded row shows before the rest is left to the
+    # package page: release notes can run to a hundred lines, and a row
+    # taller than the window helps nobody.
+    NOTES_LINES = 14
 
     RAIL = 28       # checkbox / status icon column
     PAD = 16        # card inner padding (horizontal, 4u)
@@ -4343,6 +4361,9 @@ class PackageDelegate(QStyledItemDelegate):
         self._view = view
         self._docs: dict = {}
         self._geo: dict = {}
+        # Package names whose full notes are unfolded in place, not rows:
+        # the state survives a re-check, so a row you opened stays open.
+        self._notes_open: set[str] = set()
         self._hover: tuple[int, str] = (-1, "")
         self._phase = 0
         self._paint_failed = False
@@ -4401,13 +4422,34 @@ class PackageDelegate(QStyledItemDelegate):
         self._hover = (-1, "")
         self._view.viewport().update()
 
+    def toggle_notes(self, row: int) -> None:
+        """Unfold a row's full release notes in place, or fold them back.
+
+        The row grows to hold them and everything below it moves: the one
+        deliberate shift a row is allowed (AGENTS.md). The row the user
+        clicked keeps its place on screen, so the click never lands
+        somewhere else.
+        """
+        model = self._view.model()
+        if model is None or not 0 <= row < model.rowCount():
+            return
+        name = model.item(row)["name"]
+        if name in self._notes_open:
+            self._notes_open.discard(name)
+        else:
+            self._notes_open.add(name)
+        _relayout_after_row_event(self._view, model)
+
     # — Geometry: single source of truth for paint + hit-testing —
     def _layout(self, row: int, item: dict, width: int) -> dict:
         # The view may query geometry before it has a real width (and tests
         # do too) — never lay out on a degenerate width.
         width = max(int(width or 0), 60)
         rev = item["_rev"]
-        key = (row, width, item["state"], rev)
+        # Unfolding a row changes its height, so it is part of the cache
+        # key: the geometry is rebuilt the moment the row opens or folds.
+        key = (row, width, item["state"], rev,
+               item["name"] in self._notes_open)
         lay = self._geo.get(key)
         if lay is not None:
             return lay
@@ -4462,30 +4504,34 @@ class PackageDelegate(QStyledItemDelegate):
         # row of its own — `desc` stays a null rect for hit-testing parity.
         desc_txt = " ".join((item["desc"] or "").split())
 
-        # ── Row 4 · what's new, with Show more on the right ────────────────
+        # ── Row 4 · what's new: one line, or the whole thing unfolded ──────
+        # "Show more" unfolds the full notes *in the row*: the card grows
+        # to hold them and "Show less" folds it back (see toggle_notes).
+        # Nothing is cut off without saying so: past NOTES_LINES the block
+        # ends on a muted "… N more lines" and leaves the rest to the
+        # package page the row already links to.
         full = (item["full"] or "").strip()
         notes = (item["notes"] or "").strip()
-        has_more = bool(full) and full != notes
-        shown = (notes[:_SNIPPET_LEN].rstrip() + "…"
-                 if len(notes) > _SNIPPET_LEN else notes)
-        more_txt = "Show more  ↓" if has_more else ""
+        unfold_txt = full or notes
+        unfolded = item["name"] in self._notes_open
+        collapsed_fits = (unfold_txt == notes
+                          and len(" ".join(notes.split())) <= _SNIPPET_LEN)
+        has_more = bool(unfold_txt) and not collapsed_fits
+        more_txt = ""
+        if has_more:
+            more_txt = "Show less  ↑" if unfolded else "Show more  ↓"
         more_w = fm.horizontalAdvance(more_txt) if more_txt else 0
         prefix = "What's new: "
         prefix_w = fm.horizontalAdvance(prefix)
-        single = " ".join(shown.split())
-        notes_avail = max(40, cw - prefix_w - (more_w + 24 if more_txt else 0))
-        elided = fm.elidedText(single, Qt.TextElideMode.ElideRight,
-                               notes_avail)
-        notes_html = (f"<span style='color:{_secondary_hex()}'><b>What's new: </b></span>"
-                      + html.escape(elided))
-        notes_doc = self._doc(row, "notes", notes_html, cw,
-                              self._f_text, True, rev)
+        prefix_html = (f"<span style='color:{_secondary_hex()}'>"
+                       f"<b>What's new: </b></span>")
         h_name, h_line, h_notes = self._rows()
 
         # Every card is exactly this tall, whatever it contains: state is
         # shown inside the fixed rows (progress in the bottom padding, the
         # retry pill on the notes row) instead of adding rows. Uniform
-        # heights are what keep a pixel-scrolled list from drifting.
+        # heights are what keep a pixel-scrolled list from drifting — and
+        # only an unfolded row, at the user's click, is ever taller.
         ver_top = y + h_name + self.GAP
         notes_top = ver_top + h_line + self.GAP_NOTES
         action_txt = ""
@@ -4494,6 +4540,43 @@ class PackageDelegate(QStyledItemDelegate):
         elif item["compromised"]:
             action_txt = "Install anyway"
         action_w = fm.horizontalAdvance(action_txt) + 24 if action_txt else 0
+
+        # The block's first line shares its space with the control and any
+        # row action pill, so the text leaves room for them there.
+        first_line_res = max(more_w, action_w)
+        notes_w = max(60, cw - (first_line_res + 24 if first_line_res else 0))
+        hint_txt = ""
+        if unfolded:
+            lines = unfold_txt.splitlines() or [""]
+            if len(lines) > self.NOTES_LINES:
+                keep = self.NOTES_LINES - 1
+                body = "\n".join(lines[:keep])
+                rest = len(lines) - keep
+                hint_txt = f"… {rest} more line{'s' if rest != 1 else ''}"
+            else:
+                body = unfold_txt
+            notes_doc = self._doc(row, "notes_full",
+                                  prefix_html + html.escape(body)
+                                  .replace("\n", "<br>"), notes_w,
+                                  self._f_text, True, rev)
+            h_block = max(h_notes, int(notes_doc.size().height()) + 2)
+            if hint_txt:
+                h_block += self.GAP + h_notes
+        else:
+            shown = (notes[:_SNIPPET_LEN].rstrip() + "…"
+                     if len(notes) > _SNIPPET_LEN else notes)
+            elided = fm.elidedText(" ".join(shown.split()),
+                                   Qt.TextElideMode.ElideRight,
+                                   max(40, notes_w - prefix_w))
+            notes_doc = self._doc(row, "notes",
+                                  prefix_html + html.escape(elided),
+                                  notes_w, self._f_text, True, rev)
+            h_block = h_notes
+        # An unfolded row with a row action on its first line puts the
+        # fold-back control under the block instead — never a row with no
+        # way to close it.
+        end_ctrl = bool(more_txt) and unfolded and bool(action_txt)
+        end_line = (h_notes + self.GAP_NOTES) if end_ctrl else 0
 
         lay = {
             "check": QRect(x0 - self.RAIL + 4, y + 1, 18, 18),
@@ -4509,26 +4592,31 @@ class PackageDelegate(QStyledItemDelegate):
             "ver": QRect(x0, ver_top, cw, h_line),
             "ver_old": ver_old, "ver_new": ver_new, "ver_w": ver_w,
             "desc": QRect(),
-            # The notes rect stops where its row action begins: it
-            # describes exactly the space the text is elided into.
-            "notes": QRect(x0, notes_top,
-                           max(40, cw - (max(more_w, action_w) + 12
-                                         if (more_txt or action_txt) else 0)),
-                           h_notes),
+            # The notes block holds the folded line, or the unfolded text;
+            # its width leaves the first line's right side to the control
+            # and any row action pill.
+            "notes": QRect(x0, notes_top, notes_w, h_block),
+            "hint": (QRect(x0, notes_top + h_block - h_notes, cw, h_notes)
+                     if hint_txt else QRect()),
+            "hint_txt": hint_txt,
             "more": (QRect(right - more_w - 4, notes_top, more_w + 4, h_notes)
-                     if (more_txt and not action_txt) else QRect()),
+                     if (more_txt and not action_txt and not end_ctrl)
+                     else QRect()),
+            "more_end": (QRect(right - more_w - 4,
+                               notes_top + h_block + self.GAP_NOTES,
+                               more_w + 4, h_notes) if end_ctrl else QRect()),
             "action": (QRect(right - action_w, notes_top, action_w, h_notes)
                        if action_txt else QRect()),
             "action_txt": action_txt,
             # Thin progress line inside the bottom padding — no extra row.
-            "progress": (QRect(x0, notes_top + h_notes + 3, cw, 3)
+            "progress": (QRect(x0, notes_top + h_block + end_line + 3, cw, 3)
                          if item["state"] in ("installing", "done", "failed")
                          else QRect()),
             "card": QRect(self.CDX, self.CDY, width - 2 * self.CDX, 0),
         }
 
-        total = (notes_top + h_notes + self.GAP_NOTES + 4 + self.PBOT
-                 + self.CDY)
+        total = (notes_top + h_block + end_line + self.GAP_NOTES + 4
+                 + self.PBOT + self.CDY)
         lay["card"].setHeight(total - 2 * self.CDY)
         lay["height"] = total
         lay["notes_doc"] = notes_doc
@@ -4670,12 +4758,20 @@ class PackageDelegate(QStyledItemDelegate):
         p.translate(nr.topLeft())
         lay["notes_doc"].drawContents(p, QRectF(0, 0, nr.width(), nr.height()))
         p.restore()
+        if lay["hint_txt"]:
+            p.setPen(QPen(QColor(_secondary_hex())))
+            p.drawText(move(lay["hint"]),
+                       Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter, lay["hint_txt"])
 
         # Action links
         hover = self._hover if self._hover[0] == index.row() else (-1, "")
         p.setFont(self._f_text)
         if lay["more_txt"]:
-            mr = move(lay["more"])
+            # Show more sits on the notes line; the fold-back control of an
+            # unfolded row with a row action drops to the block's last line.
+            mr = move(lay["more"] if not lay["more"].isNull()
+                      else lay["more_end"])
             f = p.font()
             f.setUnderline(hover[1] == "more")
             p.setFont(f)
@@ -4750,7 +4846,7 @@ class PackageDelegate(QStyledItemDelegate):
             lay, origin = self._hit(option, index)
             pos = event.position().toPoint() - origin
             kind = ""
-            for k in ("check", "link", "more", "action"):
+            for k in ("check", "link", "more", "more_end", "action"):
                 r = lay.get(k)
                 if r is not None and not r.isNull() and r.contains(pos):
                     # The rail is only a checkbox while the row is idle;
@@ -4759,7 +4855,9 @@ class PackageDelegate(QStyledItemDelegate):
                                          or model.item(index.row())["state"]
                                          != "idle"):
                         continue
-                    kind = k
+                    # One control, one behaviour: the fold-back link under
+                    # an unfolded block hovers like the one on its line.
+                    kind = "more" if k == "more_end" else k
                     break
             if (index.row(), kind) != self._hover:
                 old_row = self._hover[0]
@@ -4788,7 +4886,9 @@ class PackageDelegate(QStyledItemDelegate):
                     _package_url(item["name"], item["repo"],
                                  item.get("url", "")))
                 return True
-            if not lay["more"].isNull() and lay["more"].contains(pos):
+            if ((not lay["more"].isNull() and lay["more"].contains(pos))
+                    or (not lay["more_end"].isNull()
+                        and lay["more_end"].contains(pos))):
                 self.more_requested.emit(index.row())
                 return True
             if not lay["action"].isNull() and lay["action"].contains(pos):
@@ -4985,6 +5085,7 @@ class TrackedDelegate(QStyledItemDelegate):
     open_requested = pyqtSignal(str)
     link_activated = pyqtSignal(str)    # external URL clicked
     toggled = pyqtSignal(int)           # checkbox flipped
+    expand_requested = pyqtSignal(int)  # "Show more" clicked on a row
 
     CDX = 8         # card inset inside the row (horizontal, 2u)
     PAD = 16        # card inner padding (horizontal, 4u)
@@ -5000,10 +5101,13 @@ class TrackedDelegate(QStyledItemDelegate):
 
     # A dependency row's "DEPENDENCY FOR" block: a label line and this
     # many bullet lines, reserved whatever the count — one requirer and
-    # ten are the same height, so the list never re-anchors. The bullets
-    # hang under the label by DEP_INDENT.
+    # ten are the same height, so the list never re-anchors on its own.
+    # "Show more" on the label line unfolds the whole list and the row
+    # grows to hold it: the one deliberate shift a row is allowed (see
+    # AGENTS.md). The bullets hang under the label by DEP_INDENT.
     DEP_LINES = 3
     DEP_INDENT = 12
+    MORE_GAP = 6    # label line: gap between its text and the control
 
     def _rows(self) -> tuple[int, int, int]:
         return (_sp(self.H_NAME), _sp(self.H_LINE), _sp(self.H_PILL))
@@ -5012,6 +5116,9 @@ class TrackedDelegate(QStyledItemDelegate):
         super().__init__(view)
         self._view = view
         self._hover: tuple[int, str] = (-1, "")
+        # Package names whose requirer list is unfolded, not rows: the
+        # state survives a rescan, so a row you opened stays open.
+        self._expanded: set[str] = set()
         self._f_name = QFont()
         self._f_name.setBold(True)
         self._f_text = QFont()
@@ -5032,19 +5139,65 @@ class TrackedDelegate(QStyledItemDelegate):
     def _dep_bullets(self, item: dict) -> list[tuple[str, str]]:
         """A dependency row's block: (bullet, text) per reserved line.
 
-        At most DEP_LINES lines, the last one carrying "+N more" when the
-        requirers don't fit — the full list is the row's tooltip.
+        Folded, at most DEP_LINES lines, the last one carrying "+N more"
+        when the requirers don't fit — "Show more" on the label line then
+        unfolds the whole list and the row grows to hold it (see
+        toggle_expanded). The full list is also the row's tooltip.
         """
         if not item.get("needs_known"):
             return []
         needs = [str(n) for n in (item.get("needs") or []) if n]
         if not needs:
             return [("", "No explicitly installed package needs it.")]
-        bullets = [("\u2022", n) for n in needs[:self.DEP_LINES]]
-        if len(needs) > self.DEP_LINES:
+        n_lines = self._dep_lines(item)
+        bullets = [("\u2022", n) for n in needs[:n_lines]]
+        if len(needs) > n_lines:
             mark, text = bullets[-1]
-            bullets[-1] = (mark, f"{text}   +{len(needs) - self.DEP_LINES} more")
+            bullets[-1] = (mark, f"{text}   +{len(needs) - n_lines} more")
         return bullets
+
+    def _unfolded(self, item: dict) -> bool:
+        return item["name"] in self._expanded
+
+    def _dep_lines(self, item: dict) -> int:
+        """How many bullet lines this dependency row reserves right now."""
+        if self._unfolded(item):
+            needs = [str(n) for n in (item.get("needs") or []) if n]
+            return max(self.DEP_LINES, len(needs))
+        return self.DEP_LINES
+
+    def _dep_more_txt(self, item: dict) -> str:
+        """The label line's control: unfold the list, fold it back, or nothing.
+
+        A row that already shows every requirer gets no control — there is
+        nothing behind it to reveal.
+        """
+        if not item.get("needs_known"):
+            return ""
+        needs = [str(n) for n in (item.get("needs") or []) if n]
+        if len(needs) <= self.DEP_LINES:
+            return ""
+        return "Show less" if self._unfolded(item) else "Show more"
+
+    def toggle_expanded(self, row: int) -> None:
+        """Unfold a dependency row's whole requirer list, or fold it back.
+
+        The row grows to hold it and everything below it moves: the one
+        deliberate shift a row is allowed (AGENTS.md). The row the user
+        clicked keeps its place on screen.
+        """
+        model = self._view.model()
+        if model is None or not 0 <= row < model.rowCount():
+            return
+        item = model.item(row)
+        if item.get("kind") != "dependency":
+            return
+        name = item["name"]
+        if name in self._expanded:
+            self._expanded.discard(name)
+        else:
+            self._expanded.add(name)
+        _relayout_after_row_event(self._view, model)
 
     def _geom(self, row: int, item: dict, width: int) -> dict:
         # Same card as the Updates list: rail, name row with the one row
@@ -5105,26 +5258,36 @@ class TrackedDelegate(QStyledItemDelegate):
         dep_label = QRect()
         dep_rects: list[QRect] = []
         dep_lines: list[tuple[str, str]] = []
+        dep_more = QRect()
+        dep_more_txt = ""
         if item.get("kind") == "dependency":
             dep_label_txt = "\u21b3 DEPENDENCY FOR:"
             dep_label = QRect(x0, bottom_top, cw, h_line)
+            # "Show more" sits on the label line, right — always in the
+            # same place, folded or unfolded.
+            dep_more_txt = self._dep_more_txt(item)
+            more_w = (fm.horizontalAdvance(dep_more_txt) + self.MORE_GAP
+                      if dep_more_txt else 0)
+            if more_w:
+                dep_more = QRect(right - more_w, bottom_top, more_w, h_line)
             bullets_w = max(40, cw - self.DEP_INDENT)
             lines = self._dep_bullets(item)
+            n_dep_lines = self._dep_lines(item)
             dep_top = bottom_top + h_line + self.GAP
-            for i in range(self.DEP_LINES):
+            for i in range(n_dep_lines):
                 rect = QRect(x0 + self.DEP_INDENT,
                              dep_top + i * (h_line + self.GAP),
                              bullets_w, h_line)
                 dep_rects.append(rect)
-                mark, text = (lines + [("", "")] * self.DEP_LINES)[i]
+                mark, text = (lines + [("", "")] * n_dep_lines)[i]
                 avail = bullets_w - (fm.horizontalAdvance(mark + " ")
                                      if mark else 0)
                 dep_lines.append(
                     (mark, fm.elidedText(text, Qt.TextElideMode.ElideRight,
                                          max(20, avail))
                      if text else ""))
-            bottom_top = (dep_top + self.DEP_LINES * h_line
-                          + (self.DEP_LINES - 1) * self.GAP + self.GAP)
+            bottom_top = (dep_top + n_dep_lines * h_line
+                          + (n_dep_lines - 1) * self.GAP + self.GAP)
         # Pills sit on the bottom baseline, right-aligned (Uninstall,
         # then Open) — like the Updates action pill below its notes line.
         pills_w = 0
@@ -5167,11 +5330,14 @@ class TrackedDelegate(QStyledItemDelegate):
             "desc": QRect(x0, desc_top, cw, h_line),
             "desc_txt": desc_txt,
             # Dependency rows only: the "DEPENDENCY FOR" label and its
-            # bullets ((mark, text) per reserved line).
+            # bullets ((mark, text) per reserved line), plus the control
+            # that unfolds the whole list in place.
             "dep_label": dep_label,
             "dep_label_txt": dep_label_txt,
             "dep_rects": dep_rects,
             "dep_lines": dep_lines,
+            "dep_more": dep_more,
+            "dep_more_txt": dep_more_txt,
             "hint": QRect(x0, bottom_top + 4,
                           max(10, cw - pills_w - 12), h_line),
             "hint_txt": hint_txt,
@@ -5302,6 +5468,18 @@ class TrackedDelegate(QStyledItemDelegate):
             p.drawText(move(lay["dep_label"]),
                        Qt.AlignmentFlag.AlignLeft
                        | Qt.AlignmentFlag.AlignVCenter, lay["dep_label_txt"])
+            if lay["dep_more_txt"]:
+                # Folded or unfolded, the control keeps its place: one
+                # link-coloured word at the right of the label line.
+                p.setFont(self._f_text)
+                f = p.font()
+                f.setUnderline(hover[1] == "dep_more")
+                p.setFont(f)
+                p.setPen(QPen(QColor(_link_hex())))
+                p.drawText(move(lay["dep_more"]),
+                           Qt.AlignmentFlag.AlignRight
+                           | Qt.AlignmentFlag.AlignVCenter,
+                           lay["dep_more_txt"])
             p.setFont(self._f_text)
             fm_t = QFontMetrics(self._f_text)
             text_col = pal.color(pal.ColorRole.Text)
@@ -5381,7 +5559,7 @@ class TrackedDelegate(QStyledItemDelegate):
                              option.rect.width())
             pos = event.position().toPoint() - option.rect.topLeft()
             kind = ""
-            for k in ("check", "action2", "open", "link"):
+            for k in ("check", "action2", "open", "link", "dep_more"):
                 if not lay[k].isNull() and lay[k].contains(pos):
                     kind = k
                     break
@@ -5414,6 +5592,10 @@ class TrackedDelegate(QStyledItemDelegate):
                 self.link_activated.emit(
                     _package_url(it["name"], it["repo"], it.get("url", "")))
                 return True
+            if (not lay["dep_more"].isNull()
+                    and lay["dep_more"].contains(pos)):
+                self.expand_requested.emit(index.row())
+                return True
         return False
 
 
@@ -5421,82 +5603,6 @@ def fm_elided(font: QFont, text: str, width: int) -> str:
     """Elide `text` to fit `width` pixels (single line)."""
     return QFontMetrics(font).elidedText(text, Qt.TextElideMode.ElideRight,
                                          max(20, width))
-
-
-class NotesPopover(QDialog):
-    """'Show more' popover: full release notes + source + actions."""
-
-    def __init__(self, parent: QWidget, item: dict) -> None:
-        super().__init__(parent, Qt.WindowType.Popup)
-        self.setWindowTitle(f"{item['name']} — what's new")
-        self.setMinimumSize(560, 420)
-        self.setStyleSheet(_themed_qss())
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 16, 20, 16)
-        lay.setSpacing(10)
-
-        eyebrow = QLabel("WHAT'S NEW · FULL DETAILS")
-        eyebrow.setObjectName("eyebrow")
-        lay.addWidget(eyebrow)
-        title = QLabel(
-            f"{item['name']} &nbsp;<span style='color:{_secondary_hex()}'>"
-            f"{item['old']} → <b style='color:{_positive_hex()}'>{item['new']}</b>"
-            "</span>")
-        title.setObjectName("title")
-        title.setStyleSheet(f"font-size: {_sp(17)}px;")
-        lay.addWidget(title)
-
-        if item.get("source"):
-            src_html = (f"<span style='color:{_secondary_hex()}'>"
-                        f"Source: {html.escape(item['source'])}</span>")
-            if item.get("source_url"):
-                src_html += (f" &nbsp;·&nbsp; <a href='{item['source_url']}'"
-                             f" style='text-decoration:none;"
-                             f" color:{_link_hex()}'>open source ↗</a>")
-            src = QLabel(src_html)
-            src.setObjectName("package-link")
-            src.setOpenExternalLinks(True)
-            lay.addWidget(src)
-
-        browser = QTextBrowser()
-        browser.setObjectName("details")
-        browser.setPlainText((item.get("full") or item.get("notes") or "").strip())
-        browser.setFont(QFont("monospace"))
-        lay.addWidget(browser, 1)
-
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        pkg_url = _package_url(item["name"], item["repo"], item.get("url", ""))
-        if pkg_url:
-            pkg_link = QLabel(
-                f"<a style='text-decoration:none; color:{_link_hex()}' "
-                f"href='{pkg_url}'>Open package page ↗</a>")
-            pkg_link.setStyleSheet(f"color: {_secondary_hex()};")
-            pkg_link.setObjectName("package-link")
-            pkg_link.setOpenExternalLinks(True)
-            row.addWidget(pkg_link)
-        row.addStretch()
-        copy_btn = QPushButton("Copy")
-        copy_btn.setObjectName("secondary-small")
-        copy_btn.setFixedHeight(_sp(30))
-        copy_btn.setIcon(app_icon("copy", 14))
-        copy_btn.clicked.connect(
-            lambda: QApplication.clipboard().setText(browser.toPlainText()))
-        row.addWidget(copy_btn)
-        close_btn = QPushButton("Close")
-        close_btn.setObjectName("primary")
-        close_btn.setFixedHeight(_sp(30))
-        close_btn.clicked.connect(self.close)
-        row.addWidget(close_btn)
-        lay.addLayout(row)
-
-        # Position near the cursor, clamped on-screen.
-        pos = QCursor.pos()
-        geo = QApplication.primaryScreen().availableGeometry()
-        self.adjustSize()
-        x = min(max(pos.x() - 280, geo.left()), geo.right() - self.width())
-        y = min(max(pos.y() - 100, geo.top()), geo.bottom() - self.height())
-        self.move(x, y)
 
 
 class UpdateWindow(QMainWindow):
@@ -5534,7 +5640,6 @@ class UpdateWindow(QMainWindow):
         self._info_gen = 0
         self._last_error: str = ""
         self._installing_row: int | None = None
-        self._popover: NotesPopover | None = None
         self._orphans: set = set()  # parked threads (see _park_thread)
         self._sources_dialog: ManagedSourcesDialog | None = None
         # Buttons whose icons bake the theme's grey: re-resolved live in
@@ -7646,6 +7751,9 @@ class UpdateWindow(QMainWindow):
         delegate.open_requested.connect(self._open_untracked_app)
         delegate.link_activated.connect(
             lambda url: QDesktopServices.openUrl(QUrl(url)))
+        # "Show more" on a dependency row unfolds the whole requirer list
+        # inside the card (never a dialog).
+        delegate.expand_requested.connect(delegate.toggle_expanded)
         delegate.toggled.connect(
             lambda row, m=model: self._toggle_card_check(m, row))
         model.dataChanged.connect(
@@ -8795,9 +8903,14 @@ class UpdateWindow(QMainWindow):
                 self._overwrite = "*"
                 self.start_update()
 
-    # — Show-more popover —
+    # — Show more: unfold the row in place —
     def _on_more_requested(self, row: int) -> None:
-        self.show_popover(row)
+        """Unfold this row's full release notes, or fold them back.
+
+        Never a dialog: the notes open inside the card, which grows to
+        hold them (see PackageDelegate.toggle_notes).
+        """
+        self._delegate.toggle_notes(row)
 
     # — AUR → official moves —
     def _open_sources_dialog(self) -> None:
@@ -8821,10 +8934,6 @@ class UpdateWindow(QMainWindow):
 
     def _on_sources_closed(self) -> None:
         self._sources_dialog = None
-
-    def show_popover(self, row: int) -> None:
-        self._popover = NotesPopover(self, self._model.item(row))
-        self._popover.show()
 
     # — Per-package actions —
     def _on_row_action(self, name: str) -> None:

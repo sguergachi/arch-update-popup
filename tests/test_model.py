@@ -1,7 +1,7 @@
 """Model + delegate tests (offscreen Qt)."""
 import pytest
 
-from PyQt6.QtCore import QEvent, QPointF, Qt
+from PyQt6.QtCore import QEvent, QObject, QPointF, Qt, pyqtSignal
 from PyQt6.QtGui import QMouseEvent, QPainter, QPixmap
 from PyQt6.QtWidgets import QApplication, QListView, QStyleOptionViewItem
 
@@ -164,7 +164,7 @@ class TestDelegate:
         assert d.editorEvent(ev, view.model(), opt, idx) is True
         assert got == ["https://aur.archlinux.org/packages/aur-pkg"]
 
-    def test_more_hit_opens_popover_signal(self, view, qapp):
+    def test_more_hit_asks_to_unfold(self, view, qapp):
         d = view.itemDelegate()
         opt, idx = _option(view, 0)  # row 0 has longer full text
         lay = d._layout(0, view.model().item(0), opt.rect.width())
@@ -177,6 +177,47 @@ class TestDelegate:
                          Qt.KeyboardModifier.NoModifier)
         assert d.editorEvent(ev, view.model(), opt, idx) is True
         assert got == [0]
+
+    def test_show_more_unfolds_the_row_in_place(self, view, qapp):
+        d = view.itemDelegate()
+        opt, _idx = _option(view, 0)
+        w = opt.rect.width()
+        before = d._layout(0, view.model().item(0), w)
+        assert before["more_txt"] == "Show more  ↓"
+        seen = []
+        view.model().layoutChanged.connect(lambda *a: seen.append(1))
+        d.toggle_notes(0)
+        after = d._layout(0, view.model().item(0), w)
+        assert after["height"] > before["height"]
+        assert after["notes"].height() > before["notes"].height()
+        assert after["more_txt"] == "Show less  ↑"
+        assert seen  # the view was told to re-measure the rows
+
+    def test_folding_back_restores_the_uniform_height(self, view, qapp):
+        d = view.itemDelegate()
+        opt, _idx = _option(view, 0)
+        w = opt.rect.width()
+        d.toggle_notes(0)
+        d.toggle_notes(0)
+        # Rows are uniform again: the unfolded one folded back to the same
+        # height every other row has.
+        assert d._layout(0, view.model().item(0), w)["height"] \
+            == d._layout(1, view.model().item(1), w)["height"]
+
+    def test_an_unfolded_row_with_a_row_action_keeps_a_fold_control(
+            self, view, qapp):
+        # The Retry pill takes the notes line's right side, so the fold
+        # control drops under the block — a row is never stuck open.
+        view.model().set_state("konsole", "failed")
+        d = view.itemDelegate()
+        opt, _idx = _option(view, 0)
+        d.toggle_notes(0)
+        lay = d._layout(0, view.model().item(0), opt.rect.width())
+        assert lay["action_txt"] == "Retry"
+        assert lay["more"].isNull()
+        assert not lay["more_end"].isNull()
+        assert lay["more_end"].top() > lay["notes"].top()
+        assert lay["more_txt"] == "Show less  ↑"
 
     def test_failed_row_action(self, view, qapp):
         view.model().set_state("konsole", "failed")
@@ -925,3 +966,85 @@ class TestDependencyBlock:
                                     "\u2022 C", "\u2022 D", "\u2022 E"]
         assert m.data(m.index(m.row_of("zen")),
                       Qt.ItemDataRole.ToolTipRole) is None
+
+    def test_show_more_unfolds_the_whole_list_in_place(self, deps_view):
+        d = deps_view.itemDelegate()
+        m = deps_view.model()
+        folded = self._lay(deps_view, "libbar")
+        assert folded["dep_more_txt"] == "Show more"
+        assert folded["dep_lines"][2][1].endswith("+2 more")
+        d.toggle_expanded(m.row_of("libbar"))
+        unfolded = self._lay(deps_view, "libbar")
+        assert unfolded["dep_more_txt"] == "Show less"
+        assert [t for _mark, t in unfolded["dep_lines"]] \
+            == ["A", "B", "C", "D", "E"]
+        assert unfolded["height"] > folded["height"]
+        d.toggle_expanded(m.row_of("libbar"))
+        assert self._lay(deps_view, "libbar")["height"] == folded["height"]
+
+    def test_a_row_that_shows_everything_carries_no_control(self, deps_view):
+        lay = self._lay(deps_view, "libfoo")
+        assert lay["dep_more_txt"] == ""
+        assert lay["dep_more"].isNull()
+
+    def test_the_control_rides_the_label_line(self, deps_view):
+        lay = self._lay(deps_view, "libbar")
+        assert lay["dep_more"].right() <= lay["dep_label"].right() + 1
+        assert lay["dep_label"].top() <= lay["dep_more"].top()
+        assert lay["dep_more"].bottom() <= lay["dep_label"].bottom()
+
+    def test_clicking_show_more_asks_the_row_to_unfold(self, deps_view, qapp):
+        d = deps_view.itemDelegate()
+        m = deps_view.model()
+        row = m.row_of("libbar")
+        opt, idx = _topt(deps_view, row)
+        lay = d._geom(row, m.item(row), opt.rect.width())
+        seen = []
+        d.expand_requested.connect(seen.append)
+        ev = QMouseEvent(QEvent.Type.MouseButtonRelease,
+                         QPointF(lay["dep_more"].center()
+                                 + opt.rect.topLeft()),
+                         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        assert d.editorEvent(ev, m, opt, idx) is True
+        assert seen == [row]
+
+    def test_the_view_keeps_its_scroll_through_a_relayout(self, qapp):
+        # The helper reads the offset before the layout pass and puts it
+        # back after, so the row the user clicked never moves.
+        class _Sb:
+            def __init__(self):
+                self.v = 131
+                self.writes = []
+
+            def value(self):
+                return self.v
+
+            def setValue(self, x):  # noqa: N802 (Qt spelling)
+                self.writes.append(x)
+                self.v = x
+
+        class _Vp:
+            def update(self):
+                pass
+
+        class _View:
+            def __init__(self):
+                self.sb = _Sb()
+
+            def verticalScrollBar(self):  # noqa: N802
+                return self.sb
+
+            def viewport(self):
+                return _Vp()
+
+        class _Model(QObject):
+            layoutChanged = pyqtSignal()
+
+        m, view = _Model(), _View()
+        seen = []
+        m.layoutChanged.connect(lambda: seen.append(view.sb.value()))
+        app._relayout_after_row_event(view, m)
+        assert seen == [131]
+        assert view.sb.value() == 131
+        assert view.sb.writes == [131]

@@ -4,7 +4,7 @@ import time
 import pytest
 
 from PyQt6.QtCore import QObject, QPointF, Qt, pyqtSignal
-from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtGui import QFontMetrics, QMouseEvent
 from PyQt6.QtWidgets import QApplication, QLabel
 
 from conftest import load_app
@@ -839,17 +839,36 @@ class TestWindow:
         assert "Files already exist" in window._sub.text()
         assert window._live_conflicts == {"konsole": ["/usr/lib/x"]}
 
-    def test_popover_content(self, window, qapp):
+    def test_show_more_unfolds_the_notes_in_place(self, window, qapp):
         window._model.set_info(0, "d", "short", "2026-01-01",
-                               "FULL BODY TEXT", "GitHub release",
-                               "https://example.com")
-        window.show_popover(0)
+                               "line one\nline two\nline three",
+                               "GitHub release", "https://example.com")
+        d = window._delegate
+        h0 = d._layout(0, window._model.item(0), 900)["height"]
+        window._on_more_requested(0)
         qapp.processEvents()
-        pop = window._popover
-        assert pop is not None and pop.isVisible()
-        browsers = pop.findChildren(app.QTextBrowser)
-        assert browsers and "FULL BODY TEXT" in browsers[0].toPlainText()
-        pop.close()
+        lay = d._layout(0, window._model.item(0), 900)
+        assert lay["height"] > h0          # the card grew to hold it all
+        assert lay["more_txt"] == "Show less  ↑"
+        window._on_more_requested(0)
+        assert d._layout(0, window._model.item(0), 900)["height"] == h0
+        # Never a dialog: the notes open inside the card itself.
+        assert not hasattr(window, "show_popover")
+        assert not hasattr(app, "NotesPopover")
+
+    def test_a_huge_changelog_stops_at_the_cap_and_says_so(self, window):
+        window._model.set_info(
+            0, "d", "short", "2026-01-01",
+            "\n".join(f"line {i}" for i in range(30)),
+            "GitHub release", "https://example.com")
+        d = window._delegate
+        window._on_more_requested(0)
+        lay = d._layout(0, window._model.item(0), 900)
+        assert lay["hint_txt"] == "… 17 more lines"
+        spacing = QFontMetrics(d._f_text).lineSpacing()
+        assert lay["notes"].height() <= (
+            app.PackageDelegate.NOTES_LINES * spacing + 8)
+        assert lay["hint"].top() >= lay["notes"].top()
 
     def test_single_run(self, window, monkeypatch):
         monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
