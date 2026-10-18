@@ -562,3 +562,53 @@ class TestSettings:
         target.write_text("{not json")
         monkeypatch.setattr(app, "_settings_file", lambda: str(target))
         assert app.load_settings() == {}
+
+
+class TestAskpassEnable:
+    """Source-enable runner: command shape and askpass lifecycle."""
+
+    def test_runner_uses_sudo_a_not_pkexec(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda name: "/usr/bin/sudo")
+        r = app._SourceEnableRunner("echo hello")
+        # Construction-time shape (the real script path is filled in run()).
+        assert r._cmd == ["sudo", "-A", "bash", "<script>"]
+        assert r._askpass is not None
+
+    def test_askpass_script_is_0700_and_kdialog(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda name: "/usr/bin/sudo")
+        r = app._SourceEnableRunner("echo hello")
+        askpass = r._askpass
+        assert askpass is not None
+        assert os.path.exists(askpass)
+        mode = os.stat(askpass).st_mode & 0o777
+        assert mode == 0o700
+        body = open(askpass).read()
+        assert "kdialog" in body
+        assert "zenity" in body
+        assert "exit 1" in body
+        r._cleanup()
+        assert not os.path.exists(askpass)
+        assert r._askpass is None
+
+    def test_pkexec_fallback_when_no_sudo(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda name: None)
+        r = app._SourceEnableRunner("echo hello")
+        assert r._cmd[0] == "pkexec"
+        r._cleanup()
+
+    def test_env_exports_askpass(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda name: "/usr/bin/sudo")
+        r = app._SourceEnableRunner("echo hello")
+        env = r._child_env()
+        assert env["SUDO_ASKPASS"] == r._askpass
+        r._cleanup()
+
+    def test_cleanup_runs_on_every_exit_path(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda name: "/usr/bin/sudo")
+        r = app._SourceEnableRunner("echo hello")
+        # Simulate the runner finishing.
+        r._cleanup()
+        assert r._askpass is None
+        # Second cleanup is a no-op (no crash).
+        r._cleanup()
+        assert r._askpass is None

@@ -55,6 +55,34 @@ class FakeRunner(QObject):
         pass
 
 
+class FakeSourceEnableRunner(QObject):
+    """_SourceEnableRunner stub: emits line/done on demand."""
+    line = pyqtSignal(str)
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, *a, **k):
+        super().__init__()
+        self.script = a[0] if a else ""
+        self._running = False
+        self.terminated = False
+
+    def isRunning(self):
+        return self._running
+
+    def wait(self, ms=0):
+        return True
+
+    def start(self):
+        self._running = True
+
+    def terminate(self):
+        self.terminated = True
+        self._running = False
+
+    def requestInterruption(self):
+        pass
+
+
 class FakeChecker(QObject):
     """UpdateChecker stub: check runs until the test emits a result."""
     updates_found = pyqtSignal(list)
@@ -107,6 +135,7 @@ def window(qapp, monkeypatch):
     # Never pop real desktop bubbles during tests; per-test overrides apply.
     monkeypatch.setattr(app, "_notify_update", lambda *a, **k: 0)
     monkeypatch.setattr(app, "_notify_close", lambda *a, **k: None)
+    monkeypatch.setattr(app, "_SourceEnableRunner", FakeSourceEnableRunner)
     w = app.UpdateWindow(_updates(), {}, None)
     w.resize(1280, 800)
     w.show()

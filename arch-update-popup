@@ -8034,11 +8034,35 @@ class _SourceEnableRunner(QThread):
         self._proc: subprocess.Popen | None = None
         self._killed = False
         self._script = script_body
+        self._askpass: str | None = None
+        # Build the command shape at construction, like ObsoleteRemover, so
+        # tests can inspect it without running anything. The temp script path
+        # is filled in run().
+        if shutil.which("sudo"):
+            self._askpass = make_askpass_script(
+                "Enter sudo password to enable the managed source:")
+            self._cmd = ["sudo", "-A", "bash", "<script>"]
+        else:
+            self._cmd = ["pkexec", "bash", "<script>"]
+
+    def _child_env(self) -> dict:
+        """Environment for the child process, exporting SUDO_ASKPASS."""
+        env = os.environ.copy()
+        if self._askpass:
+            env["SUDO_ASKPASS"] = self._askpass
+        return env
+
+    def _cleanup(self) -> None:
+        if self._askpass:
+            try:
+                os.unlink(self._askpass)
+            except OSError:
+                pass
+            self._askpass = None
 
     def run(self) -> None:
         import tempfile
         path = ""
-        askpass = None
         fd = -1
         try:
             fd, path = tempfile.mkstemp(suffix=".sh", prefix="arch-update-enable-")
@@ -8046,14 +8070,13 @@ class _SourceEnableRunner(QThread):
                 f.write(self._script)
             fd = -1
             os.chmod(path, stat.S_IRWXU)
-            askpass = make_askpass_script("Enter sudo password to enable the "
-                                          "managed source:")
-            env = os.environ.copy()
-            env["SUDO_ASKPASS"] = askpass
+            self._cmd = ["sudo", "-A", "bash", path] if self._askpass else \
+                ["pkexec", "bash", path]
+            env = self._child_env()
             master_fd, slave_fd = pty.openpty()
             try:
                 proc = subprocess.Popen(
-                    ["sudo", "-A", "bash", path],
+                    self._cmd,
                     stdout=slave_fd, stderr=slave_fd,
                     stdin=subprocess.DEVNULL, env=env, close_fds=True)
             except FileNotFoundError as e:
@@ -8097,12 +8120,12 @@ class _SourceEnableRunner(QThread):
                     os.close(fd)
                 except OSError:
                     pass
-            for p in (path, askpass):
-                if p:
-                    try:
-                        os.unlink(p)
-                    except OSError:
-                        pass
+            self._cleanup()
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def terminate(self) -> None:  # type: ignore[override]
         self._killed = True
@@ -8112,6 +8135,7 @@ class _SourceEnableRunner(QThread):
                 proc.terminate()
             except Exception:
                 pass
+
 
 
 # ── AUR → official moves dialog ──────────────────────────────────────────
