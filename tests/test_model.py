@@ -683,7 +683,10 @@ class TestUntrackedScan:
                        # The app's own page (AppImages / manual installs),
                        # the file behind an AppImage row, and whether the
                        # row is an application or a stray dependency.
-                       "url": "", "path": "", "kind": ""}
+                       "url": "", "path": "", "kind": "",
+                       # Dependency rows: the applications that need the
+                       # package (human names), and whether we know.
+                       "needs": [], "needs_known": True}
 
     def test_set_items(self, qapp):
         m = app.TrackedModel()
@@ -837,3 +840,88 @@ class TestTrackedEnricher:
         enr._enrich()
 
         assert got == []
+
+
+class TestDependencyBlock:
+    """A dependency row names what needs it — label, bullets, own lines."""
+
+    @pytest.fixture()
+    def deps_view(self, qapp):
+        m = app.TrackedModel()
+        m.set_items([
+            app._tracked_row("libfoo", "1-1", "official", kind="dependency",
+                             needs=["Steam"], desc="A foo library"),
+            app._tracked_row("libbar", "2-1", "official", kind="dependency",
+                             needs=["A", "B", "C", "D", "E"]),
+            app._tracked_row("libbaz", "3-1", "official", kind="dependency"),
+            app._tracked_row("libqux", "4-1", "official", kind="dependency",
+                             needs_known=False),
+            app._tracked_row("zen", "5-1", "manual", title="Zen",
+                             desktop="/x/zen.desktop", kind="app"),
+        ])
+        v = QListView()
+        v.resize(900, 400)
+        v.setModel(m)
+        d = app.TrackedDelegate(v)
+        v.setItemDelegate(d)
+        v.show()
+        return v
+
+    def _lay(self, view, name):
+        m = view.model()
+        row = m.row_of(name)
+        opt, _idx = _topt(view, row)
+        return view.itemDelegate()._geom(row, m.item(row), opt.rect.width())
+
+    def test_the_label_sits_above_the_bullets_and_below_the_description(
+            self, deps_view):
+        lay = self._lay(deps_view, "libfoo")
+        assert lay["dep_label_txt"] == "\u21b3 DEPENDENCY FOR:"
+        assert lay["desc"].bottom() <= lay["dep_label"].top()
+        assert lay["dep_label"].bottom() <= lay["dep_rects"][0].top()
+
+    def test_one_bullet_per_application(self, deps_view):
+        lay = self._lay(deps_view, "libfoo")
+        assert lay["dep_lines"][0] == ("\u2022", "Steam")
+        assert lay["dep_lines"][1:] == [("", ""), ("", "")]
+
+    def test_a_long_list_is_capped_and_counted(self, deps_view):
+        lay = self._lay(deps_view, "libbar")
+        lines = lay["dep_lines"]
+        assert len(lines) == app.TrackedDelegate.DEP_LINES == 3
+        assert [txt for _mark, txt in lines[:2]] == ["A", "B"]
+        assert lines[2][0] == "\u2022"
+        assert lines[2][1].startswith("C") and "+2 more" in lines[2][1]
+
+    def test_a_package_nothing_needs_says_so(self, deps_view):
+        lay = self._lay(deps_view, "libbaz")
+        assert lay["dep_lines"][0] == (
+            "", "No explicitly installed package needs it.")
+
+    def test_without_requirer_data_the_block_claims_nothing(self, deps_view):
+        lay = self._lay(deps_view, "libqux")
+        assert [txt for _mark, txt in lay["dep_lines"]] == ["", "", ""]
+
+    def test_app_rows_carry_no_block(self, deps_view):
+        lay = self._lay(deps_view, "zen")
+        assert lay["dep_label_txt"] == ""
+        assert lay["dep_label"].isNull()
+        assert lay["dep_rects"] == []
+
+    def test_the_block_is_reserved_so_dependency_rows_match(self, deps_view):
+        # One requirer and five are the same height, so the list can
+        # never re-anchor itself as rows are measured; app rows, which
+        # have no block, stay shorter.
+        assert self._lay(deps_view, "libfoo")["height"] \
+            == self._lay(deps_view, "libbar")["height"]
+        assert self._lay(deps_view, "libfoo")["height"] \
+            > self._lay(deps_view, "zen")["height"]
+
+    def test_the_tooltip_lists_every_requirer(self, deps_view):
+        m = deps_view.model()
+        row = m.row_of("libbar")
+        tip = m.data(m.index(row), Qt.ItemDataRole.ToolTipRole)
+        assert tip.splitlines() == ["DEPENDENCY FOR:", "\u2022 A", "\u2022 B",
+                                    "\u2022 C", "\u2022 D", "\u2022 E"]
+        assert m.data(m.index(m.row_of("zen")),
+                      Qt.ItemDataRole.ToolTipRole) is None

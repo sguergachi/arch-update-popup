@@ -2139,16 +2139,20 @@ def _foreign_pkg_set() -> set[str]:
 
 def _tracked_row(name: str, version: str, repo: str, title: str = "",
                  desktop: str = "", desc: str = "", url: str = "",
-                 kind: str = "") -> dict:
+                 kind: str = "", needs: list[str] | None = None,
+                 needs_known: bool = True) -> dict:
     """A complete TrackedModel-compatible row dict.
 
     `kind` separates the two things the Untracked list holds: "app" (a
     launcher on disk) and "dependency" (a package pulled in by another).
+    A dependency row also carries `needs`: the applications that would go
+    with it, by their human names, for the "DEPENDENCY FOR" block.
     """
     return {"name": name, "title": title, "version": version, "repo": repo,
             "state": "idle", "failed_op": "",
             "desktop": desktop or None, "desc": desc, "checked": False,
-            "url": url, "path": "", "kind": kind}
+            "url": url, "path": "", "kind": kind,
+            "needs": list(needs or []), "needs_known": needs_known}
 
 
 class FlatpakRemover(QThread):
@@ -2519,7 +2523,9 @@ class UntrackedLoader(QThread):
         # What needs what, so a stray dependency can name the applications
         # that pulled it in — that is the only reason to keep it.
         required_by = required_by_map()
-        explicit = _explicit_package_set() if required_by else set()
+        known = bool(required_by)
+        explicit = _explicit_package_set() if known else set()
+        descs = all_package_descs()
         rows = []
         for line in r.stdout.splitlines():
             if self.isInterruptionRequested():
@@ -2527,26 +2533,16 @@ class UntrackedLoader(QThread):
             parts = line.split()
             if len(parts) < 2:
                 continue
+            needs = ([titles.get(n, n) for n in
+                      _explicit_requirers(parts[0], required_by, explicit)]
+                     if known else [])
             rows.append(_tracked_row(
                 parts[0], parts[1],
                 "aur" if parts[0] in foreign else "official",
-                desc=self._needed_by(parts[0], required_by, explicit, titles),
-                kind="dependency"))
+                desc=descs.get(parts[0], ""), kind="dependency",
+                needs=needs, needs_known=known))
         rows.sort(key=lambda it: it["name"].lower())
         return rows
-
-    @staticmethod
-    def _needed_by(name: str, required_by: dict[str, list[str]],
-                   explicit: set[str], titles: dict[str, str]) -> str:
-        """One line naming the applications that need this package."""
-        needs = _explicit_requirers(name, required_by, explicit)
-        if not needs:
-            return ("No explicitly installed package needs it."
-                    if required_by else "")
-        label = ", ".join(titles.get(n, n) for n in needs[:3])
-        if len(needs) > 3:
-            label += f", +{len(needs) - 3} more"
-        return f"Needed by {label}"
 
 
 class InfoFetcher(QThread):
@@ -4916,6 +4912,16 @@ class TrackedModel(_FilterableModel, QAbstractListModel):
         if role == Qt.ItemDataRole.CheckStateRole:
             return (Qt.CheckState.Checked if item["checked"]
                     else Qt.CheckState.Unchecked)
+        if role == Qt.ItemDataRole.ToolTipRole \
+                and item.get("kind") == "dependency":
+            # The block shows three names; the tooltip is where the rest
+            # of them can be read (a library can be needed by hundreds).
+            needs = [str(n) for n in (item.get("needs") or []) if n]
+            if needs:
+                return "DEPENDENCY FOR:\n" + "\n".join(
+                    f"\u2022 {n}" for n in needs)
+            return ("No explicitly installed package needs it."
+                    if item.get("needs_known") else None)
         return None
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
@@ -5010,6 +5016,13 @@ class TrackedDelegate(QStyledItemDelegate):
     GAP = 2
     H_PILL = 24
 
+    # A dependency row's "DEPENDENCY FOR" block: a label line and this
+    # many bullet lines, reserved whatever the count — one requirer and
+    # ten are the same height, so the list never re-anchors. The bullets
+    # hang under the label by DEP_INDENT.
+    DEP_LINES = 3
+    DEP_INDENT = 12
+
     def _rows(self) -> tuple[int, int, int]:
         return (_sp(self.H_NAME), _sp(self.H_LINE), _sp(self.H_PILL))
 
@@ -5024,10 +5037,32 @@ class TrackedDelegate(QStyledItemDelegate):
         self._f_badge = QFont()
         self._f_badge.setBold(True)
         self._f_badge.setPointSizeF(self._f_badge.pointSizeF() - 2.0)
+        # The design scale's eyebrow (11px, uppercase, letterspaced), as
+        # a QFont: the delegate paints its own labels.
+        self._f_eyebrow = QFont(self._f_badge)
+        self._f_eyebrow.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing,
+                                         float(_sp(1)))
         # Bold twin of the text font for the official-version half of
         # the version line (mirrors the Updates list's green new-version).
         self._f_bold = QFont(self._f_text)
         self._f_bold.setBold(True)
+
+    def _dep_bullets(self, item: dict) -> list[tuple[str, str]]:
+        """A dependency row's block: (bullet, text) per reserved line.
+
+        At most DEP_LINES lines, the last one carrying "+N more" when the
+        requirers don't fit — the full list is the row's tooltip.
+        """
+        if not item.get("needs_known"):
+            return []
+        needs = [str(n) for n in (item.get("needs") or []) if n]
+        if not needs:
+            return [("", "No explicitly installed package needs it.")]
+        bullets = [("\u2022", n) for n in needs[:self.DEP_LINES]]
+        if len(needs) > self.DEP_LINES:
+            mark, text = bullets[-1]
+            bullets[-1] = (mark, f"{text}   +{len(needs) - self.DEP_LINES} more")
+        return bullets
 
     def _geom(self, row: int, item: dict, width: int) -> dict:
         # Same card as the Updates list: rail, name row with the one row
@@ -5080,6 +5115,34 @@ class TrackedDelegate(QStyledItemDelegate):
         # can never drift under the cursor.
         desc_top = ver_top + h_line + self.GAP
         bottom_top = desc_top + h_line + self.GAP
+        # A dependency row then carries its own labelled block: which
+        # applications need this package, one bullet per line. It sits
+        # below the description, never inside it, and the whole block is
+        # reserved for every dependency row.
+        dep_label_txt = ""
+        dep_label = QRect()
+        dep_rects: list[QRect] = []
+        dep_lines: list[tuple[str, str]] = []
+        if item.get("kind") == "dependency":
+            dep_label_txt = "\u21b3 DEPENDENCY FOR:"
+            dep_label = QRect(x0, bottom_top, cw, h_line)
+            bullets_w = max(40, cw - self.DEP_INDENT)
+            lines = self._dep_bullets(item)
+            dep_top = bottom_top + h_line + self.GAP
+            for i in range(self.DEP_LINES):
+                rect = QRect(x0 + self.DEP_INDENT,
+                             dep_top + i * (h_line + self.GAP),
+                             bullets_w, h_line)
+                dep_rects.append(rect)
+                mark, text = (lines + [("", "")] * self.DEP_LINES)[i]
+                avail = bullets_w - (fm.horizontalAdvance(mark + " ")
+                                     if mark else 0)
+                dep_lines.append(
+                    (mark, fm.elidedText(text, Qt.TextElideMode.ElideRight,
+                                         max(20, avail))
+                     if text else ""))
+            bottom_top = (dep_top + self.DEP_LINES * h_line
+                          + (self.DEP_LINES - 1) * self.GAP + self.GAP)
         # Pills sit on the bottom baseline, right-aligned (Uninstall,
         # then Open) — like the Updates action pill below its notes line.
         pills_w = 0
@@ -5121,6 +5184,12 @@ class TrackedDelegate(QStyledItemDelegate):
             "ver_left_w": ver_left_w,
             "desc": QRect(x0, desc_top, cw, h_line),
             "desc_txt": desc_txt,
+            # Dependency rows only: the "DEPENDENCY FOR" label and its
+            # bullets ((mark, text) per reserved line).
+            "dep_label": dep_label,
+            "dep_label_txt": dep_label_txt,
+            "dep_rects": dep_rects,
+            "dep_lines": dep_lines,
             "hint": QRect(x0, bottom_top + 4,
                           max(10, cw - pills_w - 12), h_line),
             "hint_txt": hint_txt,
@@ -5242,6 +5311,36 @@ class TrackedDelegate(QStyledItemDelegate):
             p.drawText(move(lay["desc"]),
                        Qt.AlignmentFlag.AlignLeft
                        | Qt.AlignmentFlag.AlignVCenter, lay["desc_txt"])
+        # Dependency rows: the label and its bullet list, in their own
+        # block under the description — the applications that would go
+        # with this package, named one per line.
+        if lay["dep_label_txt"]:
+            p.setFont(self._f_eyebrow)
+            p.setPen(QPen(QColor(_warning_hex())))
+            p.drawText(move(lay["dep_label"]),
+                       Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter, lay["dep_label_txt"])
+            p.setFont(self._f_text)
+            fm_t = QFontMetrics(self._f_text)
+            text_col = pal.color(pal.ColorRole.Text)
+            for rect, (mark, text) in zip(lay["dep_rects"], lay["dep_lines"]):
+                if not text:
+                    continue
+                r = move(rect)
+                off = 0
+                if mark:
+                    off = fm_t.horizontalAdvance(mark + " ")
+                    p.setPen(QPen(QColor(_warning_hex())))
+                    p.drawText(
+                        QRect(r.left(), r.top(), off, r.height()),
+                        Qt.AlignmentFlag.AlignLeft
+                        | Qt.AlignmentFlag.AlignVCenter, mark)
+                p.setPen(QPen(text_col))
+                p.drawText(
+                    QRect(r.left() + off, r.top(), r.width() - off,
+                          r.height()),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    text)
         # Bottom line: status hint left, pills right.
         p.setFont(self._f_text)
         if lay["hint_txt"]:

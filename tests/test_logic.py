@@ -846,29 +846,6 @@ class TestDependencyRequirers:
         found = app._explicit_requirers("libfoo", req, {"a", "b", "c", "d", "e"})
         assert found == ["a", "b", "c", "d", "e"]
 
-    def test_the_needed_by_line_names_titles(self):
-        req = {"libfoo": ["steam", "lutris", "heroic-games-launcher-bin",
-                          "bottles"]}
-        line = app.UntrackedLoader._needed_by(
-            "libfoo", req,
-            {"steam", "lutris", "heroic-games-launcher-bin", "bottles"},
-            {"steam": "Steam", "lutris": "Lutris",
-             "heroic-games-launcher-bin": "Heroic Games Launcher"})
-        assert line == "Needed by Steam, Lutris, Heroic Games Launcher, +1 more"
-
-    def test_the_needed_by_line_falls_back_to_the_package_name(self):
-        req = {"libfoo": ["gaze-bin"]}
-        assert app.UntrackedLoader._needed_by("libfoo", req, {"gaze-bin"}, {}) \
-            == "Needed by gaze-bin"
-
-    def test_the_needed_by_line_says_when_nothing_needs_it(self):
-        req = {"libfoo": ["some-orphan"]}
-        assert app.UntrackedLoader._needed_by("libfoo", req, set(), {}) == \
-            "No explicitly installed package needs it."
-
-    def test_no_data_means_no_claim(self):
-        assert app.UntrackedLoader._needed_by("libfoo", {}, set(), {}) == ""
-
     def test_required_by_map_parses_expac(self, monkeypatch):
         class R:
             stdout = ("libfoo|steam lutris\n"
@@ -886,9 +863,10 @@ class TestDependencyRequirers:
 
 
 class TestDependencyRows:
-    """The dependency rows carry that line as their description."""
+    """Dependency rows carry the apps that need them, by their names."""
 
-    def test_load_deps_asks_who_needs_each_package(self, monkeypatch):
+    def test_load_deps_names_the_apps_that_need_each_package(
+            self, monkeypatch):
         class R:
             stdout = "libfoo 1-1\nlibbar 2-1\n"
             returncode = 0
@@ -898,12 +876,47 @@ class TestDependencyRows:
         monkeypatch.setattr(app, "required_by_map",
                             lambda: {"libfoo": ["steam"]})
         monkeypatch.setattr(app, "_explicit_package_set", lambda: {"steam"})
+        monkeypatch.setattr(app, "all_package_descs",
+                            lambda: {"libfoo": "A foo library"})
         rows = app.UntrackedLoader()._load_deps({"steam": "Steam"})
         by_name = {r["name"]: r for r in rows}
-        assert by_name["libfoo"]["desc"] == "Needed by Steam"
-        assert by_name["libbar"]["desc"] == \
-            "No explicitly installed package needs it."
+        assert by_name["libfoo"]["needs"] == ["Steam"]
+        assert by_name["libfoo"]["needs_known"] is True
         assert by_name["libfoo"]["kind"] == "dependency"
+        # The description line stays the package's own description: the
+        # applications that need it live in their own block, never
+        # inside it.
+        assert by_name["libfoo"]["desc"] == "A foo library"
+        # Nothing needs libbar — a known fact, not a missing list.
+        assert by_name["libbar"]["needs"] == []
+        assert by_name["libbar"]["needs_known"] is True
+
+    def test_the_names_fall_back_to_the_package_name(self, monkeypatch):
+        class R:
+            stdout = "libfoo 1-1\n"
+            returncode = 0
+
+        monkeypatch.setattr(app, "_run", lambda *a, **k: R())
+        monkeypatch.setattr(app, "_foreign_pkg_set", lambda: set())
+        monkeypatch.setattr(app, "required_by_map",
+                            lambda: {"libfoo": ["gaze-bin"]})
+        monkeypatch.setattr(app, "_explicit_package_set", lambda: {"gaze-bin"})
+        monkeypatch.setattr(app, "all_package_descs", lambda: {})
+        rows = app.UntrackedLoader()._load_deps({})
+        assert rows[0]["needs"] == ["gaze-bin"]
+
+    def test_without_requirer_data_the_row_claims_nothing(self, monkeypatch):
+        class R:
+            stdout = "libfoo 1-1\n"
+            returncode = 0
+
+        monkeypatch.setattr(app, "_run", lambda *a, **k: R())
+        monkeypatch.setattr(app, "_foreign_pkg_set", lambda: set())
+        monkeypatch.setattr(app, "required_by_map", lambda: {})
+        monkeypatch.setattr(app, "all_package_descs", lambda: {})
+        rows = app.UntrackedLoader()._load_deps({})
+        assert rows[0]["needs"] == []
+        assert rows[0]["needs_known"] is False
 
 
 class TestDesktopLaunch:
