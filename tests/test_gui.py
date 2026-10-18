@@ -2843,3 +2843,57 @@ class TestFlatpakRows:
 
         assert window._unapp_model.row_of("com.discordapp.Discord") is None
         assert "uninstalled" in window._sub.text()
+
+
+class TestRebootButton:
+    """The reboot call to action is a filled warning button."""
+
+    def test_it_is_a_button_with_the_warning_fill(self, window, qapp,
+                                                 monkeypatch):
+        monkeypatch.setattr(app, "reboot_required", lambda: True)
+        window._refresh_reboot_chip()
+        btn = window._reboot_btn
+        assert btn.isVisible() or btn.isVisibleTo(window)
+        assert btn.text() == "Reboot to finish"
+        assert btn.objectName() == "reboot"
+        assert not btn.icon().isNull()
+        assert btn.height() == app._sp(34)
+        qss = app._themed_qss()
+        assert "QPushButton#reboot" in qss
+        assert app._warning_hex() in qss
+
+    def test_showing_it_does_not_move_the_other_buttons(self, window, qapp,
+                                                        monkeypatch):
+        monkeypatch.setattr(app, "reboot_required", lambda: False)
+        window._refresh_reboot_chip()
+        qapp.processEvents()
+        before = (window._recheck_btn.x(), window._update_btn.x())
+        monkeypatch.setattr(app, "reboot_required", lambda: True)
+        window._refresh_reboot_chip()
+        qapp.processEvents()
+        after = (window._recheck_btn.x(), window._update_btn.x())
+        assert after == before
+
+    def test_confirming_asks_the_session_to_reboot(self, window, qapp,
+                                                   monkeypatch):
+        asked = []
+        monkeypatch.setattr(app, "request_reboot",
+                            lambda: (asked.append(True), True)[1])
+        _accept_box(monkeypatch, "Reboot now")
+        window._reboot_now()
+        assert asked == [True]
+        assert "Rebooting" in window._sub.text()
+
+    def test_declining_does_nothing(self, window, qapp, monkeypatch):
+        asked = []
+        monkeypatch.setattr(app, "request_reboot",
+                            lambda: (asked.append(True), True)[1])
+        _accept_box(monkeypatch, "Not yet")
+        window._reboot_now()
+        assert asked == []
+
+    def test_a_failed_request_says_so(self, window, qapp, monkeypatch):
+        monkeypatch.setattr(app, "request_reboot", lambda: False)
+        _accept_box(monkeypatch, "Reboot now")
+        window._reboot_now()
+        assert "power menu" in window._sub.text()

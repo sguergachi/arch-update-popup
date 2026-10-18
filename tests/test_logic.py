@@ -802,3 +802,67 @@ class TestFlatpakRemoverCommands:
         assert "--user" in r._batches[0]
         assert "--system" in r._batches[1]
         r._cleanup()
+
+
+class TestRequestReboot:
+    """The reboot button must ask the desktop, not fight polkit."""
+
+    def test_kde_session_call_comes_first(self, monkeypatch):
+        seen = []
+
+        class R:
+            returncode = 0
+
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/" + n)
+        monkeypatch.setattr(app, "_run",
+                            lambda cmd, **k: (seen.append(cmd), R())[1])
+        assert app.request_reboot() is True
+        assert seen == [["qdbus6", "org.kde.Shutdown", "/Shutdown",
+                         "org.kde.Shutdown.logoutAndReboot"]]
+
+    def test_systemctl_is_the_last_resort(self, monkeypatch):
+        seen = []
+
+        class R:
+            def __init__(self, code):
+                self.returncode = code
+
+        def fake_run(cmd, **k):
+            seen.append(cmd)
+            return R(1 if cmd[0] != "systemctl" else 0)
+
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/" + n)
+        monkeypatch.setattr(app, "_run", fake_run)
+        assert app.request_reboot() is True
+        assert [c[0] for c in seen] == ["qdbus6", "qdbus", "systemctl"]
+
+    def test_nothing_available_reports_failure(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: None)
+        assert app.request_reboot() is False
+
+    def test_a_broken_call_does_not_stop_the_next_one(self, monkeypatch):
+        seen = []
+
+        class R:
+            returncode = 0
+
+        def fake_run(cmd, **k):
+            seen.append(cmd[0])
+            if cmd[0] == "qdbus6":
+                raise OSError("no bus")
+            return R()
+
+        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/" + n)
+        monkeypatch.setattr(app, "_run", fake_run)
+        assert app.request_reboot() is True
+        assert seen == ["qdbus6", "qdbus"]
+
+    def test_on_warning_ink_stays_legible(self):
+        ink = app.QColor(app._on_warning_hex())
+        fill = app.QColor(app._warning_hex())
+        assert ink.isValid() and ink != fill
+        # The ink is picked against the fill's lightness, whichever way the
+        # scheme's warning colour leans: dark ink on a bright fill, light
+        # ink on a deep one (Breeze's amber takes white).
+        assert ((ink.lightness() > fill.lightness())
+                == (fill.lightness() <= 150))

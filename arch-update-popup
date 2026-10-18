@@ -979,6 +979,32 @@ def reboot_required() -> bool:
         return False
 
 
+def request_reboot() -> bool:
+    """Ask the session to restart the machine, the desktop's own way.
+
+    `systemctl reboot` needs an interactive polkit agent this tray session
+    does not have, so the session manager's own D-Bus call comes first —
+    it is also the polite path (KDE closes and saves what it should).
+    """
+    calls = [
+        ["qdbus6", "org.kde.Shutdown", "/Shutdown",
+         "org.kde.Shutdown.logoutAndReboot"],
+        ["qdbus", "org.kde.Shutdown", "/Shutdown",
+         "org.kde.Shutdown.logoutAndReboot"],
+        ["systemctl", "reboot", "--no-block"],
+    ]
+    for cmd in calls:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            res = _run(cmd, capture_output=True, text=True, timeout=15)
+        except Exception:
+            continue
+        if res.returncode == 0:
+            return True
+    return False
+
+
 def _find_data_dirs() -> list[str]:
     """Return candidate campaign data directories, most-specific first."""
     dirs: list[str] = []
@@ -2715,6 +2741,12 @@ def _on_accent_hex() -> str:
     return "#ffffff" if QColor(_accent_hex()).lightness() < 170 else "#202326"
 
 
+def _on_warning_hex() -> str:
+    """Text/icon color that stays legible on a warning-filled control."""
+    return ("#202326" if QColor(_warning_hex()).lightness() > 150
+            else "#ffffff")
+
+
 def _positive_hex() -> str:
     return _tokens()["positive"]
 
@@ -2934,6 +2966,20 @@ QProgressBar[state="failed"]::chunk { background: %(negative)s; }
 QLabel#log-preview { font-size: %(meta)spx; color: %(muted)s; padding: 2px 0; }
 QLabel#log-preview:hover { color: %(accent)s; }
 
+/* — The reboot call to action: filled warning, not a text hint. It is
+     the only button that says "the machine needs you", so it wears the
+     scheme's yellow as a fill (with the readable on-warning ink). — */
+QPushButton#reboot {
+    background: %(warning)s; color: %(on_warning)s;
+    border: none; border-radius: %(radius)spx;
+    font-weight: 700; padding: 0 %(pad14)spx;
+}
+QPushButton#reboot:hover { background: %(warning_hover)s; }
+QPushButton#reboot:pressed { background: %(warning_press)s; }
+QPushButton#reboot:disabled {
+    background: %(disabled)s; color: %(on_disabled)s;
+}
+
 /* — Buttons: 34px primary/secondary, 28px small — */
 QPushButton#primary {
     background: %(accent)s; color: %(on_accent)s; border: none;
@@ -3026,7 +3072,7 @@ def _build_qss() -> str:
         "title": _sp(20), "stat": _sp(22), "body": _sp(13), "meta": _sp(12),
         "eyebrow": _sp(11),
         "radius": 6, "radius_inner": 4, "accentbar": 3,
-        "control": _sp(34),
+        "control": _sp(34), "pad14": _sp(14), "pad18": _sp(18),
         "muted": _secondary_hex(),
         "accent": accent,
         "accent_hover": _mix(accent, "#ffffff" if t["dark"] else "#000000",
@@ -3036,6 +3082,10 @@ def _build_qss() -> str:
         "on_accent": on_accent,
         "positive": t["positive"], "negative": t["negative"],
         "warning": t["neutral"], "link": t["link"], "visited": t["visited"],
+        "on_warning": _on_warning_hex(),
+        "warning_hover": _mix(t["neutral"],
+                              "#ffffff" if t["dark"] else "#000000", 0.14),
+        "warning_press": _mix(t["neutral"], "#000000", 0.28),
         "surface": t["surface"], "canvas": t["canvas"],
         "border": t["border"], "hover": t["hover"],
         "disabled": _mix(t["surface"], t["text"], 0.35),
@@ -3228,6 +3278,8 @@ _ICON_SVGS: dict[str, tuple[str, str]] = {
     "select-none": ('<rect x="4" y="4" width="16" height="16" rx="2"/>', "muted"),
     "search": ('<circle cx="11" cy="11" r="6.5"/><path d="M15.8 15.8 21 21"/>',
                "muted"),
+    "reboot": ('<path d="M12 3.5v8"/><path d="M7.4 6.6a7 7 0 1 0 9.2 0"/>',
+               "on_warning"),
 }
 
 _ICON_CACHE: dict[tuple[str, int, str], QIcon] = {}
@@ -3247,6 +3299,8 @@ def _icon_color(token: str) -> str:
         return _warning_hex()
     if token == "on_accent":
         return _on_accent_hex()
+    if token == "on_warning":
+        return _on_warning_hex()
     return token
 
 
@@ -5503,13 +5557,19 @@ class UpdateWindow(QMainWindow):
 
         # "Reboot to finish" — an Arch-specific truth: once pacman replaces
         # the running kernel's modules, only a restart completes the update.
-        self._reboot_chip = QLabel("⟳  Reboot to finish")
-        self._reboot_chip.setObjectName("text-warning")
-        self._reboot_chip.setToolTip(
+        # A filled warning button, because it is the one thing left to do.
+        self._reboot_btn = QPushButton("Reboot to finish")
+        self._reboot_btn.setObjectName("reboot")
+        self._reboot_btn.setFixedHeight(_sp(34))
+        self._reboot_btn.setMinimumWidth(_sp(170))
+        self._reboot_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._icon_btn(self._reboot_btn, "reboot", 16, token="on_warning")
+        self._reboot_btn.setToolTip(
             "The running kernel is older than the installed one — restart "
             "to finish the upgrade.")
-        self._reboot_chip.setVisible(reboot_required())
-        footer.addWidget(self._reboot_chip, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._reboot_btn.clicked.connect(self._reboot_now)
+        self._reboot_btn.setVisible(reboot_required())
+        footer.addWidget(self._reboot_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._recheck_btn = self._refresh_button(
             "Check for updates again right now", self._recheck_updates)
@@ -5912,9 +5972,32 @@ class UpdateWindow(QMainWindow):
         self._update_btn.setVisible(not running)
 
     def _refresh_reboot_chip(self) -> None:
-        chip = getattr(self, "_reboot_chip", None)
-        if chip is not None:
-            chip.setVisible(reboot_required())
+        btn = getattr(self, "_reboot_btn", None)
+        if btn is not None:
+            btn.setVisible(reboot_required())
+
+    def _reboot_now(self) -> None:
+        """Restart the machine — the only way to finish a kernel update."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Reboot now?")
+        box.setText("Restart to finish the update?")
+        box.setInformativeText(
+            "The new kernel only takes effect after a restart. Save your "
+            "work first — anything unsaved is lost.")
+        go_btn = box.addButton("Reboot now",
+                               QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Not yet", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is not go_btn:
+            return
+        if request_reboot():
+            self._set_status("Rebooting — see you on the other side.", "ok")
+            self._log_action("Reboot requested")
+        else:
+            self._set_status(
+                "Couldn't start a reboot from here — use your desktop's "
+                "power menu.", "error")
 
     def _apply_default_geometry(self) -> None:
         """Reopen where the user left it, else at a comfortable size.
