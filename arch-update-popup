@@ -8501,8 +8501,17 @@ class ManagedSourcesDialog(QMainWindow):
             label.setFixedHeight(_sp(24))
             row.addWidget(label)
             on_here = _managed_source_ready(probe, enabled)
-            badge = _badge("enabled" if on_here else "not enabled",
-                           "positive" if on_here else "muted")
+            if on_here:
+                badge_txt, tint = "enabled", "positive"
+            elif steps:
+                badge_txt, tint = "not enabled", "muted"
+            else:
+                # No setup commands exist for this source (the official
+                # repos, or a distro repo this machine doesn't configure):
+                # "not enabled" would promise a switch this app can't
+                # offer, so say what it really is.
+                badge_txt, tint = "not set up", "muted"
+            badge = _badge(badge_txt, tint)
             row.addWidget(badge)
             row.addStretch()
             if steps and not on_here:

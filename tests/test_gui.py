@@ -2568,3 +2568,65 @@ class TestRemovalWhileBusy:
         assert w._pending_removals == []
         assert len(FakeRemover.started) == 1
         assert FakeRemover.started[0].packages == ["konsole"]
+
+
+def _card_named(dlg, name):
+    """The sources card whose title label reads `name`."""
+    for w in dlg.findChildren(app.QWidget):
+        lbl = w.findChild(app.QLabel, "package-name")
+        if lbl is not None and lbl.text() == name:
+            return w
+    raise AssertionError(f"no card named {name!r}")
+
+
+class TestSourcesStateAgreement:
+    """Every label on a card must tell the same story — the user caught
+    the badge saying NOT ENABLED while the button said Enabled."""
+
+    def test_flatpak_card_flips_its_badge_on_success(self, sources_dialog):
+        # The exact card from the report (last in the list).
+        d = sources_dialog
+        card = _card_named(d, "Flatpak · Flathub")
+        assert card._badge.text() == "NOT ENABLED"
+        btn = card._enable_btn
+        assert btn is not None and btn.text() == "Enable"
+
+        d._enable_source("Flatpak · Flathub", "#!/bin/bash\necho hi",
+                         card, btn)
+        d._enable_runner.done.emit(True, "")
+
+        assert card._badge.text() == "ENABLED"
+        assert card._badge.property("tint") == "positive"
+        assert btn.text() == "Enabled ✓"
+        assert card._bar.property("state") == "done"
+        assert "enabled ✓" in card._status_lbl.text()
+
+    def test_every_card_offers_a_button_or_says_enabled(self, sources_dialog):
+        # No dead ends: a card that says "not enabled" must offer the
+        # Enable button, and nothing already enabled may offer one.
+        d = sources_dialog
+        for w in d.findChildren(app.QWidget):
+            badge = getattr(w, "_badge", None)
+            if badge is None:
+                continue
+            has_btn = getattr(w, "_enable_btn", None) is not None
+            if has_btn:
+                assert badge.text() == "NOT ENABLED"
+            else:
+                assert badge.text() in ("ENABLED", "NOT SET UP"), \
+                    f"{badge.text()} with nothing to do about it"
+
+    def test_a_ready_source_is_reported_ready(self, sources_dialog,
+                                             monkeypatch):
+        # Flatpak installed with Flathub registered: the card must say so
+        # on open, with nothing left to enable.
+        d = sources_dialog
+        monkeypatch.setattr(app, "_flatpak_ready", lambda: True)
+        fresh = app.ManagedSourcesDialog()
+        try:
+            card = _card_named(fresh, "Flatpak · Flathub")
+            assert card._badge.text() == "ENABLED"
+            assert card._badge.property("tint") == "positive"
+            assert card._enable_btn is None
+        finally:
+            fresh.close()
