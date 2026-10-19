@@ -1677,6 +1677,21 @@ def load_tracked() -> list[dict]:
         installed = get_installed_packages()
     except Exception:
         installed = []
+    # What would go with each package if it were removed: the explicit
+    # packages that (transitively) need it, resolved to the top of the
+    # chain so the answer names an application, not another library (see
+    # _explicit_requirers). One `expac` call answers for the machine;
+    # without it, `needs_known` stays false and the rows claim nothing.
+    try:
+        required_by = required_by_map()
+        explicit = _explicit_package_set() if required_by else set()
+        if required_by and explicit:
+            for pkg in installed:
+                pkg["needs"] = _explicit_requirers(pkg["name"], required_by,
+                                                   explicit)
+                pkg["needs_known"] = True
+    except Exception:
+        pass
     try:
         installed += flatpak_tracked_rows()
     except Exception:
@@ -3442,6 +3457,13 @@ QWidget#log-panel {
     background: %(surface)s; border: 1px solid %(border)s;
     border-radius: %(radius)spx;
 }
+/* The requirer list: a strip under the list, opened by a row's "Show more" */
+QWidget#detail-panel {
+    background: %(surface)s; border: 1px solid %(border)s;
+    border-radius: %(radius)spx;
+}
+QLabel#detail-name { font-weight: 700; color: palette(text); }
+QLabel#detail-names { color: palette(text); }
 QLabel#details-label {
     font-size: %(eyebrow)spx; font-weight: 700; color: %(muted)s;
     letter-spacing: 1px;
@@ -4051,6 +4073,91 @@ class _ControlsRow(QWidget):
         self.filtered.setText(self.filtered.fontMetrics().elidedText(
             text, Qt.TextElideMode.ElideRight, _sp(self.INFO_W)))
         self.filtered.setToolTip(text)
+
+
+class _DetailPanel(QWidget):
+    """The requirer list for one row, in a strip under the list.
+
+    A package can be needed by a dozen others; unfolding that inside its
+    row buried the list under a wall of names and made that one row a
+    different height from every other. The whole list lives down here
+    instead, opened by the row's "Show more" and closed by "Hide" or by
+    leaving the page (see `_on_detail_requested` / `_close_detail`) —
+    where it can be as long as it likes without moving anything above
+    it: the list gives up the room, and the footer keeps its place.
+    """
+
+    closed = pyqtSignal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("detail-panel")
+        # Plain QWidgets don't paint QSS backgrounds/borders without this.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # One height, whatever the answer: a strip that grew with its
+        # list would move the list under the reader's cursor (see
+        # AGENTS.md). Long lists scroll inside it.
+        self.setFixedHeight(_sp(96))
+        self.setVisible(False)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(_sp(14), _sp(10), _sp(14), _sp(10))
+        lay.setSpacing(_sp(6))
+
+        head = QHBoxLayout()
+        head.setSpacing(_sp(8))
+        self._label = QLabel("")
+        self._label.setObjectName("details-label")
+        head.addWidget(self._label)
+        self._name = QLabel("")
+        self._name.setObjectName("detail-name")
+        self._name.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        # The package name stretches and clips rather than pushing the
+        # count and Hide out of the strip; the tooltip has it whole.
+        head.addWidget(self._name, 1)
+        self._count = QLabel("")
+        self._count.setObjectName("meta")
+        head.addWidget(self._count)
+        self._hide_btn = QPushButton("Hide")
+        self._hide_btn.setObjectName("secondary-small")
+        self._hide_btn.setFixedHeight(_sp(28))
+        self._hide_btn.setToolTip("Close this list")
+        self._hide_btn.clicked.connect(self._emit_closed)
+        head.addWidget(self._hide_btn)
+        lay.addLayout(head)
+
+        # The names, wrapped, scrolling when they outrun the strip.
+        self._scroll = QScrollArea()
+        self._scroll.setObjectName("detail-scroll")
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._names = QLabel("")
+        self._names.setObjectName("detail-names")
+        self._names.setWordWrap(True)
+        self._names.setAlignment(Qt.AlignmentFlag.AlignTop
+                                 | Qt.AlignmentFlag.AlignLeft)
+        self._names.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._scroll.setWidget(self._names)
+        lay.addWidget(self._scroll, 1)
+
+    def _emit_closed(self) -> None:
+        self.closed.emit()
+
+    def show_detail(self, name: str, heading: str, names: list[str]) -> None:
+        """Show one package's requirers — the row's control said "more"."""
+        self._label.setText(heading)
+        self._name.setText(name)
+        self._name.setToolTip(name)
+        count = len(names)
+        self._count.setText(f"{count} package{'s' if count != 1 else ''}")
+        self._names.setText(" · ".join(names))
+        self.setVisible(True)
+
+    def hide_detail(self) -> None:
+        self.setVisible(False)
 
 
 class _ListPlaceholder(QWidget):
@@ -5138,6 +5245,14 @@ class TrackedModel(_FilterableModel, QAbstractListModel):
                 "desktop": pkg.get("desktop") or None,
                 # Package description (Updates-style row): "" until resolved.
                 "desc": pkg.get("desc", ""),
+                # "dependency" for a stray package, "app" for a launcher on
+                # disk; the badge keeps showing where it came from.
+                "kind": pkg.get("kind", ""),
+                # What would go with it if it were removed: the explicit
+                # packages that (transitively) need it, and whether the
+                # machine answered at all (see load_tracked).
+                "needs": list(pkg.get("needs") or []),
+                "needs_known": bool(pkg.get("needs_known", False)),
                 # Checkbox multi-select for batch uninstall (default off:
                 # removal is destructive, so selection is explicit).
                 "checked": False,
@@ -5179,16 +5294,19 @@ class TrackedModel(_FilterableModel, QAbstractListModel):
         if role == Qt.ItemDataRole.CheckStateRole:
             return (Qt.CheckState.Checked if item["checked"]
                     else Qt.CheckState.Unchecked)
-        if role == Qt.ItemDataRole.ToolTipRole \
-                and item.get("kind") == "dependency":
-            # The block shows three names; the tooltip is where the rest
-            # of them can be read (a library can be needed by hundreds).
+        if role == Qt.ItemDataRole.ToolTipRole and item.get("needs_known"):
+            # The row carries one line of names; the tooltip holds the
+            # whole list — a library can be needed by hundreds.
             needs = [str(n) for n in (item.get("needs") or []) if n]
             if needs:
-                return "DEPENDENCY FOR:\n" + "\n".join(
+                head = ("DEPENDENCY FOR:"
+                        if item.get("kind") == "dependency"
+                        else "NEEDED BY:")
+                return head + "\n" + "\n".join(
                     f"\u2022 {n}" for n in needs)
-            return ("No explicitly installed package needs it."
-                    if item.get("needs_known") else None)
+            if item.get("kind") == "dependency":
+                return "No explicitly installed package needs it."
+            return None
         return None
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
@@ -5270,7 +5388,10 @@ class TrackedDelegate(QStyledItemDelegate):
     open_requested = pyqtSignal(str)
     link_activated = pyqtSignal(str)    # external URL clicked
     toggled = pyqtSignal(int)           # checkbox flipped
-    expand_requested = pyqtSignal(int)  # "Show more" clicked on a row
+    more_requested = pyqtSignal(int)    # "Show more" clicked on a row
+    # What the requirer panel should show: package, heading, names. An
+    # empty package name means "nothing to show" (see _DetailPanel).
+    detail_requested = pyqtSignal(str, str, list)
 
     CDX = 8         # card inset inside the row (horizontal, 2u)
     PAD = 16        # card inner padding (horizontal, 4u)
@@ -5284,15 +5405,11 @@ class TrackedDelegate(QStyledItemDelegate):
     GAP = 2
     H_PILL = 24
 
-    # A dependency row's "DEPENDENCY FOR" block: a label line and this
-    # many bullet lines, reserved whatever the count — one requirer and
-    # ten are the same height, so the list never re-anchors on its own.
-    # "Show more" on the label line unfolds the whole list and the row
-    # grows to hold it: the one deliberate shift a row is allowed (see
-    # AGENTS.md). The bullets hang under the label by DEP_INDENT.
-    DEP_LINES = 3
-    DEP_INDENT = 12
-    MORE_GAP = 6    # label line: gap between its text and the control
+    # The requirer summary rides the row's bottom line: one line, whatever
+    # the count — one requirer and thirty are the same height, so the list
+    # never re-anchors on its own, and no row ever grows. "Show more"
+    # opens the whole list in the panel under the list (see _DetailPanel).
+    MORE_GAP = 6    # the summary line: gap before its control
 
     def _rows(self) -> tuple[int, int, int]:
         return (_sp(self.H_NAME), _sp(self.H_LINE), _sp(self.H_PILL))
@@ -5301,9 +5418,10 @@ class TrackedDelegate(QStyledItemDelegate):
         super().__init__(view)
         self._view = view
         self._hover: tuple[int, str] = (-1, "")
-        # Package names whose requirer list is unfolded, not rows: the
-        # state survives a rescan, so a row you opened stays open.
-        self._expanded: set[str] = set()
+        # The package whose requirer list the panel is showing — by name,
+        # not by row, so the state survives a rescan. One at a time: the
+        # panel holds one list.
+        self._detail_name: str = ""
         self._f_name = QFont()
         self._f_name.setBold(True)
         self._f_text = QFont()
@@ -5321,68 +5439,54 @@ class TrackedDelegate(QStyledItemDelegate):
         self._f_bold = QFont(self._f_text)
         self._f_bold.setBold(True)
 
-    def _dep_bullets(self, item: dict) -> list[tuple[str, str]]:
-        """A dependency row's block: (bullet, text) per reserved line.
+    def _requirers(self, item: dict) -> list[str]:
+        """The packages that need this one, in the words the panel uses.
 
-        Folded, at most DEP_LINES lines, the last one carrying "+N more"
-        when the requirers don't fit — "Show more" on the label line then
-        unfolds the whole list and the row grows to hold it (see
-        toggle_expanded). The full list is also the row's tooltip.
+        Nothing is claimed without data: without the reverse-dependency
+        map (`needs_known`) there is no list and no line at all.
         """
         if not item.get("needs_known"):
             return []
-        needs = [str(n) for n in (item.get("needs") or []) if n]
-        if not needs:
-            return [("", "No explicitly installed package needs it.")]
-        n_lines = self._dep_lines(item)
-        bullets = [("\u2022", n) for n in needs[:n_lines]]
-        if len(needs) > n_lines:
-            mark, text = bullets[-1]
-            bullets[-1] = (mark, f"{text}   +{len(needs) - n_lines} more")
-        return bullets
+        return [str(n) for n in (item.get("needs") or []) if n]
 
-    def _unfolded(self, item: dict) -> bool:
-        return item["name"] in self._expanded
+    def _req_heading(self, item: dict) -> str:
+        """What the requirer line is about, per page.
 
-    def _dep_lines(self, item: dict) -> int:
-        """How many bullet lines this dependency row reserves right now."""
-        if self._unfolded(item):
-            needs = [str(n) for n in (item.get("needs") or []) if n]
-            return max(self.DEP_LINES, len(needs))
-        return self.DEP_LINES
-
-    def _dep_more_txt(self, item: dict) -> str:
-        """The label line's control: unfold the list, fold it back, or nothing.
-
-        A row that already shows every requirer gets no control — there is
-        nothing behind it to reveal.
+        On Untracked the row *is* a dependency and the question is who
+        pulled it in; on Tracked the row is yours and the question is
+        what would go with it (see AGENTS.md).
         """
-        if not item.get("needs_known"):
-            return ""
-        needs = [str(n) for n in (item.get("needs") or []) if n]
-        if len(needs) <= self.DEP_LINES:
-            return ""
-        return "Show less" if self._unfolded(item) else "Show more"
+        return ("\u21b3 DEPENDENCY FOR:"
+                if item.get("kind") == "dependency" else "\u21b3 NEEDED BY:")
 
-    def toggle_expanded(self, row: int) -> None:
-        """Unfold a dependency row's whole requirer list, or fold it back.
+    def set_detail(self, name: str) -> None:
+        """Which package's requirer list the panel shows ("" = none)."""
+        if self._detail_name == name:
+            return
+        self._detail_name = name
+        self._view.viewport().update()
 
-        The row grows to hold it and everything below it moves: the one
-        deliberate shift a row is allowed (AGENTS.md). The row the user
-        clicked keeps its place on screen.
+    def toggle_detail(self, row: int) -> None:
+        """Open a row's requirer list in the panel, or close the panel.
+
+        The list never unfolds inside the row: the panel under the list
+        holds it, so the row (and every row under it) keeps its height
+        and its place (see _DetailPanel).
         """
         model = self._view.model()
         if model is None or not 0 <= row < model.rowCount():
             return
         item = model.item(row)
-        if item.get("kind") != "dependency":
-            return
+        names = self._requirers(item)
+        if not names:
+            return          # no list, no control on the row to open it
         name = item["name"]
-        if name in self._expanded:
-            self._expanded.discard(name)
-        else:
-            self._expanded.add(name)
-        _relayout_after_row_event(self._view, model)
+        if self._detail_name == name:
+            self.set_detail("")
+            self.detail_requested.emit("", "", [])
+            return
+        self.set_detail(name)
+        self.detail_requested.emit(name, self._req_heading(item), names)
 
     def _geom(self, row: int, item: dict, width: int) -> dict:
         # Same card as the Updates list: rail, name row with the one row
@@ -5431,48 +5535,10 @@ class TrackedDelegate(QStyledItemDelegate):
                                   Qt.TextElideMode.ElideRight, desc_avail)
                     if desc_avail > 60 else "")
         # The description row is always reserved (even when empty) so every
-        # card is the same height — a pixel-scrolled list of uniform rows
-        # can never drift under the cursor.
+        # card is the same height — a pixel-scrolled list of rows that can
+        # never re-anchor under the cursor.
         desc_top = ver_top + h_line + self.GAP
         bottom_top = desc_top + h_line + self.GAP
-        # A dependency row then carries its own labelled block: which
-        # applications need this package, one bullet per line. It sits
-        # below the description, never inside it, and the whole block is
-        # reserved for every dependency row.
-        dep_label_txt = ""
-        dep_label = QRect()
-        dep_rects: list[QRect] = []
-        dep_lines: list[tuple[str, str]] = []
-        dep_more = QRect()
-        dep_more_txt = ""
-        if item.get("kind") == "dependency":
-            dep_label_txt = "\u21b3 DEPENDENCY FOR:"
-            dep_label = QRect(x0, bottom_top, cw, h_line)
-            # "Show more" sits on the label line, right — always in the
-            # same place, folded or unfolded.
-            dep_more_txt = self._dep_more_txt(item)
-            more_w = (fm.horizontalAdvance(dep_more_txt) + self.MORE_GAP
-                      if dep_more_txt else 0)
-            if more_w:
-                dep_more = QRect(right - more_w, bottom_top, more_w, h_line)
-            bullets_w = max(40, cw - self.DEP_INDENT)
-            lines = self._dep_bullets(item)
-            n_dep_lines = self._dep_lines(item)
-            dep_top = bottom_top + h_line + self.GAP
-            for i in range(n_dep_lines):
-                rect = QRect(x0 + self.DEP_INDENT,
-                             dep_top + i * (h_line + self.GAP),
-                             bullets_w, h_line)
-                dep_rects.append(rect)
-                mark, text = (lines + [("", "")] * n_dep_lines)[i]
-                avail = bullets_w - (fm.horizontalAdvance(mark + " ")
-                                     if mark else 0)
-                dep_lines.append(
-                    (mark, fm.elidedText(text, Qt.TextElideMode.ElideRight,
-                                         max(20, avail))
-                     if text else ""))
-            bottom_top = (dep_top + n_dep_lines * h_line
-                          + (n_dep_lines - 1) * self.GAP + self.GAP)
         # Pills sit on the bottom baseline, right-aligned (Uninstall,
         # then Open) — like the Updates action pill below its notes line.
         pills_w = 0
@@ -5493,12 +5559,67 @@ class TrackedDelegate(QStyledItemDelegate):
             pills_w += ow + 8
         else:
             open_rect = QRect()
+        # ── Bottom line, left: what needs this package ─────────────────
+        # A stray dependency names the applications behind it (Untracked),
+        # a tracked package the things that would go with it — on one
+        # line: the names that fit, a count for the rest, and a control
+        # that opens the whole list in the panel under the list (see
+        # _DetailPanel). None of it changes the row's height: the line is
+        # already there on every row (see AGENTS.md).
+        hint = QRect(x0, bottom_top + 4, max(10, cw - pills_w - 12), h_line)
+        requirers = self._requirers(item)
+        dep_row = (item.get("kind") == "dependency"
+                   and item.get("needs_known"))
+        req_label_txt = ""
+        req_label = QRect()
+        req_names = QRect()
+        req_names_txt = ""
+        req_note_txt = ""
+        req_more = QRect()
+        req_more_txt = ""
+        if requirers:
+            fm_eye = QFontMetrics(self._f_eyebrow)
+            req_label_txt = self._req_heading(item)
+            head_w = fm_eye.horizontalAdvance(req_label_txt) + 8
+            names_w = max(40, hint.width() - head_w)
+            joined = " · ".join(requirers)
+            if fm.horizontalAdvance(joined) <= names_w:
+                shown = joined          # every name fits: nothing behind it
+            else:
+                # The line says as many whole names as fit and counts the
+                # rest; the panel holds the complete list.
+                req_more_txt = ("Show less"
+                                if self._detail_name == item["name"]
+                                else "Show more")
+                more_w = fm.horizontalAdvance(req_more_txt) + self.MORE_GAP
+                names_w = max(40, names_w - more_w)
+                shown, used, fits = "", 0, 0
+                for i, word in enumerate(requirers):
+                    sep = fm.horizontalAdvance(" · ") if fits else 0
+                    tail = fm.horizontalAdvance(
+                        f"  +{len(requirers) - fits} more")
+                    word_w = fm.horizontalAdvance(word)
+                    if used + sep + word_w + tail > names_w:
+                        break
+                    shown += (" · " if fits else "") + word
+                    used += sep + word_w
+                    fits += 1
+                shown += f"  +{len(requirers) - fits} more"
+                req_more = QRect(hint.right() - more_w, hint.top(),
+                                 more_w, h_line)
+            req_label = QRect(hint.left(), hint.top(), head_w - 8, h_line)
+            req_names = QRect(hint.left() + head_w, hint.top(),
+                              names_w, h_line)
+            req_names_txt = fm.elidedText(shown, Qt.TextElideMode.ElideRight,
+                                          req_names.width())
+        elif dep_row:
+            # A dependency nothing needs says exactly that, where the
+            # names would have been.
+            req_note_txt = "\u21b3 No explicitly installed package needs it."
         ycur = bottom_top + h_pill
         # Row = card + CDY on both sides, so cards keep an 8px gap and
         # the card itself always has PBOT below its last element.
         total = ycur + self.PBOT + self.CDY
-        hint_txt = ""
-        hint_col = _secondary_hex()
         return {
             "check": QRect(x0 - self.RAIL + 4, y + 1, 18, 18),
             "name": QRect(x0, y, name_w, h_name),
@@ -5514,19 +5635,17 @@ class TrackedDelegate(QStyledItemDelegate):
             "ver_left_w": ver_left_w,
             "desc": QRect(x0, desc_top, cw, h_line),
             "desc_txt": desc_txt,
-            # Dependency rows only: the "DEPENDENCY FOR" label and its
-            # bullets ((mark, text) per reserved line), plus the control
-            # that unfolds the whole list in place.
-            "dep_label": dep_label,
-            "dep_label_txt": dep_label_txt,
-            "dep_rects": dep_rects,
-            "dep_lines": dep_lines,
-            "dep_more": dep_more,
-            "dep_more_txt": dep_more_txt,
-            "hint": QRect(x0, bottom_top + 4,
-                          max(10, cw - pills_w - 12), h_line),
-            "hint_txt": hint_txt,
-            "hint_col": hint_col,
+            # Bottom line, left: what needs this package — a heading and
+            # the names that fit (or the note saying nothing does), plus
+            # the control that opens the whole list in the panel.
+            "hint": hint,
+            "req_label": req_label,
+            "req_label_txt": req_label_txt,
+            "req_names": req_names,
+            "req_names_txt": req_names_txt,
+            "req_note_txt": req_note_txt,
+            "req_more": req_more,
+            "req_more_txt": req_more_txt,
             "action2": action2,
             "action2_txt": uni_txt,
             "open": open_rect,
@@ -5644,56 +5763,40 @@ class TrackedDelegate(QStyledItemDelegate):
             p.drawText(move(lay["desc"]),
                        Qt.AlignmentFlag.AlignLeft
                        | Qt.AlignmentFlag.AlignVCenter, lay["desc_txt"])
-        # Dependency rows: the label and its bullet list, in their own
-        # block under the description — the applications that would go
-        # with this package, named one per line.
-        if lay["dep_label_txt"]:
+        # Bottom line, left: what needs this package (see _geom) — a
+        # dependency's applications, or the packages that go with a
+        # tracked one — and the control that opens the whole list in the
+        # panel. The pills own the right end of this same line.
+        p.setFont(self._f_text)
+        if lay["req_note_txt"]:
+            p.setPen(QPen(QColor(_secondary_hex())))
+            p.drawText(move(lay["hint"]),
+                       Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter,
+                       fm_elided(self._f_text, lay["req_note_txt"],
+                                 lay["hint"].width()))
+        elif lay["req_label_txt"]:
             p.setFont(self._f_eyebrow)
             p.setPen(QPen(QColor(_warning_hex())))
-            p.drawText(move(lay["dep_label"]),
+            p.drawText(move(lay["req_label"]),
                        Qt.AlignmentFlag.AlignLeft
-                       | Qt.AlignmentFlag.AlignVCenter, lay["dep_label_txt"])
-            if lay["dep_more_txt"]:
-                # Folded or unfolded, the control keeps its place: one
-                # link-coloured word at the right of the label line.
-                p.setFont(self._f_text)
+                       | Qt.AlignmentFlag.AlignVCenter, lay["req_label_txt"])
+            p.setFont(self._f_text)
+            p.setPen(QPen(pal.color(pal.ColorRole.Text)))
+            p.drawText(move(lay["req_names"]),
+                       Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter, lay["req_names_txt"])
+            if lay["req_more_txt"]:
+                # One link-coloured word at the line's right end — the
+                # same place whether this row's panel is open or not.
                 f = p.font()
-                f.setUnderline(hover[1] == "dep_more")
+                f.setUnderline(hover[1] == "req_more")
                 p.setFont(f)
                 p.setPen(QPen(QColor(_link_hex())))
-                p.drawText(move(lay["dep_more"]),
+                p.drawText(move(lay["req_more"]),
                            Qt.AlignmentFlag.AlignRight
                            | Qt.AlignmentFlag.AlignVCenter,
-                           lay["dep_more_txt"])
-            p.setFont(self._f_text)
-            fm_t = QFontMetrics(self._f_text)
-            text_col = pal.color(pal.ColorRole.Text)
-            for rect, (mark, text) in zip(lay["dep_rects"], lay["dep_lines"]):
-                if not text:
-                    continue
-                r = move(rect)
-                off = 0
-                if mark:
-                    off = fm_t.horizontalAdvance(mark + " ")
-                    p.setPen(QPen(QColor(_warning_hex())))
-                    p.drawText(
-                        QRect(r.left(), r.top(), off, r.height()),
-                        Qt.AlignmentFlag.AlignLeft
-                        | Qt.AlignmentFlag.AlignVCenter, mark)
-                p.setPen(QPen(text_col))
-                p.drawText(
-                    QRect(r.left() + off, r.top(), r.width() - off,
-                          r.height()),
-                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                    text)
-        # Bottom line: status hint left, pills right.
-        p.setFont(self._f_text)
-        if lay["hint_txt"]:
-            p.setPen(QPen(QColor(lay["hint_col"])))
-            p.drawText(move(lay["hint"]),
-                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                       fm_elided(self._f_text, lay["hint_txt"],
-                                 lay["hint"].width()))
+                           lay["req_more_txt"])
         # The link underline flag above is sticky on the painter: the
         # font was already reset, so pills never inherit it.
         p.setFont(self._f_text)
@@ -5744,7 +5847,7 @@ class TrackedDelegate(QStyledItemDelegate):
                              option.rect.width())
             pos = event.position().toPoint() - option.rect.topLeft()
             kind = ""
-            for k in ("check", "action2", "open", "link", "dep_more"):
+            for k in ("check", "action2", "open", "link", "req_more"):
                 if not lay[k].isNull() and lay[k].contains(pos):
                     kind = k
                     break
@@ -5777,9 +5880,9 @@ class TrackedDelegate(QStyledItemDelegate):
                 self.link_activated.emit(
                     _package_url(it["name"], it["repo"], it.get("url", "")))
                 return True
-            if (not lay["dep_more"].isNull()
-                    and lay["dep_more"].contains(pos)):
-                self.expand_requested.emit(index.row())
+            if (not lay["req_more"].isNull()
+                    and lay["req_more"].contains(pos)):
+                self.more_requested.emit(index.row())
                 return True
         return False
 
@@ -6478,6 +6581,10 @@ class UpdateWindow(QMainWindow):
             self._open_tracked_app)
         self._track_delegate.link_activated.connect(
             lambda url: QDesktopServices.openUrl(QUrl(url)))
+        self._track_delegate.more_requested.connect(
+            self._track_delegate.toggle_detail)
+        self._track_delegate.detail_requested.connect(
+            self._on_detail_requested)
         self._track_delegate.toggled.connect(self._on_track_toggled)
         self._track_model.dataChanged.connect(
             lambda *a: self._refresh_tracked_footer())
@@ -6637,6 +6744,15 @@ class UpdateWindow(QMainWindow):
         self._controls.cells.removeWidget(self._un_strip)
         self._controls.cells.insertWidget(2, self._un_strip)
 
+        # ── Zone 4½ · The requirer panel, under the list ────────────────────
+        # One row's "Show more" opens it here, between the list and the
+        # footer: the list gives up exactly its height, the footer keeps
+        # its place, and nothing inside the list ever grows (see
+        # _DetailPanel). Rows on any page can open it; leaving the page
+        # closes it (see _close_detail).
+        self._detail_panel = _DetailPanel()
+        self._detail_panel.closed.connect(self._close_detail)
+        left.addWidget(self._detail_panel)
         left.addWidget(self._footer_stack)
         self._update_view_badges()
         self._refresh_selection_ui()
@@ -6813,6 +6929,9 @@ class UpdateWindow(QMainWindow):
         self._controls.cells.setCurrentIndex(idx)
         self._content_stack.setCurrentIndex(idx)
         self._footer_stack.setCurrentIndex(idx)
+        # The requirer panel belongs to a row on the page that just left
+        # the screen: nothing of it may stand over the new one.
+        self._close_detail()
         self._view_buttons[key].setChecked(True)
         # The status line follows the page you are looking at: a load on
         # this page speaks, a load on another one goes quiet (see
@@ -7614,6 +7733,9 @@ class UpdateWindow(QMainWindow):
         self._log_action("Reloading the tracked package list…")
         self._track_loaded = False
         self._track_loading = True
+        # The row the requirer panel was describing is about to be
+        # replaced: close it rather than narrate a list that is gone.
+        self._close_detail()
         self._track_model.set_packages([])
         self._release_thread("_track_loader")
         self._track_loader = TrackedLoader()
@@ -8062,7 +8184,8 @@ class UpdateWindow(QMainWindow):
             lambda url: QDesktopServices.openUrl(QUrl(url)))
         # "Show more" on a dependency row unfolds the whole requirer list
         # inside the card (never a dialog).
-        delegate.expand_requested.connect(delegate.toggle_expanded)
+        delegate.more_requested.connect(delegate.toggle_detail)
+        delegate.detail_requested.connect(self._on_detail_requested)
         delegate.toggled.connect(
             lambda row, m=model: self._toggle_card_check(m, row))
         model.dataChanged.connect(
@@ -8172,6 +8295,7 @@ class UpdateWindow(QMainWindow):
         self._log_action("Scanning for untracked software…")
         self._untracked_loaded = False
         self._un_loading = True
+        self._close_detail()
         self._un_model.set_items([])
         self._release_thread("_untracked_loader")
         self._untracked_loader = UntrackedLoader()
@@ -9226,6 +9350,32 @@ class UpdateWindow(QMainWindow):
         hold them (see PackageDelegate.toggle_notes).
         """
         self._delegate.toggle_notes(row)
+
+    # — Show more on a requirer line: the panel under the list —
+    def _on_detail_requested(self, name: str, heading: str,
+                             names: list) -> None:
+        """Show one row's whole requirer list in the panel under the list.
+
+        The row's own line carries the names that fit; this is where the
+        rest live, so a package needed by thirty others costs the list
+        nothing (see _DetailPanel).
+        """
+        if not name:
+            self._detail_panel.hide_detail()
+            return
+        self._detail_panel.show_detail(name, heading,
+                                       [str(n) for n in names])
+
+    def _close_detail(self) -> None:
+        """Fold the panel and forget which row opened it.
+
+        Called by "Hide", and on every page change: the row it belongs to
+        is not on screen any more, and a stale list under a fresh page
+        would be a lie.
+        """
+        self._track_delegate.set_detail("")
+        self._un_delegate.set_detail("")
+        self._detail_panel.hide_detail()
 
     # — AUR → official moves —
     def _open_sources_dialog(self) -> None:

@@ -1040,6 +1040,47 @@ class TestDependencyRows:
         assert rows[0]["needs_known"] is False
 
 
+class TestTrackedRequirers:
+    """Tracked rows say what would go with them, like stray dependencies.
+
+    Both lists wear the same one-line requirer summary; on Tracked the
+    question is the other way round — what would come off with this
+    package — and the whole list opens in the panel under the list.
+    """
+
+    def test_load_tracked_names_the_explicit_packages_that_need_each(
+            self, monkeypatch):
+        monkeypatch.setattr(app, "get_installed_packages", lambda: [
+            {"name": "bluez-libs", "version": "1-1", "repo": "official"},
+            {"name": "pipewire", "version": "2-1", "repo": "official"}])
+        monkeypatch.setattr(app, "flatpak_tracked_rows", lambda: [])
+        monkeypatch.setattr(app, "appimage_rows", lambda: [])
+        monkeypatch.setattr(app, "required_by_map", lambda: {
+            "bluez-libs": ["kdeconnect"],
+            "kdeconnect": ["plasma-desktop"],
+            "pipewire": []})
+        monkeypatch.setattr(app, "_explicit_package_set",
+                            lambda: {"plasma-desktop", "pipewire"})
+        rows = {r["name"]: r for r in app.load_tracked()}
+        # The walk climbs to the package the user installed, not the
+        # library in between.
+        assert rows["bluez-libs"]["needs"] == ["plasma-desktop"]
+        assert rows["bluez-libs"]["needs_known"] is True
+        # Nothing needs pipewire — a known fact, not a missing list.
+        assert rows["pipewire"]["needs"] == []
+        assert rows["pipewire"]["needs_known"] is True
+
+    def test_without_requirer_data_the_rows_claim_nothing(self, monkeypatch):
+        monkeypatch.setattr(app, "get_installed_packages", lambda: [
+            {"name": "pipewire", "version": "1-1", "repo": "official"}])
+        monkeypatch.setattr(app, "flatpak_tracked_rows", lambda: [])
+        monkeypatch.setattr(app, "appimage_rows", lambda: [])
+        monkeypatch.setattr(app, "required_by_map", lambda: {})
+        rows = app.load_tracked()
+        assert "needs" not in rows[0]
+        assert "needs_known" not in rows[0]
+
+
 class TestDesktopLaunch:
     """A .desktop Exec is not a command line."""
 

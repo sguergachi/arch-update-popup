@@ -883,8 +883,13 @@ class TestTrackedEnricher:
         assert got == []
 
 
-class TestDependencyBlock:
-    """A dependency row names what needs it — label, bullets, own lines."""
+class TestRequirerLine:
+    """A row names what needs it — one line, with the rest in the panel.
+
+    The line rides the row's bottom row, so every row is the same height
+    whether it names one requirer or a dozen; the whole list opens in the
+    strip under the list (see _DetailPanel), never inside the row.
+    """
 
     @pytest.fixture()
     def deps_view(self, qapp):
@@ -893,15 +898,20 @@ class TestDependencyBlock:
             app._tracked_row("libfoo", "1-1", "official", kind="dependency",
                              needs=["Steam"], desc="A foo library"),
             app._tracked_row("libbar", "2-1", "official", kind="dependency",
-                             needs=["A", "B", "C", "D", "E"]),
+                             needs=["Plasma Workspace", "Steam Big Picture",
+                                    "KDE Connect", "GIMP", "Firefox",
+                                    "LibreOffice", "Blender", "Inkscape"]),
             app._tracked_row("libbaz", "3-1", "official", kind="dependency"),
             app._tracked_row("libqux", "4-1", "official", kind="dependency",
                              needs_known=False),
             app._tracked_row("zen", "5-1", "manual", title="Zen",
                              desktop="/x/zen.desktop", kind="app"),
+            # A tracked package wears the same line from the other side.
+            app._tracked_row("pipewire", "6-1", "official",
+                             needs=["plasma-desktop", "firefox"]),
         ])
         v = QListView()
-        v.resize(900, 400)
+        v.resize(700, 400)
         v.setModel(m)
         d = app.TrackedDelegate(v)
         v.setItemDelegate(d)
@@ -914,95 +924,124 @@ class TestDependencyBlock:
         opt, _idx = _topt(view, row)
         return view.itemDelegate()._geom(row, m.item(row), opt.rect.width())
 
-    def test_the_label_sits_above_the_bullets_and_below_the_description(
+    def test_the_line_sits_below_the_description(self, deps_view):
+        lay = self._lay(deps_view, "libfoo")
+        assert lay["req_label_txt"] == "\u21b3 DEPENDENCY FOR:"
+        assert lay["desc"].bottom() <= lay["req_label"].top()
+        assert lay["req_names"].left() > lay["req_label"].left()
+
+    def test_one_requirer_is_named_and_needs_no_control(self, deps_view):
+        lay = self._lay(deps_view, "libfoo")
+        assert lay["req_names_txt"] == "Steam"
+        assert lay["req_more_txt"] == ""
+        assert lay["req_more"].isNull()
+
+    def test_a_long_list_shows_what_fits_and_counts_the_rest(
             self, deps_view):
-        lay = self._lay(deps_view, "libfoo")
-        assert lay["dep_label_txt"] == "\u21b3 DEPENDENCY FOR:"
-        assert lay["desc"].bottom() <= lay["dep_label"].top()
-        assert lay["dep_label"].bottom() <= lay["dep_rects"][0].top()
-
-    def test_one_bullet_per_application(self, deps_view):
-        lay = self._lay(deps_view, "libfoo")
-        assert lay["dep_lines"][0] == ("\u2022", "Steam")
-        assert lay["dep_lines"][1:] == [("", ""), ("", "")]
-
-    def test_a_long_list_is_capped_and_counted(self, deps_view):
         lay = self._lay(deps_view, "libbar")
-        lines = lay["dep_lines"]
-        assert len(lines) == app.TrackedDelegate.DEP_LINES == 3
-        assert [txt for _mark, txt in lines[:2]] == ["A", "B"]
-        assert lines[2][0] == "\u2022"
-        assert lines[2][1].startswith("C") and "+2 more" in lines[2][1]
+        assert lay["req_names_txt"].startswith("Plasma Workspace")
+        assert "+" in lay["req_names_txt"]
+        assert "more" in lay["req_names_txt"]
+        # Fresh names only: nothing is repeated, nothing is cut mid-word.
+        shown = lay["req_names_txt"].split("  +")[0].split(" · ")
+        assert shown == ["Plasma Workspace", "Steam Big Picture",
+                         "KDE Connect", "GIMP", "Firefox", "LibreOffice",
+                         "Blender", "Inkscape"][:len(shown)]
+        assert 0 < len(shown) < 8
+
+    def test_the_control_rides_the_line_right_end(self, deps_view):
+        lay = self._lay(deps_view, "libbar")
+        assert lay["req_more_txt"] == "Show more"
+        assert lay["req_more"].right() <= lay["hint"].right() + 1
+        assert lay["hint"].left() <= lay["req_more"].left()
+        assert lay["req_more"].top() >= lay["hint"].top()
 
     def test_a_package_nothing_needs_says_so(self, deps_view):
         lay = self._lay(deps_view, "libbaz")
-        assert lay["dep_lines"][0] == (
-            "", "No explicitly installed package needs it.")
+        assert lay["req_note_txt"] == (
+            "\u21b3 No explicitly installed package needs it.")
+        assert lay["req_label_txt"] == "" and lay["req_more_txt"] == ""
 
-    def test_without_requirer_data_the_block_claims_nothing(self, deps_view):
+    def test_without_requirer_data_the_row_claims_nothing(self, deps_view):
         lay = self._lay(deps_view, "libqux")
-        assert [txt for _mark, txt in lay["dep_lines"]] == ["", "", ""]
+        assert lay["req_label_txt"] == ""
+        assert lay["req_names_txt"] == ""
+        assert lay["req_note_txt"] == ""
+        assert lay["req_more"].isNull()
 
-    def test_app_rows_carry_no_block(self, deps_view):
+    def test_app_rows_carry_no_line(self, deps_view):
         lay = self._lay(deps_view, "zen")
-        assert lay["dep_label_txt"] == ""
-        assert lay["dep_label"].isNull()
-        assert lay["dep_rects"] == []
+        assert lay["req_label_txt"] == ""
+        assert lay["req_names_txt"] == ""
+        assert lay["req_note_txt"] == ""
+        assert lay["req_more"].isNull()
 
-    def test_the_block_is_reserved_so_dependency_rows_match(self, deps_view):
-        # One requirer and five are the same height, so the list can
-        # never re-anchor itself as rows are measured; app rows, which
-        # have no block, stay shorter.
-        assert self._lay(deps_view, "libfoo")["height"] \
-            == self._lay(deps_view, "libbar")["height"]
-        assert self._lay(deps_view, "libfoo")["height"] \
-            > self._lay(deps_view, "zen")["height"]
+    def test_tracked_rows_ask_the_other_way(self, deps_view):
+        # The same relation, read from the side of a package you installed
+        # yourself: what would go with it.
+        lay = self._lay(deps_view, "pipewire")
+        assert lay["req_label_txt"] == "\u21b3 NEEDED BY:"
+        assert lay["req_names_txt"] == "plasma-desktop · firefox"
+
+    def test_every_row_is_the_same_height(self, deps_view):
+        # The line is part of the row: a row that names eight requirers is
+        # exactly as tall as one that names none, so the list can never
+        # re-anchor itself as rows are measured (see AGENTS.md).
+        heights = {self._lay(deps_view, name)["height"]
+                   for name in ("libfoo", "libbar", "libbaz", "libqux",
+                                "zen", "pipewire")}
+        assert len(heights) == 1
 
     def test_the_tooltip_lists_every_requirer(self, deps_view):
         m = deps_view.model()
         row = m.row_of("libbar")
         tip = m.data(m.index(row), Qt.ItemDataRole.ToolTipRole)
-        assert tip.splitlines() == ["DEPENDENCY FOR:", "\u2022 A", "\u2022 B",
-                                    "\u2022 C", "\u2022 D", "\u2022 E"]
+        assert tip.splitlines()[:2] == ["DEPENDENCY FOR:", "\u2022 Plasma "
+                                        "Workspace"]
+        assert len(tip.splitlines()) == 9
+        pipe = m.row_of("pipewire")
+        assert m.data(m.index(pipe), Qt.ItemDataRole.ToolTipRole) \
+            .splitlines() == ["NEEDED BY:", "\u2022 plasma-desktop",
+                              "\u2022 firefox"]
         assert m.data(m.index(m.row_of("zen")),
                       Qt.ItemDataRole.ToolTipRole) is None
 
-    def test_show_more_unfolds_the_whole_list_in_place(self, deps_view):
+    def test_show_more_opens_the_panel_never_a_taller_row(
+            self, deps_view, qapp):
         d = deps_view.itemDelegate()
         m = deps_view.model()
-        folded = self._lay(deps_view, "libbar")
-        assert folded["dep_more_txt"] == "Show more"
-        assert folded["dep_lines"][2][1].endswith("+2 more")
-        d.toggle_expanded(m.row_of("libbar"))
-        unfolded = self._lay(deps_view, "libbar")
-        assert unfolded["dep_more_txt"] == "Show less"
-        assert [t for _mark, t in unfolded["dep_lines"]] \
-            == ["A", "B", "C", "D", "E"]
-        assert unfolded["height"] > folded["height"]
-        d.toggle_expanded(m.row_of("libbar"))
-        assert self._lay(deps_view, "libbar")["height"] == folded["height"]
-
-    def test_a_row_that_shows_everything_carries_no_control(self, deps_view):
-        lay = self._lay(deps_view, "libfoo")
-        assert lay["dep_more_txt"] == ""
-        assert lay["dep_more"].isNull()
-
-    def test_the_control_rides_the_label_line(self, deps_view):
+        row = m.row_of("libbar")
+        opened, closed = [], []
+        d.detail_requested.connect(
+            lambda *a: opened.append(a) if a[0] else closed.append(a))
+        d.more_requested.connect(d.toggle_detail)
+        before = self._lay(deps_view, "libbar")
+        d.more_requested.emit(row)
+        qapp.processEvents()
+        assert opened == [(("libbar"), "\u21b3 DEPENDENCY FOR:",
+                           ["Plasma Workspace", "Steam Big Picture",
+                            "KDE Connect", "GIMP", "Firefox", "LibreOffice",
+                            "Blender", "Inkscape"])]
+        # The row says "Show less" instead of "Show more", and is exactly
+        # as tall as it was: the list under it does not move.
         lay = self._lay(deps_view, "libbar")
-        assert lay["dep_more"].right() <= lay["dep_label"].right() + 1
-        assert lay["dep_label"].top() <= lay["dep_more"].top()
-        assert lay["dep_more"].bottom() <= lay["dep_label"].bottom()
+        assert lay["req_more_txt"] == "Show less"
+        assert lay["height"] == before["height"]
+        d.more_requested.emit(row)
+        qapp.processEvents()
+        assert closed and self._lay(deps_view, "libbar")["req_more_txt"] \
+            == "Show more"
 
-    def test_clicking_show_more_asks_the_row_to_unfold(self, deps_view, qapp):
+    def test_clicking_show_more_asks_for_the_panel(self, deps_view, qapp):
         d = deps_view.itemDelegate()
         m = deps_view.model()
         row = m.row_of("libbar")
         opt, idx = _topt(deps_view, row)
         lay = d._geom(row, m.item(row), opt.rect.width())
         seen = []
-        d.expand_requested.connect(seen.append)
+        d.more_requested.connect(seen.append)
         ev = QMouseEvent(QEvent.Type.MouseButtonRelease,
-                         QPointF(lay["dep_more"].center()
+                         QPointF(lay["req_more"].center()
                                  + opt.rect.topLeft()),
                          Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
                          Qt.KeyboardModifier.NoModifier)

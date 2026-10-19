@@ -26,19 +26,30 @@ slot; it may never move the slots.
   a message wrap and push the content down.
 - **Rows are all the same height**, and the list uses `ResizeMode.Fixed`.
   Variable row heights make the view re-anchor itself as rows are measured,
-  which looks exactly like the list scrolling on its own. The one exception is
-  the row the user just unfolded by hand: "Show more" grows *that* row to hold
-  what it was hiding (full release notes, the whole requirer list) and folds
-  back on "Show less" — see `_relayout_after_row_event`, which holds the scroll
-  offset so the clicked row never moves. Nothing else may resize a row.
+  which looks exactly like the list scrolling on its own. A row's own bottom
+  line carries whatever it has to say — a stray dependency's applications, a
+  tracked package's requirers, a status hint — always on that one line, never
+  on extra ones. So a row that names eight requirers is exactly as tall as one
+  that names none.
+- **A long list opens under the list, never inside a row.** A package can be
+  needed by dozens of others: the row shows the names that fit, a count for the
+  rest and a "Show more" control, and the whole list opens in `_DetailPanel` —
+  the one strip that sits between the list and the footer, closing on "Hide",
+  on a page change and on a reload. The list gives up exactly that height; the
+  footer and everything above the list stay put, and the strip is one fixed
+  size whatever it is showing. The one thing that may grow a row is release
+  notes: "Show more" unfolds *that* row to hold them and folds back on "Show
+  less" — see `_relayout_after_row_event`, which holds the scroll offset so the
+  clicked row never moves.
 - **An empty list still looks like a list.** Keep its frame, its header and its
   stat cards; the placeholder lives *inside* the frame and only swaps an icon
   and two lines of text.
 - **Lists show "Loading…" while they load** — inside that same frame, in that
   same placeholder, with a line saying what is being loaded. Never a blank box.
 - **The only allowed shifts are deliberate, rare and worth it:** the security
-  warning banner, the AUR→official banner, opening the log panel, and unfolding
-  a row with "Show more". Nothing else may move.
+  warning banner, the AUR→official banner, opening the log panel, unfolding a
+  row's release notes, and opening the requirer panel under the list. Nothing
+  else may move.
 
 ## Where information lives
 
@@ -61,6 +72,11 @@ One place per fact, and no page owns a line of its own:
 - **How much is selected lives in the footer**, next to that count:
   `390 tracked · All 390 packages selected` (see `_selection_text`). Not beside
   Select all — that row belongs to the filter field and the cards.
+- **What needs a package lives on that row's own bottom line** — a stray
+  dependency's applications (Untracked), the packages that would go with a
+  tracked one (Tracked) — with the whole list in the panel under the list.
+  One fact, one line, and every row keeps its height whether it names one
+  requirer or none.
 
 Why: pressing Refresh with 13 updates and getting 0 must not make the window
 jump. Movement is read as a bug even when the new state is correct.

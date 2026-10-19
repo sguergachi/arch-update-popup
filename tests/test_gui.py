@@ -2191,6 +2191,160 @@ class TestControlRowAndFilter:
             assert not hasattr(window, name), name
 
 
+class TestRequirerPanel:
+    """A row's whole requirer list opens under the list, never inside it.
+
+    "Show more" used to grow the row, which pushed every row below it and
+    buried the list under a wall of names. The list now opens in a strip
+    between the list and the footer: the list gives up exactly that
+    height, the footer keeps its place, and every row keeps its own (see
+    AGENTS.md).
+    """
+
+    LONG_NEEDS = [f"Application {i:02d}" for i in range(1, 26)]
+
+    def _stage_deps(self, window, qapp):
+        """Two stray dependencies: one with a list far too long for a row,
+        one that everything fits into."""
+        rows = [
+            app._tracked_row("libfoo", "2-1", "official", kind="dependency",
+                             needs=list(self.LONG_NEEDS)),
+            app._tracked_row("libbar", "3-1", "official", kind="dependency",
+                             needs=["Firefox"]),
+        ]
+        window._on_untracked_loaded([], rows)
+        qapp.processEvents()
+        return rows
+
+    def test_the_strip_sits_between_the_list_and_the_footer(
+            self, window, qapp):
+        left = window._left_col
+        widgets = [left.itemAt(i).widget() for i in range(left.count())]
+        panel = window._detail_panel
+        assert widgets.index(panel) > widgets.index(window._content_stack)
+        assert widgets.index(panel) < widgets.index(window._footer_stack)
+        assert not panel.isVisible()
+
+    def test_show_more_opens_the_whole_list_under_the_list(
+            self, window, qapp):
+        self._stage_deps(window, qapp)
+        d = window._un_delegate
+        before = window._content_stack.geometry()
+        footer = window._footer_stack.geometry()
+        d.toggle_detail(window._un_model.row_of("libfoo"))
+        qapp.processEvents()
+        panel = window._detail_panel
+        assert panel.isVisible()
+        assert panel._name.text() == "libfoo"
+        assert panel._label.text() == "\u21b3 DEPENDENCY FOR:"
+        assert panel._count.text() == "25 packages"
+        assert panel._names.text().split(" · ") == self.LONG_NEEDS
+        # The list hands over exactly the strip's height; everything above
+        # the list and the footer keep their place.
+        after = window._content_stack.geometry()
+        assert after.top() == before.top()
+        assert after.bottom() < before.bottom()
+        assert window._footer_stack.geometry() == footer
+
+    def test_the_row_keeps_its_height_and_its_place(self, window, qapp):
+        self._stage_deps(window, qapp)
+        d, m, view = (window._un_delegate, window._un_model, window._un_view)
+        row = m.row_of("libfoo")
+        from PyQt6.QtWidgets import QStyleOptionViewItem
+        opt = QStyleOptionViewItem()
+        opt.rect = view.visualRect(m.index(row))
+        lay = d._geom(row, m.item(row), opt.rect.width())
+        assert lay["req_more_txt"] == "Show more"   # the list is cut short
+        above = view.visualRect(m.index(row)).top()
+        d.toggle_detail(row)
+        qapp.processEvents()
+        after = d._geom(row, m.item(row), opt.rect.width())
+        assert after["height"] == lay["height"]
+        assert after["req_more_txt"] == "Show less"
+        # A row below it does not move either: nothing above the panel
+        # gives way except the list's own height.
+        assert view.visualRect(m.index(row)).top() == above
+
+    def test_hide_gives_the_list_its_height_back(self, window, qapp):
+        self._stage_deps(window, qapp)
+        before = window._content_stack.geometry()
+        window._un_delegate.toggle_detail(window._un_model.row_of("libfoo"))
+        qapp.processEvents()
+        assert window._detail_panel.isVisible()
+        window._detail_panel._hide_btn.click()
+        qapp.processEvents()
+        assert not window._detail_panel.isVisible()
+        assert window._un_delegate._detail_name == ""
+        assert window._content_stack.geometry() == before
+
+    def test_leaving_the_page_closes_the_panel(self, window, qapp):
+        self._stage_deps(window, qapp)
+        d, m = window._un_delegate, window._un_model
+        d.toggle_detail(m.row_of("libfoo"))
+        qapp.processEvents()
+        window._switch_view("obsolete")
+        qapp.processEvents()
+        assert not window._detail_panel.isVisible()
+        assert d._detail_name == ""
+        # Back on its page the row offers its list again.
+        from PyQt6.QtWidgets import QStyleOptionViewItem
+        row = m.row_of("libfoo")
+        opt = QStyleOptionViewItem()
+        opt.rect = window._un_view.visualRect(m.index(row))
+        lay = d._geom(row, m.item(row), opt.rect.width())
+        assert lay["req_more_txt"] == "Show more"
+
+    def test_the_strip_is_the_same_size_whatever_the_answer(
+            self, window, qapp):
+        self._stage_deps(window, qapp)
+        d, m = window._un_delegate, window._un_model
+        d.toggle_detail(m.row_of("libfoo"))     # twenty-five names
+        qapp.processEvents()
+        tall = (window._detail_panel.height(),
+                window._content_stack.geometry())
+        d.toggle_detail(m.row_of("libbar"))     # one name
+        qapp.processEvents()
+        assert window._detail_panel._count.text() == "1 package"
+        assert (window._detail_panel.height(),
+                window._content_stack.geometry()) == tall
+
+    def test_a_tracked_row_opens_the_same_panel(self, window, qapp):
+        if window._obs_checker is not None:
+            window._obs_checker.wait(25000)
+        qapp.processEvents()
+        loader = window._track_loader
+        if loader is not None:
+            loader.wait(25000)
+        qapp.processEvents()
+        window._switch_view("tracked")
+        qapp.processEvents()
+        window._on_tracked_loaded([
+            {"name": "bluez-libs", "version": "1-1", "repo": "official",
+             "needs": list(self.LONG_NEEDS), "needs_known": True},
+            {"name": "pipewire", "version": "2-1", "repo": "official"}])
+        qapp.processEvents()
+        d = window._track_delegate
+        m = window._track_model
+        row = m.row_of("bluez-libs")
+        from PyQt6.QtWidgets import QStyleOptionViewItem
+        opt = QStyleOptionViewItem()
+        opt.rect = window._track_list.visualRect(m.index(row))
+        lay = d._geom(row, m.item(row), opt.rect.width())
+        # The same relation, from the side of a package you installed.
+        assert lay["req_label_txt"] == "\u21b3 NEEDED BY:"
+        assert lay["req_more_txt"] == "Show more"
+        d.toggle_detail(row)
+        qapp.processEvents()
+        assert window._detail_panel.isVisible()
+        assert window._detail_panel._label.text() == "\u21b3 NEEDED BY:"
+        assert window._detail_panel._name.text() == "bluez-libs"
+        # A package nothing needs claims nothing: no line, no control.
+        row = m.row_of("pipewire")
+        opt.rect = window._track_list.visualRect(m.index(row))
+        lay = d._geom(row, m.item(row), opt.rect.width())
+        assert lay["req_label_txt"] == "" and lay["req_names_txt"] == ""
+
+
 class TestLogPanelState:
     def test_placeholder_until_something_is_logged(self, window, qapp):
         window._log_btn.setChecked(True)
