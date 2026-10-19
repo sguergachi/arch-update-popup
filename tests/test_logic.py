@@ -999,7 +999,7 @@ class TestDependencyRows:
         monkeypatch.setattr(app, "_explicit_package_set", lambda: {"steam"})
         monkeypatch.setattr(app, "all_package_descs",
                             lambda: {"libfoo": "A foo library"})
-        rows = app.UntrackedLoader()._load_deps({"steam": "Steam"})
+        rows = app.LibraryLoader()._load_deps({"steam": "Steam"})
         by_name = {r["name"]: r for r in rows}
         assert by_name["libfoo"]["needs"] == ["Steam"]
         assert by_name["libfoo"]["needs_known"] is True
@@ -1023,7 +1023,7 @@ class TestDependencyRows:
                             lambda: {"libfoo": ["gaze-bin"]})
         monkeypatch.setattr(app, "_explicit_package_set", lambda: {"gaze-bin"})
         monkeypatch.setattr(app, "all_package_descs", lambda: {})
-        rows = app.UntrackedLoader()._load_deps({})
+        rows = app.LibraryLoader()._load_deps({})
         assert rows[0]["needs"] == ["gaze-bin"]
 
     def test_without_requirer_data_the_row_claims_nothing(self, monkeypatch):
@@ -1035,7 +1035,7 @@ class TestDependencyRows:
         monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
         monkeypatch.setattr(app, "required_by_map", lambda: {})
         monkeypatch.setattr(app, "all_package_descs", lambda: {})
-        rows = app.UntrackedLoader()._load_deps({})
+        rows = app.LibraryLoader()._load_deps({})
         assert rows[0]["needs"] == []
         assert rows[0]["needs_known"] is False
 
@@ -1105,43 +1105,32 @@ class TestLoadSteps:
 
 
 class TestLoadProgress:
-    """Both list loads narrate their stages for the status line and track."""
+    """The Library load narrates its stages for the status line and track."""
 
-    def test_the_tracked_load_names_every_stage_it_fills(self, monkeypatch):
-        monkeypatch.setattr(app, "get_installed_packages", lambda: [])
+    def test_the_library_load_names_every_stage_it_fills(self, monkeypatch):
+        class R:
+            stdout = ""
+            returncode = 1      # nothing to answer for; it still narrates
+
+        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
+        monkeypatch.setattr(app, "get_installed_packages",
+                            lambda repos=None: [])
         monkeypatch.setattr(app, "required_by_map", lambda: {})
         monkeypatch.setattr(app, "flatpak_tracked_rows", lambda: [])
         monkeypatch.setattr(app, "appimage_rows", lambda: [])
-        seen = []
-        app.load_tracked(app._LoadSteps(lambda p, what:
-                                        seen.append((p, what))))
-        assert seen == [
-            (0, "Reading the installed packages…"),
-            (600, "Working out what needs what…"),
-            (950, "Adding Flatpak apps and AppImages…"),
-            (1000, "Adding Flatpak apps and AppImages…")]
-
-    def test_the_untracked_scan_names_every_stage_it_fills(self, monkeypatch):
-        class R:
-            stdout = ""
-            returncode = 0
-
-        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
         monkeypatch.setattr(app, "scan_desktop_files", lambda: [])
-        monkeypatch.setattr(app, "_installed_version_map", lambda: {})
-        monkeypatch.setattr(app, "_explicit_package_set", lambda: set())
-        monkeypatch.setattr(app, "required_by_map", lambda: {})
         monkeypatch.setattr(app, "all_package_descs", lambda: {})
         monkeypatch.setattr(app, "_run", lambda *a, **k: R())
         seen = []
-        loader = app.UntrackedLoader()
+        loader = app.LibraryLoader()
         loader.progress.connect(lambda p, what: seen.append((p, what)))
-        loader.run()
+        loader._load_all()
         assert seen == [
-            (0, "Reading the package database…"),
-            (340, "Matching applications to packages…"),
-            (560, "Working out what needs what…"),
-            (850, "Naming the apps behind each dependency…"),
+            (0, "Reading the installed packages…"),
+            (349, "Working out what needs what…"),
+            (523, "Adding Flatpak apps and AppImages…"),
+            (555, "Matching applications to packages…"),
+            (714, "Naming the apps behind each dependency…"),
             (1000, "Naming the apps behind each dependency…")]
 
     def test_the_dependency_rows_fill_their_stage_row_by_row(self,
@@ -1159,34 +1148,52 @@ class TestLoadProgress:
         steps = app._LoadSteps(lambda p, what: seen.append(p))
         steps.plan([("Reading the dependency list…", 3), ("Rows…", 1)])
         steps.begin()
-        rows = app.UntrackedLoader()._load_deps({}, {}, steps)
+        rows = app.LibraryLoader()._load_deps({}, {}, steps)
         assert len(rows) == 400
         assert seen[0] == 0 and seen[-1] == 1000
         assert len(seen) > 10       # 400 rows fill it, they do not jump it
 
 
-class TestTrackedRequirers:
-    """Tracked rows say what would go with them, like stray dependencies.
+class TestLibraryRequirers:
+    """Library rows say what would go with them, like stray dependencies.
 
-    Both lists wear the same one-line requirer summary; on Tracked the
-    question is the other way round — what would come off with this
-    package — and the whole list opens in the panel under the list.
+    Every row wears the same one-line requirer summary; for your own
+    packages the question is the other way round — what would come off
+    with this package — and the whole list opens in the panel under the
+    list.
     """
 
-    def test_load_tracked_names_the_explicit_packages_that_need_each(
-            self, monkeypatch):
-        monkeypatch.setattr(app, "get_installed_packages", lambda: [
-            {"name": "bluez-libs", "version": "1-1", "repo": "official"},
-            {"name": "pipewire", "version": "2-1", "repo": "official"}])
+    def _loaded(self, monkeypatch, required_by):
+        """One whole Library read, with the machine's answers patched in."""
+        class R:
+            stdout = ""
+            returncode = 1
+
+        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
+        monkeypatch.setattr(app, "scan_desktop_files", lambda: [])
+        monkeypatch.setattr(app, "all_package_descs", lambda: {})
         monkeypatch.setattr(app, "flatpak_tracked_rows", lambda: [])
         monkeypatch.setattr(app, "appimage_rows", lambda: [])
-        monkeypatch.setattr(app, "required_by_map", lambda: {
+        monkeypatch.setattr(app, "required_by_map", lambda: required_by)
+        monkeypatch.setattr(app, "_run", lambda *a, **k: R())
+        got = []
+        loader = app.LibraryLoader()
+        loader.done.connect(got.append)
+        loader._load_all()
+        return {r["name"]: r for r in got[0]}
+
+    def test_the_library_names_the_explicit_packages_that_need_each(
+            self, monkeypatch):
+        monkeypatch.setattr(app, "get_installed_packages",
+                            lambda repos=None: [
+            {"name": "bluez-libs", "version": "1-1", "repo": "official"},
+            {"name": "pipewire", "version": "2-1", "repo": "official"}])
+        monkeypatch.setattr(app, "_explicit_package_set",
+                            lambda: {"plasma-desktop", "pipewire"})
+        rows = self._loaded(monkeypatch, {
             "bluez-libs": ["kdeconnect"],
             "kdeconnect": ["plasma-desktop"],
             "pipewire": []})
-        monkeypatch.setattr(app, "_explicit_package_set",
-                            lambda: {"plasma-desktop", "pipewire"})
-        rows = {r["name"]: r for r in app.load_tracked()}
         # The walk climbs to the package the user installed, not the
         # library in between.
         assert rows["bluez-libs"]["needs"] == ["plasma-desktop"]
@@ -1196,14 +1203,12 @@ class TestTrackedRequirers:
         assert rows["pipewire"]["needs_known"] is True
 
     def test_without_requirer_data_the_rows_claim_nothing(self, monkeypatch):
-        monkeypatch.setattr(app, "get_installed_packages", lambda: [
+        monkeypatch.setattr(app, "get_installed_packages",
+                            lambda repos=None: [
             {"name": "pipewire", "version": "1-1", "repo": "official"}])
-        monkeypatch.setattr(app, "flatpak_tracked_rows", lambda: [])
-        monkeypatch.setattr(app, "appimage_rows", lambda: [])
-        monkeypatch.setattr(app, "required_by_map", lambda: {})
-        rows = app.load_tracked()
-        assert "needs" not in rows[0]
-        assert "needs_known" not in rows[0]
+        rows = self._loaded(monkeypatch, {})
+        assert rows["pipewire"]["needs"] == []
+        assert rows["pipewire"]["needs_known"] is False
 
 
 class TestDesktopLaunch:

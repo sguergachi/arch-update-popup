@@ -317,13 +317,15 @@ class TestThemeHelpers:
 class TestTrackedModel:
     def _model(self):
         m = app.TrackedModel()
-        m.set_packages(
-            [{"name": "b-aur", "version": "1-1", "repo": "aur"},
-             {"name": "a-off", "version": "2-1", "repo": "official"},
-             {"name": "c-aur", "version": "3-1", "repo": "aur"}])
+        # The loader sorts and builds complete rows; the model keeps
+        # exactly that order (see set_items).
+        m.set_items([
+            app._tracked_row("a-off", "2-1", "official"),
+            app._tracked_row("b-aur", "1-1", "aur"),
+            app._tracked_row("c-aur", "3-1", "aur")])
         return m
 
-    def test_sorted_by_the_name_on_screen(self):
+    def test_rows_keep_the_order_the_loader_built(self):
         m = self._model()
         assert m.rowCount() == 3
         assert [m.item(r)["name"] for r in range(3)] == \
@@ -347,9 +349,10 @@ class TestTrackedModel:
 @pytest.fixture()
 def tracked_view(qapp):
     m = app.TrackedModel()
-    m.set_packages(
-        [{"name": "b-aur", "version": "1-1", "repo": "aur"},
-         {"name": "a-off", "version": "2-1", "repo": "official"}])
+    m.set_items([
+        app._tracked_row("a-off", "2-1", "official"),
+        app._tracked_row("b-aur", "1-1", "aur",
+                         desktop="/x/b-aur.desktop")])
     v = QListView()
     v.resize(900, 400)
     v.setModel(m)
@@ -412,9 +415,8 @@ class TestTrackedDelegate:
 
     def test_remove_row(self):
         m = app.TrackedModel()
-        m.set_packages(
-            [{"name": "a", "version": "1", "repo": "aur"},
-             {"name": "b", "version": "1", "repo": "official"}])
+        m.set_items([app._tracked_row("a", "1", "aur"),
+                     app._tracked_row("b", "1", "official")])
         assert m.rowCount() == 2
         m.remove_row("a")
         assert m.rowCount() == 1 and m.item(0)["name"] == "b"
@@ -458,38 +460,12 @@ class TestTrackedDelegate:
         p.end()
         qapp.processEvents()
 
-    def test_pick_desktop_file(self, tmp_path):
-        exact = tmp_path / "foo.desktop"
-        exact.write_text("[Desktop Entry]\nName=Foo\nExec=foo\n")
-        hidden = tmp_path / "zzz.desktop"
-        hidden.write_text("[Desktop Entry]\nName=Z\nNoDisplay=true\nExec=z\n")
-        paths = [str(hidden), str(exact)]
-        assert app.pick_desktop_file("foo", paths) == str(exact)
-        assert app.pick_desktop_file("other", paths) == str(exact)  # fallback
-        assert app.pick_desktop_file("zzz", [str(hidden)]) == ""
-        assert app.pick_desktop_file("foo", []) == ""
-        term = tmp_path / "term.desktop"
-        term.write_text("[Desktop Entry]\nName=T\nTerminal=true\nExec=t\n")
-        assert app.pick_desktop_file("term", [str(term)]) == ""
-
-    def test_set_desktop(self, tracked_view, qapp):
-        m = tracked_view.model()
-        assert m.item(0)["desktop"] is None
-        seen = []
-        m.dataChanged.connect(lambda *a: seen.append(a))
-        m.set_desktop("b-aur", "/x/b-aur.desktop")
-        assert m.item(m.row_of("b-aur"))["desktop"] == "/x/b-aur.desktop"
-        assert len(seen) == 1
-        m.set_desktop("nope", "/x.desktop")  # unknown: silent no-op
-        assert len(seen) == 1
-
     def test_open_pill_only_with_launcher(self, tracked_view):
         m = tracked_view.model()
         d = tracked_view.itemDelegate()
         opt, idx = _topt(tracked_view, 0)
         lay = d._geom(0, m.item(0), opt.rect.width())
         assert lay["open"].isNull()
-        m.set_desktop("b-aur", "/x/b-aur.desktop")
         row = m.row_of("b-aur")
         opt, idx = _topt(tracked_view, row)
         lay = d._geom(row, m.item(row), opt.rect.width())
@@ -504,7 +480,6 @@ class TestTrackedDelegate:
 
     def test_open_hit(self, tracked_view, qapp):
         m = tracked_view.model()
-        m.set_desktop("b-aur", "/x/b-aur.desktop")
         d = tracked_view.itemDelegate()
         row = m.row_of("b-aur")
         opt, idx = _topt(tracked_view, row)
@@ -532,18 +507,10 @@ class TestTrackedDelegate:
         # Version line: the installed version, nothing else.
         assert lay["ver_left"].startswith(
             tracked_view.model().item(0)["version"])
-        # Descriptions land via set_desc with a single-row repaint.
-        m = tracked_view.model()
-        seen = []
-        m.dataChanged.connect(lambda *a: seen.append(a))
-        m.set_desc("a-off", "Terminal emulator")
-        assert m.item(m.row_of("a-off"))["desc"] == "Terminal emulator"
-        assert len(seen) == 1
 
     def test_pills_bottom_right(self, tracked_view):
         d = tracked_view.itemDelegate()
         m = tracked_view.model()
-        m.set_desktop("b-aur", "/x/b-aur.desktop")
         row = m.row_of("b-aur")
         opt, idx = _topt(tracked_view, row)
         lay = d._geom(row, m.item(row), opt.rect.width())
@@ -647,9 +614,15 @@ class TestUntrackedScan:
             "error: No package owns /opt/myapp/bin/x")
         assert owner is None
 
-    def test_loader_uses_partial_qo_output(self, qapp, monkeypatch):
+    def test_loader_uses_partial_qo_output(self, qapp, monkeypatch,
+                                           tmp_path):
         """pacman -Qo exits nonzero over unowned files but still prints
         the owned lines — the loader must use them, not discard."""
+        owned = tmp_path / "a.desktop"
+        owned.write_text("[Desktop Entry]\nName=A\nExec=a\n")
+        stray = tmp_path / "b.desktop"
+        stray.write_text("[Desktop Entry]\nName=B\nExec=b\n")
+
         class R:
             def __init__(self, rc, out):
                 self.returncode = rc
@@ -661,28 +634,22 @@ class TestUntrackedScan:
                             f"error: No package owns {cmd[3]}")
             if cmd[:2] == ["pacman", "-Qo"]:
                 return R(1, "error: No package owns x")
-            if cmd == ["pacman", "-Q"]:
-                return R(0, "foo 1-1\n")
-            if cmd == ["pacman", "-Qm"]:
-                return R(0, "")
-            if cmd == ["pacman", "-Qd"]:
-                return R(0, "dep 2-1\n")
             return R(1, "")
 
         monkeypatch.setattr(app, "_run", fake_run)
         monkeypatch.setattr(app, "scan_desktop_files", lambda: [
-            {"file": "/a.desktop", "title": "A", "comment": "",
+            {"file": str(owned), "title": "A", "comment": "",
              "exec": "a"},
-            {"file": "/b.desktop", "title": "B", "comment": "",
+            {"file": str(stray), "title": "B", "comment": "",
              "exec": "b"}])
-        got = []
-        loader = app.UntrackedLoader()
-        loader.done.connect(lambda a, p: got.append((a, p)))
-        loader.run()
-        apps, pkgs = got[0]
-        assert [(r["title"], r["name"], r["version"]) for r in apps] == [
-            ("A", "foo", "1-1"), ("B", "b", "")]
-        assert [(r["name"], r["version"]) for r in pkgs] == [("dep", "2-1")]
+        launchers, rows, titles = app.LibraryLoader()._load_apps()
+        # The owned launcher belongs to foo's row now.
+        assert launchers["foo"]["title"] == "A"
+        assert launchers["foo"]["desktop"] == str(owned)
+        assert titles == {"foo": "A"}
+        # The unowned one is a row of its own (nothing can remove it).
+        assert [(r["title"], r["name"], r["kind"], r["repo"])
+                for r in rows] == [("B", "b", "app", app.SRC_MANUAL)]
 
     def test_a_batch_that_answered_is_never_asked_again_file_by_file(
             self, qapp, monkeypatch):
@@ -710,15 +677,18 @@ class TestUntrackedScan:
              "exec": "owned"},
             {"file": "/u/stray.desktop", "title": "Stray", "comment": "",
              "exec": "stray"}])
-        app.UntrackedLoader()._load_apps({}, app._LoadSteps())
+        app.LibraryLoader()._load_apps()
         asked = [c for c in calls if c[:2] == ["pacman", "-Qo"]]
         assert asked == [["pacman", "-Qo", "/u/owned.desktop",
                           "/u/stray.desktop"]]
 
     def test_a_batch_that_could_not_run_falls_back_file_by_file(
-            self, qapp, monkeypatch):
+            self, qapp, monkeypatch, tmp_path):
         """A refused command line (too many launchers, say) is the one case
         the per-file query still answers: the batch never spoke."""
+        desk = tmp_path / "zen.desktop"
+        desk.write_text("[Desktop Entry]\nName=Zen\nExec=/usr/bin/zen %U\n"
+                        "Type=Application\n")
 
         class R:
             def __init__(self, rc, out):
@@ -733,15 +703,15 @@ class TestUntrackedScan:
             return R(1, "")
 
         monkeypatch.setattr(app, "_run", fake_run)
-        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
         monkeypatch.setattr(app, "scan_desktop_files", lambda: [
-            {"file": "/u/zen.desktop", "title": "Zen", "comment": "",
+            {"file": str(desk), "title": "Zen", "comment": "",
              "exec": "zen"}])
-        rows, _titles = app.UntrackedLoader()._load_apps({},
-                                                         app._LoadSteps())
-        assert [(r["name"], r["version"]) for r in rows] == [("foo", "1-1")]
+        launchers, rows, titles = app.LibraryLoader()._load_apps()
+        assert titles == {"foo": "Zen"}
+        assert launchers["foo"]["desktop"] == str(desk)
+        assert rows == []      # nothing unowned: no stray rows
 
-    def test_loader_dedupes_same_app(self, qapp, monkeypatch):
+    def test_loader_dedupes_same_app(self, qapp, monkeypatch, tmp_path):
         class R:
             def __init__(self, rc, out):
                 self.returncode = rc
@@ -751,27 +721,25 @@ class TestUntrackedScan:
             if cmd[:2] == ["pacman", "-Qo"]:
                 return R(0, "\n".join(
                     f"{f} is owned by foo 1-1" for f in cmd[2:]))
-            if cmd == ["pacman", "-Q"]:
-                return R(0, "foo 1-1\n")
-            if cmd == ["pacman", "-Qm"]:
-                return R(0, "")
-            if cmd == ["pacman", "-Qd"]:
-                return R(0, "")
             return R(1, "")
 
         monkeypatch.setattr(app, "_run", fake_run)
-        # System + user copy of the same app: one row.
+        # System + user copy of the same app: one launcher for the
+        # package (the first in scan order wins).
+        user = tmp_path / "app.desktop"
+        user.write_text("[Desktop Entry]\nName=App\nExec=app\n")
+        sysd = tmp_path / "sys" / "app.desktop"
+        sysd.parent.mkdir()
+        sysd.write_text("[Desktop Entry]\nName=App\nExec=app\n")
         monkeypatch.setattr(app, "scan_desktop_files", lambda: [
-            {"file": "/u/app.desktop", "title": "App", "comment": "",
+            {"file": str(user), "title": "App", "comment": "",
              "exec": "app"},
-            {"file": "/s/app.desktop", "title": "App", "comment": "",
+            {"file": str(sysd), "title": "App", "comment": "",
              "exec": "app"}])
-        got = []
-        loader = app.UntrackedLoader()
-        loader.done.connect(lambda a, p: got.append((a, p)))
-        loader.run()
-        assert len(got[0][0]) == 1
-        assert got[0][0][0]["name"] == "foo"
+        launchers, rows, titles = app.LibraryLoader()._load_apps()
+        assert list(launchers) == ["foo"]
+        assert launchers["foo"]["desktop"] == str(user)
+        assert rows == []
 
     def test_tracked_row_complete(self):
         row = app._tracked_row("p", "1-1", "official", title="T")
@@ -808,31 +776,12 @@ class _R:
         self.returncode = returncode
 
 
-class TestEnrichMaps:
-    """Launchers and descriptions for the whole list, in two calls.
+class TestDescriptionMap:
+    """Descriptions for the whole list, in one call.
 
     Asking pacman once per package took ~65 s for a tracked list, and a
-    row had no launcher (no Open pill) until its turn came — which reads
-    as "I can't open that app".
+    row had no description until its turn came.
     """
-
-    def test_launchers_come_from_one_call(self, monkeypatch):
-        calls = []
-        out = ("1password|opt/1Password/1password\x1f"
-               "usr/share/applications/1password.desktop\x1f"
-               "usr/share/doc/1password/README\n"
-               "zsh|usr/share/zsh/functions/README\n")
-        monkeypatch.setattr(app.shutil, "which", lambda n: "/usr/bin/expac")
-        monkeypatch.setattr(
-            app, "_run",
-            lambda cmd, **kw: (calls.append(cmd), _R(out))[1])
-
-        got = app.all_package_launchers()
-
-        # Only .desktop files, with the leading slash pacman -Ql gives.
-        assert got == {"1password": ["/usr/share/applications/"
-                                     "1password.desktop"]}
-        assert calls == [["expac", "-Q", "-l", "\x1f", "%n|%F"]]
 
     def test_descriptions_skip_the_null_placeholder(self, monkeypatch):
         out = "1password|Password manager and secure wallet\n" \
@@ -850,7 +799,6 @@ class TestEnrichMaps:
         monkeypatch.setattr(app, "_run",
                             lambda *a, **k: pytest.fail("ran a query"))
 
-        assert app.all_package_launchers() == {}
         assert app.all_package_descs() == {}
 
     def test_a_failed_query_is_no_map(self, monkeypatch):
@@ -858,86 +806,7 @@ class TestEnrichMaps:
         monkeypatch.setattr(app, "_run",
                             lambda cmd, **kw: _R("", returncode=1))
 
-        assert app.all_package_launchers() == {}
         assert app.all_package_descs() == {}
-
-
-class TestTrackedEnricher:
-    """Rows get their launcher and description from those two maps."""
-
-    @pytest.fixture()
-    def desk(self, tmp_path):
-        f = tmp_path / "zen.desktop"
-        f.write_text("[Desktop Entry]\nName=Zen\nExec=/usr/bin/zen %U\n"
-                     "Type=Application\n")
-        return f
-
-    def test_a_row_is_one_lookup(self, qapp, monkeypatch, desk):
-        monkeypatch.setattr(app, "all_package_launchers",
-                            lambda: {"zen": [str(desk)]})
-        monkeypatch.setattr(app, "all_package_descs",
-                            lambda: {"zen": "A browser"})
-        monkeypatch.setattr(app, "_run",
-                            lambda *a, **k: pytest.fail("asked pacman"))
-        enr = app.TrackedEnricher(["zen", "linux"])
-        got = {"found": [], "titled": [], "described": []}
-        enr.found.connect(lambda n, d: got["found"].append((n, d)))
-        enr.titled.connect(lambda n, t: got["titled"].append((n, t)))
-        enr.described.connect(lambda n, d: got["described"].append((n, d)))
-
-        enr._enrich()
-
-        assert got["found"] == [("zen", str(desk))]
-        assert got["titled"] == [("zen", "Zen")]
-        # "linux" ships nothing: no launcher, no description, no pill.
-        assert got["described"] == [("zen", "A browser")]
-
-    def test_without_a_map_each_row_asks_pacman(self, qapp, monkeypatch):
-        asked = []
-        monkeypatch.setattr(app, "all_package_launchers", lambda: {})
-        monkeypatch.setattr(app, "all_package_descs", lambda: {})
-        monkeypatch.setattr(
-            app.TrackedEnricher, "_resolve_desktop",
-            staticmethod(lambda n: asked.append(n) or ""))
-        monkeypatch.setattr(app.TrackedEnricher, "_resolve_desc",
-                            staticmethod(lambda n: ""))
-
-        app.TrackedEnricher(["linux"])._enrich()
-
-        assert asked == ["linux"]
-
-    def test_flatpak_rows_are_resolved_first(self, qapp, monkeypatch):
-        order = []
-        monkeypatch.setattr(app, "all_package_launchers", lambda: {})
-        monkeypatch.setattr(app, "all_package_descs", lambda: {})
-        monkeypatch.setattr(
-            app.TrackedEnricher, "_flatpak_desktop",
-            staticmethod(lambda n: order.append(n) or ""))
-        monkeypatch.setattr(app.TrackedEnricher, "_flatpak_desc",
-                            staticmethod(lambda n: ""))
-        monkeypatch.setattr(
-            app.TrackedEnricher, "_desktop_for",
-            lambda self, n, l: order.append(n) or "")
-
-        app.TrackedEnricher(["aaa", "org.x.App", "zzz"],
-                            flatpak={"org.x.App"})._enrich()
-
-        assert order == ["org.x.App", "aaa", "zzz"]
-
-    def test_an_interrupted_pass_emits_nothing(self, qapp, monkeypatch):
-        monkeypatch.setattr(app, "all_package_launchers",
-                            lambda: {"zen": ["/x/zen.desktop"]})
-        monkeypatch.setattr(app, "all_package_descs", lambda: {})
-        monkeypatch.setattr(app.TrackedEnricher, "_resolve_desc",
-                            staticmethod(lambda n: "d"))
-        enr = app.TrackedEnricher(["zen"])
-        monkeypatch.setattr(enr, "isInterruptionRequested", lambda: True)
-        got = []
-        enr.described.connect(lambda n, d: got.append((n, d)))
-
-        enr._enrich()
-
-        assert got == []
 
 
 class TestRequirerLine:

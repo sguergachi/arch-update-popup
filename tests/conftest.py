@@ -41,7 +41,7 @@ def _no_obsolete(self):
     self.done.emit([])
 
 
-def _no_tracked(self):
+def _no_library(self):
     self.done.emit([])
 
 
@@ -60,8 +60,7 @@ def _quiet(self):
 _EMPTY_THREAD_RUNS = {
     "UpdateChecker": _no_updates,
     "ObsoleteChecker": _no_obsolete,
-    "TrackedLoader": _no_tracked,
-    "TrackedEnricher": _quiet,
+    "LibraryLoader": _no_library,
     "InfoFetcher": _quiet,
     "SystemScanner": _no_scan,
     "UpdateRunner": _no_install,

@@ -151,8 +151,7 @@ class TestWindow:
         assert window._update_btn.isEnabled()  # 3 of 3 checkable selected
 
     def test_tab_texts_and_counts(self, window, qapp):
-        # Tabs left to right: Updates | Tracked | Untracked | Obsolete |
-        # Security.
+        # Tabs left to right: Updates | Library | Obsolete | Security.
         assert not hasattr(window, "_search")
         # The obsolete preload may land before or after this test; drive
         # it so the tab text is deterministic.
@@ -160,14 +159,13 @@ class TestWindow:
         qapp.processEvents()
         tabs = window._view_buttons
         assert [b.text() for b in
-                (tabs["updates"], tabs["tracked"], tabs["untracked"],
-                 tabs["obsolete"], tabs["security"])] == [
-            "Updates (4)", "Tracked (0)", "Untracked (0)", "Obsolete (0)",
-            "Security"]
+                (tabs["updates"], tabs["library"], tabs["obsolete"],
+                 tabs["security"])] == [
+            "Updates (4)", "Library (0)", "Obsolete (0)", "Security"]
         assert tabs["updates"].isChecked()
         head = window.centralWidget().layout().itemAt(0).layout()
         order = [head.indexOf(tabs[k]) for k in
-                 ("updates", "tracked", "untracked", "obsolete", "security")]
+                 ("updates", "library", "obsolete", "security")]
         assert order == sorted(order)
         assert head.indexOf(window._log_btn) > order[-1]
 
@@ -182,35 +180,35 @@ class TestWindow:
         # A list reading itself says so at the top left — while you are
         # looking at it, which is where the page's own loading line used
         # to sit. The box inside the frame says it too.
-        window._switch_view("tracked")
-        window._track_loaded = False
-        window._track_loading = True
-        window._refresh_tracked_summary()
-        assert "Reading the installed package list" in window._sub.text()
+        window._switch_view("library")
+        window._lib_loaded = False
+        window._lib_loading = True
+        window._refresh_library_summary()
+        assert "Reading the installed packages" in window._sub.text()
         # Leaving the page hands the line back to the resting summary…
         window._switch_view("updates")
-        assert "Reading the installed package list" not in window._sub.text()
+        assert "Reading the installed packages" not in window._sub.text()
         # …and coming back shows it again, until the load is done.
-        window._switch_view("tracked")
-        assert "Reading the installed package list" in window._sub.text()
-        window._track_loading = False
-        window._track_loaded = True
-        window._refresh_tracked_summary()
-        assert "Reading the installed package list" not in window._sub.text()
+        window._switch_view("library")
+        assert "Reading the installed packages" in window._sub.text()
+        window._lib_loading = False
+        window._lib_loaded = True
+        window._refresh_library_summary()
+        assert "Reading the installed packages" not in window._sub.text()
 
     def test_a_load_never_steals_the_line_from_a_job(self, window, qapp):
         # Background reads are quiet: a check or install owns the line,
         # and a load ending must not wipe that message either.
-        window._switch_view("tracked")
+        window._switch_view("library")
         window._set_status("Installing <b>konsole</b> — 50%", "info")
-        window._track_loaded = False
-        window._track_loading = True
-        window._refresh_tracked_summary()
+        window._lib_loaded = False
+        window._lib_loading = True
+        window._refresh_library_summary()
         assert "Installing" in window._sub.text()
         assert "Reading" not in window._sub.text()
-        window._track_loading = False
-        window._track_loaded = True
-        window._refresh_tracked_summary()
+        window._lib_loading = False
+        window._lib_loaded = True
+        window._refresh_library_summary()
         assert "Installing" in window._sub.text()
         # The job is what ends it, and then the resting text is back.
         window._set_status("")
@@ -331,7 +329,7 @@ class TestWindow:
         assert window._recheck_btn.isEnabled()
 
     def test_tab_switch_still_works(self, window, qapp):
-        window._switch_view("tracked")
+        window._switch_view("library")
         assert window._content_stack.currentIndex() == 1
         assert window._rechecker is None  # no check on plain navigation
         window._switch_view("updates")  # coming back: plain switch, no check
@@ -635,8 +633,8 @@ class TestWindow:
         assert window._update_btn in registered
         assert window._log_btn in registered
         assert window._sec_scan_btn in registered
-        for btn in (window._recheck_btn, window._track_refresh_btn,
-                    window._un_refresh_btn, window._obs_refresh_btn):
+        for btn in (window._recheck_btn, window._lib_refresh_btn,
+                    window._lib_refresh_btn, window._obs_refresh_btn):
             assert btn in registered
         assert len(registered) == len(window._theme_icons)
         # Prime the Updates delegate cache under the light theme.
@@ -685,13 +683,12 @@ class TestWindow:
         content = lay.itemAt(2).layout()  # head, divider, content row
         left = content.itemAt(0).layout()
         # view switcher + content stack + footer stack
-        assert window._content_stack.count() == 5
-        assert window._footer_stack.count() == 5
+        assert window._content_stack.count() == 4
+        assert window._footer_stack.count() == 4
         assert window._content_stack.currentIndex() == 0
         assert window._footer_stack.currentIndex() == 0
         tabs = window._view_buttons
-        assert set(tabs) == {"updates", "obsolete", "security", "tracked",
-                             "untracked"}
+        assert set(tabs) == {"updates", "obsolete", "security", "library"}
         assert tabs["updates"].isChecked()
         # the slim progress track lives in the header, under the status line
         assert window._progress.parent() is not None
@@ -709,8 +706,7 @@ class TestWindow:
         assert window._copy_btn.isHidden()  # no failure yet
         # log toggle shares the header row with the view tabs
         head = lay.itemAt(0).layout()
-        for key in ("updates", "tracked", "untracked", "obsolete",
-                    "security"):
+        for key in ("updates", "library", "obsolete", "security"):
             assert head.indexOf(window._view_buttons[key]) >= 0
         assert head.indexOf(window._log_btn) >= 0
         # The control row reads: filter field, the page's cards, Select all.
@@ -978,15 +974,15 @@ class TestViews:
     def test_switch_views(self, window, qapp):
         window._switch_view("obsolete")
         qapp.processEvents()
-        assert window._content_stack.currentIndex() == 3
-        assert window._footer_stack.currentIndex() == 3
+        assert window._content_stack.currentIndex() == 2
+        assert window._footer_stack.currentIndex() == 2
         assert window._view_buttons["obsolete"].isChecked()
         window._switch_view("security")
-        assert window._content_stack.currentIndex() == 4
-        window._switch_view("tracked")
+        assert window._content_stack.currentIndex() == 3
+        window._switch_view("library")
         assert window._content_stack.currentIndex() == 1
         assert window._footer_stack.currentIndex() == 1
-        assert window._view_buttons["tracked"].isChecked()
+        assert window._view_buttons["library"].isChecked()
         window._switch_view("updates")
         assert window._content_stack.currentIndex() == 0
 
@@ -1125,7 +1121,7 @@ class TestViews:
         # process ("QThread: Destroyed while thread is still running").
         # _release_thread must park it instead.
         import time as _t
-        self._settle_track_loader(window, qapp)  # real loaders done first
+        _settle_loaders(window, qapp)  # real loaders done first
         b, stop = self._busy_thread()
         b.start()
         for _ in range(100):
@@ -1150,7 +1146,7 @@ class TestViews:
         # A loader that exits shortly after close starts: close must
         # wait it out cleanly (no abort, no park needed).
         import time as _t
-        self._settle_track_loader(window, qapp)  # real loaders done first
+        _settle_loaders(window, qapp)  # real loaders done first
         b, stop = self._busy_thread()
         b.start()
         for _ in range(100):
@@ -1191,26 +1187,18 @@ class TestViews:
         def exec(self): return None
         def clickedButton(self): return self._accept
 
-    def _settle_track_loader(self, window, qapp):
-        if window._obs_checker is not None:
-            window._obs_checker.wait(25000)
-        qapp.processEvents()  # flush obs done (chains the tracked loader)
-        loader = window._track_loader
-        if loader is not None:
-            loader.wait(25000)
-        qapp.processEvents()  # flush tracked done
-
-    def test_tracked_loads_and_badges(self, window, qapp):
-        self._settle_track_loader(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "b-aur", "version": "1-1", "repo": "aur"},
-             {"name": "a-off", "version": "2-1", "repo": "official"}])
+    def test_library_loads_and_badges(self, window, qapp):
+        _settle_loaders(window, qapp)
+        window._on_library_loaded([
+            app._tracked_row("b-aur", "1-1", "aur"),
+            app._tracked_row("a-off", "2-1", "official")])
         qapp.processEvents()
-        assert window._track_model.rowCount() == 2
-        # Alphabetical by the name on screen.
-        assert window._track_model.item(0)["name"] == "a-off"
-        assert window._view_buttons["tracked"].text() == "Tracked (2)"
-        window._switch_view("tracked")
+        assert window._lib_model.rowCount() == 2
+        # The model keeps the order the loader built (it sorts, see
+        # LibraryLoader.run) — it never reorders what the user reads.
+        assert window._lib_model.item(0)["name"] == "b-aur"
+        assert window._view_buttons["library"].text() == "Library (2)"
+        window._switch_view("library")
         assert window._content_stack.currentIndex() == 1
         assert window._footer_stack.currentIndex() == 1
 
@@ -1240,10 +1228,25 @@ class TestViews:
         assert window._dismiss_btn.isHidden()
         assert window._details.toPlainText() == ""
 
-    def _stage_tracked(self, window, qapp):
-        self._settle_track_loader(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "del-me", "version": "1-1", "repo": "aur"}])
+    def _stage_one_package(self, window, qapp):
+        """Settle the real load, then stage one package to remove."""
+        _settle_loaders(window, qapp)
+        window._on_library_loaded(
+            [app._tracked_row("del-me", "1-1", "aur")])
+        qapp.processEvents()
+
+    def _stage_mixed(self, window, qapp):
+        """The Library's three shapes: a package you asked for, one that
+        came along with it, and a launcher no package owns."""
+        _settle_loaders(window, qapp)
+        window._on_library_loaded([
+            app._tracked_row("firefox", "1.0-1", "official",
+                             title="Firefox", desktop="/u/firefox.desktop",
+                             desc="Web browser"),
+            app._tracked_row("libfoo", "2-1", "official",
+                             kind="dependency"),
+            app._tracked_row("zen", "", app.SRC_MANUAL, title="Zen",
+                             desktop="/u/zen.desktop", kind="app")])
         qapp.processEvents()
 
     def test_tracked_uninstall_success(self, window, qapp, monkeypatch):
@@ -1257,13 +1260,13 @@ class TestViews:
             returncode = 1  # pacman -Q: package gone
 
         monkeypatch.setattr(sp, "run", lambda *a, **k: R())
-        self._stage_tracked(window, qapp)
-        window._request_track_uninstall("del-me")
-        assert isinstance(window._track_uninstaller, FakeRunner)
-        assert window._track_model.item(0)["state"] == "uninstalling"
-        window._track_uninstaller.done.emit(True, "")
+        self._stage_one_package(window, qapp)
+        window._request_library_uninstall("del-me")
+        assert isinstance(window._lib_uninstaller, FakeRunner)
+        assert window._lib_model.item(0)["state"] == "uninstalling"
+        window._lib_uninstaller.done.emit(True, "")
         qapp.processEvents()
-        assert window._track_model.row_of("del-me") is None
+        assert window._lib_model.row_of("del-me") is None
         assert "uninstalled" in window._sub.text()
 
     def test_tracked_uninstall_failure(self, window, qapp, monkeypatch):
@@ -1271,103 +1274,83 @@ class TestViews:
         monkeypatch.setattr(app, "ObsoleteRemover", FakeRunner)
         monkeypatch.setattr(app, "find_blocked_obsolete_packages",
                             lambda pkgs: [])
-        self._stage_tracked(window, qapp)
-        window._request_track_uninstall("del-me")
-        window._track_uninstaller.done.emit(False, "boom")
+        self._stage_one_package(window, qapp)
+        window._request_library_uninstall("del-me")
+        window._lib_uninstaller.done.emit(False, "boom")
         qapp.processEvents()
-        assert window._track_model.item(0)["state"] == "failed"
-        assert window._track_model.item(0)["failed_op"] == "uninstall"
+        assert window._lib_model.item(0)["state"] == "failed"
+        assert window._lib_model.item(0)["failed_op"] == "uninstall"
         assert "Removing del-me failed" in window._sub.text()
 
     def test_tracked_uninstall_cancel(self, window, qapp, monkeypatch):
         monkeypatch.setattr(app.QMessageBox, "exec", lambda self: None)
         monkeypatch.setattr(app.QMessageBox, "clickedButton", lambda self: None)
-        self._stage_tracked(window, qapp)
-        window._request_track_uninstall("del-me")  # confirm dismissed
-        assert window._track_uninstaller is None
-        assert window._track_model.item(0)["state"] == "idle"
+        self._stage_one_package(window, qapp)
+        window._request_library_uninstall("del-me")  # confirm dismissed
+        assert window._lib_uninstaller is None
+        assert window._lib_model.item(0)["state"] == "idle"
 
     def test_tracked_uninstall_busy(self, window, qapp):
-        self._settle_track_loader(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "del-me", "version": "1-1", "repo": "aur"}])
-        window._track_uninstaller = FakeRunner()
-        window._request_track_uninstall("del-me")
+        _settle_loaders(window, qapp)
+        window._on_library_loaded([app._tracked_row("del-me", "1-1", "aur")])
+        window._lib_uninstaller = FakeRunner()
+        window._request_library_uninstall("del-me")
         assert "already running" in window._sub.text()
-        window._track_uninstaller = None
+        window._lib_uninstaller = None
 
-    def _stage_untracked(self, window, qapp):
-        apps = [app._tracked_row("firefox", "1.0-1", "official",
-                                 title="Firefox", desktop="/u/firefox.desktop",
-                                 desc="Web browser", kind="app")]
-        pkgs = [app._tracked_row("libfoo", "2-1", "official",
-                                 kind="dependency")]
-        window._on_untracked_loaded(apps, pkgs)
-        qapp.processEvents()
-        return apps, pkgs
-
-    def test_untracked_tab_index_and_lazy_load(
-            self, window, qapp, monkeypatch):
-        assert window._untracked_loaded is False
-        assert window._untracked_loader is None
-        started = []
-        orig = app.UntrackedLoader
-
-        class SpyLoader(orig):
-            def start(self):
-                started.append(True)
-                super().start()
-
-        monkeypatch.setattr(app, "UntrackedLoader", SpyLoader)
-        window._switch_view("untracked")
-        assert window._content_stack.currentIndex() == 2
-        assert window._footer_stack.currentIndex() == 2
-        assert window._view_buttons["untracked"].isChecked()
-        assert started == [True]
-        assert window._untracked_loader is not None
-        # Second visit does not re-scan.
+    def test_library_tab_index_and_single_load(self, window, qapp):
+        # The page sits right after Updates, and its first read starts
+        # on its own (chained after the obsolete preload) — coming back
+        # to the tab must not read the machine again.
+        assert window._content_stack.indexOf(window._lib_page) == 1
+        assert window._footer_stack.indexOf(window._foot_library) == 1
+        window._switch_view("library")
+        assert window._controls.cells.currentIndex() == 1
+        assert window._view_buttons["library"].isChecked()
+        _settle_loaders(window, qapp)
+        assert window._lib_loaded is True
         window._switch_view("updates")
-        window._switch_view("untracked")
-        assert started == [True]
-        # Settle the real loader so it never outlives teardown (a live
-        # QThread at process exit aborts).
-        loader = window._untracked_loader
-        if loader is not None:
-            loader.wait(30000)
-        qapp.processEvents()
+        window._switch_view("library")
+        # A finished read leaves no loader behind, and coming back to
+        # the page starts nothing new: _lib_loaded is the gate.
+        assert window._lib_loaded is True
+        assert window._lib_loader is None
 
-    def test_untracked_loads_and_badges(self, window, qapp):
-        self._stage_untracked(window, qapp)
-        assert window._untracked_loaded is True
-        assert window._un_model.rowCount() == 2   # one app + one package
-        assert window._view_buttons["untracked"].text() == "Untracked (2)"
+    def test_library_holds_your_software_and_dependencies(
+            self, window, qapp):
+        self._stage_mixed(window, qapp)
+        assert window._lib_loaded is True
+        assert window._lib_model.rowCount() == 3
+        assert window._view_buttons["library"].text() == "Library (3)"
         # The strip carries the numbers; the page has no summary line.
-        assert window._stat_un_apps._value.text() == "1"
-        assert window._un_stat_cards["dependencies"]._value.text() == "1"
-        # App row shows the title; ops use the package name.
-        d = window._un_view.itemDelegate()
+        assert window._lib_stat_cards[app.LIB_YOURS]._value.text() == "2"
+        assert window._lib_stat_cards[app.LIB_DEPS]._value.text() == "1"
+        # A row shows the title it was given; ops use the package name.
+        d = window._lib_view.itemDelegate()
         from PyQt6.QtWidgets import QStyleOptionViewItem as _Opt
-        idx = window._un_model.index(0)
+        idx = window._lib_model.index(0)
         opt = _Opt()
-        opt.rect = window._un_view.visualRect(idx)
-        opt.palette = window._un_view.palette()
-        opt.font = window._un_view.font()
-        lay = d._geom(0, window._un_model.item(0), opt.rect.width())
+        opt.rect = window._lib_view.visualRect(idx)
+        opt.palette = window._lib_view.palette()
+        opt.font = window._lib_view.font()
+        lay = d._geom(0, window._lib_model.item(0), opt.rect.width())
         assert lay["title"] == "Firefox"
 
-    def test_untracked_batch_footer(self, window, qapp):
-        self._stage_untracked(window, qapp)
-        assert window._un_uninstall_btn.text() == "Uninstall selected"
-        assert not window._un_uninstall_btn.isEnabled()
-        window._un_model.set_all(True)
-        window._refresh_untracked_footer()
+    def test_library_batch_footer(self, window, qapp):
+        self._stage_mixed(window, qapp)
+        assert window._lib_uninstall_btn.text() == "Uninstall selected"
+        assert not window._lib_uninstall_btn.isEnabled()
+        window._lib_model.set_all(True)
+        window._refresh_library_footer()
         qapp.processEvents()
-        # One list now: the app and the dependency package are both here.
-        assert window._un_uninstall_btn.text() == "Uninstall 2 selected"
-        assert window._un_uninstall_btn.isEnabled()
-        assert "All 2" in window._un_footer_label.text()
+        # One list: your software, the dependency, the hand-made
+        # launcher — all three tick and remove from the same footer.
+        assert window._lib_uninstall_btn.text() == "Uninstall 3 selected"
+        assert window._lib_uninstall_btn.isEnabled()
+        assert "All 3" in window._lib_footer_label.text()
 
-    def test_untracked_uninstall_success(self, window, qapp, monkeypatch):
+    def test_library_uninstall_leaves_other_rows_alone(
+            self, window, qapp, monkeypatch):
         monkeypatch.setattr(app, "QMessageBox", self._AcceptBox)
         monkeypatch.setattr(app, "ObsoleteRemover", FakeRunner)
         monkeypatch.setattr(app, "find_blocked_obsolete_packages",
@@ -1378,50 +1361,53 @@ class TestViews:
             returncode = 1  # pacman -Q: package gone
 
         monkeypatch.setattr(sp, "run", lambda *a, **k: R())
-        self._stage_untracked(window, qapp)
-        window._request_untracked_uninstall("libfoo")
-        assert isinstance(window._untracked_uninstaller, FakeRunner)
-        row = window._un_model.row_of("libfoo")
-        assert window._un_model.item(row)["state"] == "uninstalling"
-        window._untracked_uninstaller.done.emit(True, "")
+        self._stage_mixed(window, qapp)
+        window._request_library_uninstall("libfoo")
+        assert isinstance(window._lib_uninstaller, FakeRunner)
+        row = window._lib_model.row_of("libfoo")
+        assert window._lib_model.item(row)["state"] == "uninstalling"
+        window._lib_uninstaller.done.emit(True, "")
         qapp.processEvents()
-        assert window._un_model.row_of("libfoo") is None
-        assert window._un_model.row_of("firefox") is not None  # untouched
+        assert window._lib_model.row_of("libfoo") is None
+        assert window._lib_model.row_of("firefox") is not None  # untouched
+        assert window._lib_model.row_of("zen") is not None      # untouched
         assert "uninstalled" in window._sub.text()
 
-    def test_untracked_unowned_app_skipped(self, window, qapp, monkeypatch):
+    def test_launcher_no_package_owns_is_never_removed(
+            self, window, qapp, monkeypatch):
         monkeypatch.setattr(app, "QMessageBox", self._AcceptBox)
         monkeypatch.setattr(app, "ObsoleteRemover", FakeRunner)
-        window._on_untracked_loaded(
-            [app._tracked_row("mystuff", "", "", title="My Stuff")], [])
+        _settle_loaders(window, qapp)
+        window._on_library_loaded(
+            [app._tracked_row("mystuff", "", app.SRC_MANUAL,
+                              title="My Stuff", kind="app")])
         qapp.processEvents()
-        window._request_untracked_uninstall("mystuff")
-        assert window._untracked_uninstaller is None  # nothing to remove
+        window._request_library_uninstall("mystuff")
+        assert window._lib_uninstaller is None  # nothing to remove
         assert "isn't owned by any package" in window._sub.text()
 
     def test_tracked_multiselect_footer_morphs(self, window, qapp):
-        self._settle_track_loader(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "a", "version": "1", "repo": "aur"},
-             {"name": "b", "version": "1", "repo": "extra"}])
+        _settle_loaders(window, qapp)
+        window._on_library_loaded([app._tracked_row("a", "1", "aur"),
+                                   app._tracked_row("b", "1", "extra")])
         qapp.processEvents()
         # Nothing checked: the button says what it is and is off.
-        assert window._track_uninstall_btn.text() == "Uninstall selected"
-        assert not window._track_uninstall_btn.isEnabled()
+        assert window._lib_uninstall_btn.text() == "Uninstall selected"
+        assert not window._lib_uninstall_btn.isEnabled()
         # Check rows → the button names the action it will take.
-        window._track_model.set_all(True)
-        window._refresh_tracked_footer()
+        window._lib_model.set_all(True)
+        window._refresh_library_footer()
         qapp.processEvents()
-        assert window._track_uninstall_btn.text() == "Uninstall 2 selected"
-        assert window._track_uninstall_btn.isEnabled()
+        assert window._lib_uninstall_btn.text() == "Uninstall 2 selected"
+        assert window._lib_uninstall_btn.isEnabled()
         # The control row carries the selection state: ticked when
         # everything in view is selected; the footer says it in words.
         assert window._controls.check.checkState() == \
             Qt.CheckState.Checked
-        assert "All 2 packages selected" in window._track_footer_label.text()
-        window._select_tracked_all(False)
-        assert window._track_uninstall_btn.text() == "Uninstall selected"
-        assert not window._track_uninstall_btn.isEnabled()
+        assert "All 2 packages selected" in window._lib_footer_label.text()
+        window._select_library_all(False)
+        assert window._lib_uninstall_btn.text() == "Uninstall selected"
+        assert not window._lib_uninstall_btn.isEnabled()
 
     def test_tracked_batch_uninstall_success(self, window, qapp, monkeypatch):
         monkeypatch.setattr(app, "QMessageBox", self._AcceptBox)
@@ -1434,19 +1420,18 @@ class TestViews:
             returncode = 1  # pacman -Q: package gone
 
         monkeypatch.setattr(sp, "run", lambda *a, **k: R())
-        self._settle_track_loader(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "a", "version": "1", "repo": "aur"},
-             {"name": "b", "version": "1", "repo": "extra"}])
-        window._track_model.set_all(True)
-        window._refresh_tracked_footer()
-        assert window._track_uninstall_btn.text() == "Uninstall 2 selected"
-        window._track_uninstall_btn.click()
-        assert isinstance(window._track_uninstaller, FakeRunner)
-        assert window._track_uninstall_names == ["a", "b"]
-        window._track_uninstaller.done.emit(True, "")
+        _settle_loaders(window, qapp)
+        window._on_library_loaded([app._tracked_row("a", "1", "aur"),
+                                   app._tracked_row("b", "1", "extra")])
+        window._lib_model.set_all(True)
+        window._refresh_library_footer()
+        assert window._lib_uninstall_btn.text() == "Uninstall 2 selected"
+        window._lib_uninstall_btn.click()
+        assert isinstance(window._lib_uninstaller, FakeRunner)
+        assert window._lib_uninstall_names == ["a", "b"]
+        window._lib_uninstaller.done.emit(True, "")
         qapp.processEvents()
-        assert window._track_model.rowCount() == 0
+        assert window._lib_model.rowCount() == 0
         assert "uninstalled" in window._sub.text()
 
     def test_tracked_uninstall_cancel_aborts_cleanly(
@@ -1455,11 +1440,11 @@ class TestViews:
         monkeypatch.setattr(app, "ObsoleteRemover", FakeRunner)
         monkeypatch.setattr(app, "find_blocked_obsolete_packages",
                             lambda pkgs: [])
-        self._stage_tracked(window, qapp)
-        window._request_track_uninstall("del-me")
-        window._track_uninstaller.done.emit(False, "Request dismissed")
+        self._stage_one_package(window, qapp)
+        window._request_library_uninstall("del-me")
+        window._lib_uninstaller.done.emit(False, "Request dismissed")
         qapp.processEvents()
-        assert window._track_model.item(0)["state"] == "idle"
+        assert window._lib_model.item(0)["state"] == "idle"
         assert "dismissed" in window._sub.text().lower()
 
     def test_obsolete_removal_cancel_aborts_cleanly(self, window, qapp):
@@ -1583,17 +1568,12 @@ class TestFailureDialog:
         monkeypatch.setattr(app, "find_blocked_obsolete_packages",
                             lambda pkgs: [])
         self._stage = None
-        if window._obs_checker is not None:
-            window._obs_checker.wait(25000)
+        _settle_loaders(window, qapp)
+        window._on_library_loaded(
+            [app._tracked_row("perplexity", "1.6.0-1", "aur")])
         qapp.processEvents()
-        if window._track_loader is not None:
-            window._track_loader.wait(25000)
-        qapp.processEvents()
-        window._on_tracked_loaded(
-            [{"name": "perplexity", "version": "1.6.0-1", "repo": "aur"}])
-        qapp.processEvents()
-        window._request_track_uninstall("perplexity")
-        window._track_uninstaller.done.emit(
+        window._request_library_uninstall("perplexity")
+        window._lib_uninstaller.done.emit(
             False, "perplexity: cannot remove — file conflict")
         qapp.processEvents()
         assert shown, "no dialog for a failed removal"
@@ -1819,20 +1799,20 @@ class TestCardListRemeasure:
         assert new_w in {key[1] for key in d._geo}
         assert not window._list.horizontalScrollBar().isVisible()
 
-    def test_tracked_list_remeasures(self, window, qapp):
+    def test_library_list_remeasures(self, window, qapp):
         window.resize(1280, 800)
         qapp.processEvents()
-        window._switch_view("tracked")
+        window._switch_view("library")
         qapp.processEvents()
         # One real row so sizeHint is exercised, then narrow via log panel.
-        window._un_model.set_items([
+        window._lib_model.set_items([
             app._tracked_row("zed", "1.0-1", "aur")])
         window._log_btn.setChecked(True)
         qapp.processEvents()
-        new_w = window._track_list.viewport().width()
-        d = window._track_list.itemDelegate()
+        new_w = window._lib_view.viewport().width()
+        d = window._lib_view.itemDelegate()
         assert d is not window._list.itemDelegate()
-        idx = window._un_model.index(0)
+        idx = window._lib_model.index(0)
         if idx.isValid():
             from PyQt6.QtWidgets import QStyleOptionViewItem
             from PyQt6.QtCore import QRect
@@ -1840,7 +1820,7 @@ class TestCardListRemeasure:
             opt.rect = QRect(0, 0, 1000, 100)
             hint = d.sizeHint(opt, idx)
             assert hint.width() == new_w
-        assert not window._track_list.horizontalScrollBar().isVisible()
+        assert not window._lib_view.horizontalScrollBar().isVisible()
 
 
 class TestPlaceholdersEverywhere:
@@ -1860,30 +1840,30 @@ class TestPlaceholdersEverywhere:
         window._on_obs_preload_done([])
         assert window._obs_empty.title.text() == "Nothing to clean up"
 
-    def test_tracked_says_it_is_loading_before_data_arrives(self, qapp):
+    def test_library_says_it_is_loading_before_data_arrives(self, qapp):
         w = app.UpdateWindow([], {}, None)
         w.resize(1280, 800)
         w.show()
         qapp.processEvents()
         # Not hidden (the page itself is off-screen, hence isHidden()).
-        assert not w._track_empty.isHidden()
-        w._track_loaded = False
-        w._refresh_tracked_summary()
-        assert w._track_empty.title.text() == "Loading…"
-        w._on_tracked_loaded([])
+        assert not w._lib_empty.isHidden()
+        w._lib_loaded = False
+        w._lib_loading = True
+        w._refresh_library_summary()
+        assert w._lib_empty.title.text() == "Loading…"
+        w._on_library_loaded([])
         qapp.processEvents()
-        assert w._track_empty.title.text() == "Nothing tracked"
+        assert w._lib_empty.title.text() == "Nothing installed"
         w.close()
 
-    def test_untracked_says_it_is_scanning_on_first_open(self, qapp):
+    def test_library_says_it_is_reading_on_first_open(self, qapp):
         w = app.UpdateWindow([], {}, None)
         w.resize(1280, 800)
         w.show()
         qapp.processEvents()
-        w._switch_view("untracked")
+        w._switch_view("library")
         qapp.processEvents()
-        for holder in (w._un_empty,):
-            assert not holder.isHidden()   # never a blank box
+        assert not w._lib_empty.isHidden()   # never a blank box
         w.close()
 
     def test_security_explains_itself_before_the_first_scan(self, window,
@@ -1979,8 +1959,7 @@ class TestControlRowAndFilter:
     def test_switcher_stays_put_across_pages(self, window, qapp):
         """The tabs are in the window header: pages cannot move them."""
         before = {k: b.geometry() for k, b in window._view_buttons.items()}
-        for key in ("tracked", "untracked", "obsolete", "security",
-                    "updates"):
+        for key in ("library", "obsolete", "security", "updates"):
             window._switch_view(key)
             qapp.processEvents()
             assert {k: b.geometry()
@@ -1991,12 +1970,12 @@ class TestControlRowAndFilter:
         """The field leads the row on every page that has one, and the
         row steps aside on the two pages that have nothing to filter."""
         places = []
-        for key in ("updates", "tracked", "untracked"):
+        for key in ("updates", "library"):
             window._switch_view(key)
             qapp.processEvents()
             assert window._controls.isVisible()
             places.append(window._controls.search.geometry())
-        assert places[0] == places[1] == places[2]
+        assert places[0] == places[1]
         for key in ("obsolete", "security"):
             window._switch_view(key)
             qapp.processEvents()
@@ -2006,54 +1985,53 @@ class TestControlRowAndFilter:
         window._switch_view("updates")
         qapp.processEvents()
 
-    def test_untracked_search_filters_that_page(self, window, qapp):
-        """The one filter field serves the Untracked list too."""
+    def test_library_search_filters_the_list(self, window, qapp):
+        """The one filter field serves the merged Library list."""
         if window._obs_checker is not None:
             window._obs_checker.wait(25000)
         qapp.processEvents()
-        if window._track_loader is not None:
-            window._track_loader.wait(25000)
+        if window._lib_loader is not None:
+            window._lib_loader.wait(25000)
         qapp.processEvents()
-        window._on_untracked_loaded(
-            [app._tracked_row("firefox", "1.0-1", "official",
-                              title="Firefox", desc="Web browser",
-                              kind="app"),
-             app._tracked_row("libfoo", "2-1", "official",
-                              kind="dependency")], [])
-        window._switch_view("untracked")
+        window._on_library_loaded([
+            app._tracked_row("firefox", "1.0-1", "official",
+                             title="Firefox", desc="Web browser"),
+            app._tracked_row("libfoo", "2-1", "official",
+                             kind="dependency")])
+        window._switch_view("library")
         qapp.processEvents()
         window._controls.search.setText("firefox")
         qapp.processEvents()
-        assert window._un_model.rowCount() == 1
-        assert window._un_model.item(0)["name"] == "firefox"
+        assert window._lib_model.rowCount() == 1
+        assert window._lib_model.item(0)["name"] == "firefox"
         # Nothing ticked: the footer says so, next to the list's total.
-        assert window._un_footer_label.text() == \
-            "1 untracked · No packages selected"
+        assert window._lib_footer_label.text() == \
+            "1 installed · No packages selected"
         # A filter that hides everything says so, instead of claiming the
-        # machine has nothing pacman misses.
+        # machine has nothing installed.
         window._controls.search.setText("nothing-matches")
         qapp.processEvents()
-        assert window._un_model.rowCount() == 0
-        assert window._un_empty.title.text() == "No matches"
+        assert window._lib_model.rowCount() == 0
+        assert window._lib_empty.title.text() == "No matches"
         window._controls.search.clear()
         qapp.processEvents()
         window._switch_view("updates")
 
-    def test_tracked_empty_filter_says_no_matches(self, window, qapp):
+    def test_library_empty_filter_says_no_matches(self, window, qapp):
         if window._obs_checker is not None:
             window._obs_checker.wait(25000)
         qapp.processEvents()
-        if window._track_loader is not None:
-            window._track_loader.wait(25000)
+        if window._lib_loader is not None:
+            window._lib_loader.wait(25000)
         qapp.processEvents()
-        window._on_tracked_loaded(
-            [{"name": "hyprland", "version": "1", "repo": "aur"}])
-        window._switch_view("tracked")
+        window._on_library_loaded(
+            [app._tracked_row("hyprland", "1", "aur")])
+        window._switch_view("library")
         qapp.processEvents()
         window._controls.search.setText("nothing-matches")
         qapp.processEvents()
-        assert window._track_model.rowCount() == 0
-        assert window._track_empty.title.text() == "No matches"
+        assert window._lib_model.rowCount() == 0
+        assert window._lib_empty.title.text() == "No matches"
         window._controls.search.clear()
         qapp.processEvents()
         window._switch_view("updates")
@@ -2154,40 +2132,40 @@ class TestControlRowAndFilter:
         assert window._model._items[2]["desc"] == "desc for evil"
 
     def test_every_view_footer_refreshes(self, window, qapp):
-        for btn in (window._recheck_btn, window._track_refresh_btn,
-                    window._un_refresh_btn, window._obs_refresh_btn):
+        for btn in (window._recheck_btn, window._lib_refresh_btn,
+                    window._obs_refresh_btn):
             assert btn.text() == "Refresh"
         # Security's scan is its refresh: one button, no duplicate.
         assert window._sec_scan_btn.text() == "Run scan"
         assert not hasattr(window, "_sec_close_btn")
 
-    def test_tracked_filter(self, window, qapp):
+    def test_library_filter(self, window, qapp):
         # Flush the window's own (stubbed) load chain first: it would
         # otherwise deliver an empty list over the rows staged here.
         if window._obs_checker is not None:
             window._obs_checker.wait(25000)
         qapp.processEvents()
-        if window._track_loader is not None:
-            window._track_loader.wait(25000)
+        if window._lib_loader is not None:
+            window._lib_loader.wait(25000)
         qapp.processEvents()
-        window._on_tracked_loaded(
-            [{"name": "hyprland", "version": "1", "repo": "aur"},
-             {"name": "firefox", "version": "2", "repo": "official"}])
+        window._on_library_loaded([
+            app._tracked_row("hyprland", "1", "aur"),
+            app._tracked_row("firefox", "2", "official")])
         qapp.processEvents()
-        # One filter field, five pages: it filters whichever page is up.
-        window._switch_view("tracked")
+        # One filter field, four pages: it filters whichever page is up.
+        window._switch_view("library")
         qapp.processEvents()
         window._controls.search.setText("hypr")
         qapp.processEvents()
-        assert window._track_model.rowCount() == 1
-        assert window._track_model.item(0)["name"] == "hyprland"
+        assert window._lib_model.rowCount() == 1
+        assert window._lib_model.item(0)["name"] == "hyprland"
         window._controls.search.clear()
         qapp.processEvents()
-        assert window._track_model.rowCount() == 2
+        assert window._lib_model.rowCount() == 2
 
     def test_no_close_buttons_anywhere(self, window):
         for name in ("_skip_btn", "_obs_close_btn", "_sec_close_btn",
-                     "_track_close_btn", "_un_close_btn"):
+                     "_lib_close_btn"):
             assert not hasattr(window, name), name
 
 
@@ -2204,15 +2182,16 @@ class TestRequirerPanel:
     LONG_NEEDS = [f"Application {i:02d}" for i in range(1, 26)]
 
     def _stage_deps(self, window, qapp):
-        """Two stray dependencies: one with a list far too long for a row,
-        one that everything fits into."""
+        """Two dependency packages: one with a list far too long for a
+        row, one that everything fits into."""
+        _settle_loaders(window, qapp)
         rows = [
             app._tracked_row("libfoo", "2-1", "official", kind="dependency",
                              needs=list(self.LONG_NEEDS)),
             app._tracked_row("libbar", "3-1", "official", kind="dependency",
                              needs=["Firefox"]),
         ]
-        window._on_untracked_loaded([], rows)
+        window._on_library_loaded(rows)
         qapp.processEvents()
         return rows
 
@@ -2228,10 +2207,10 @@ class TestRequirerPanel:
     def test_show_more_opens_the_whole_list_under_the_list(
             self, window, qapp):
         self._stage_deps(window, qapp)
-        d = window._un_delegate
+        d = window._lib_delegate
         before = window._content_stack.geometry()
         footer = window._footer_stack.geometry()
-        d.toggle_detail(window._un_model.row_of("libfoo"))
+        d.toggle_detail(window._lib_model.row_of("libfoo"))
         qapp.processEvents()
         panel = window._detail_panel
         assert panel.isVisible()
@@ -2248,7 +2227,7 @@ class TestRequirerPanel:
 
     def test_the_row_keeps_its_height_and_its_place(self, window, qapp):
         self._stage_deps(window, qapp)
-        d, m, view = (window._un_delegate, window._un_model, window._un_view)
+        d, m, view = (window._lib_delegate, window._lib_model, window._lib_view)
         row = m.row_of("libfoo")
         from PyQt6.QtWidgets import QStyleOptionViewItem
         opt = QStyleOptionViewItem()
@@ -2268,18 +2247,18 @@ class TestRequirerPanel:
     def test_hide_gives_the_list_its_height_back(self, window, qapp):
         self._stage_deps(window, qapp)
         before = window._content_stack.geometry()
-        window._un_delegate.toggle_detail(window._un_model.row_of("libfoo"))
+        window._lib_delegate.toggle_detail(window._lib_model.row_of("libfoo"))
         qapp.processEvents()
         assert window._detail_panel.isVisible()
         window._detail_panel._hide_btn.click()
         qapp.processEvents()
         assert not window._detail_panel.isVisible()
-        assert window._un_delegate._detail_name == ""
+        assert window._lib_delegate._detail_name == ""
         assert window._content_stack.geometry() == before
 
     def test_leaving_the_page_closes_the_panel(self, window, qapp):
         self._stage_deps(window, qapp)
-        d, m = window._un_delegate, window._un_model
+        d, m = window._lib_delegate, window._lib_model
         d.toggle_detail(m.row_of("libfoo"))
         qapp.processEvents()
         window._switch_view("obsolete")
@@ -2290,14 +2269,14 @@ class TestRequirerPanel:
         from PyQt6.QtWidgets import QStyleOptionViewItem
         row = m.row_of("libfoo")
         opt = QStyleOptionViewItem()
-        opt.rect = window._un_view.visualRect(m.index(row))
+        opt.rect = window._lib_view.visualRect(m.index(row))
         lay = d._geom(row, m.item(row), opt.rect.width())
         assert lay["req_more_txt"] == "Show more"
 
     def test_the_strip_is_the_same_size_whatever_the_answer(
             self, window, qapp):
         self._stage_deps(window, qapp)
-        d, m = window._un_delegate, window._un_model
+        d, m = window._lib_delegate, window._lib_model
         d.toggle_detail(m.row_of("libfoo"))     # twenty-five names
         qapp.processEvents()
         tall = (window._detail_panel.height(),
@@ -2308,27 +2287,27 @@ class TestRequirerPanel:
         assert (window._detail_panel.height(),
                 window._content_stack.geometry()) == tall
 
-    def test_a_tracked_row_opens_the_same_panel(self, window, qapp):
+    def test_a_library_row_opens_the_same_panel(self, window, qapp):
         if window._obs_checker is not None:
             window._obs_checker.wait(25000)
         qapp.processEvents()
-        loader = window._track_loader
+        loader = window._lib_loader
         if loader is not None:
             loader.wait(25000)
         qapp.processEvents()
-        window._switch_view("tracked")
+        window._switch_view("library")
         qapp.processEvents()
-        window._on_tracked_loaded([
-            {"name": "bluez-libs", "version": "1-1", "repo": "official",
-             "needs": list(self.LONG_NEEDS), "needs_known": True},
-            {"name": "pipewire", "version": "2-1", "repo": "official"}])
+        window._on_library_loaded([
+            app._tracked_row("bluez-libs", "1-1", "official",
+                             needs=list(self.LONG_NEEDS)),
+            app._tracked_row("pipewire", "2-1", "official")])
         qapp.processEvents()
-        d = window._track_delegate
-        m = window._track_model
+        d = window._lib_delegate
+        m = window._lib_model
         row = m.row_of("bluez-libs")
         from PyQt6.QtWidgets import QStyleOptionViewItem
         opt = QStyleOptionViewItem()
-        opt.rect = window._track_list.visualRect(m.index(row))
+        opt.rect = window._lib_view.visualRect(m.index(row))
         lay = d._geom(row, m.item(row), opt.rect.width())
         # The same relation, from the side of a package you installed.
         assert lay["req_label_txt"] == "\u21b3 NEEDED BY:"
@@ -2340,7 +2319,7 @@ class TestRequirerPanel:
         assert window._detail_panel._name.text() == "bluez-libs"
         # A package nothing needs claims nothing: no line, no control.
         row = m.row_of("pipewire")
-        opt.rect = window._track_list.visualRect(m.index(row))
+        opt.rect = window._lib_view.visualRect(m.index(row))
         lay = d._geom(row, m.item(row), opt.rect.width())
         assert lay["req_label_txt"] == "" and lay["req_names_txt"] == ""
 
@@ -2394,8 +2373,8 @@ class TestLoadProgressBar:
     """A list load fills the header track — one owner at a time."""
 
     def test_the_visible_pages_load_fills_the_track(self, window):
-        window._switch_view("tracked")
-        window._on_load_progress("tracked", 450,
+        window._switch_view("library")
+        window._on_load_progress("library", 450,
                                  "Working out what needs what…")
         assert window._progress.maximum() == 1000
         assert window._progress.value() == 450
@@ -2403,28 +2382,28 @@ class TestLoadProgressBar:
         assert "Working out what needs what… · 45%" in window._sub.text()
 
     def test_a_load_on_another_page_waits_its_turn(self, window, qapp):
-        # Updates is on screen: the scan's progress is kept, not painted.
+        # Updates is on screen: the read's progress is kept, not painted.
         before = (window._progress.minimum(), window._progress.maximum(),
                   window._progress.value())
-        window._on_load_progress("untracked", 340,
-                                 "Reading the package database…")
+        window._on_load_progress("library", 340,
+                                 "Reading the installed packages…")
         assert (window._progress.minimum(), window._progress.maximum(),
                 window._progress.value()) == before
-        assert "Reading the package database" not in window._sub.text()
-        window._untracked_loaded = True     # no lazy scan on the way in
-        window._switch_view("untracked")
+        assert "Reading the installed packages" not in window._sub.text()
+        window._lib_loaded = True     # no lazy read on the way in
+        window._switch_view("library")
         assert window._progress.maximum() == 1000
         assert window._progress.value() == 340
-        assert "Reading the package database… · 34%" in window._sub.text()
+        assert "Reading the installed packages… · 34%" in window._sub.text()
 
     def test_a_job_keeps_the_track_and_hands_it_back(self, window):
-        window._switch_view("tracked")
-        window._on_load_progress("tracked", 340,
+        window._switch_view("library")
+        window._on_load_progress("library", 340,
                                  "Reading the installed packages…")
         window._set_status("Installing 2 packages…", "info")
         window._progress.setRange(0, 2)
         window._progress.setValue(1)
-        window._on_load_progress("tracked", 600,
+        window._on_load_progress("library", 600,
                                  "Working out what needs what…")
         assert window._progress.maximum() == 2     # the job's bar, untouched
         assert window._progress.value() == 1
@@ -2435,18 +2414,18 @@ class TestLoadProgressBar:
         assert window._progress.value() == 600
 
     def test_the_load_ending_gives_the_track_back(self, window):
-        window._switch_view("tracked")
-        window._on_load_progress("tracked", 950,
+        window._switch_view("library")
+        window._on_load_progress("library", 950,
                                  "Adding Flatpak apps and AppImages…")
-        window._clear_load_track("tracked")
+        window._clear_load_track("library")
         assert window._progress.maximum() == 1
         assert window._progress.value() == 0
         assert window._progress.property("state") == "idle"
         assert "Adding Flatpak" not in window._sub.text()
 
     def test_release_notes_leave_a_loads_bar_alone(self, window):
-        window._switch_view("tracked")
-        window._on_load_progress("tracked", 600,
+        window._switch_view("library")
+        window._on_load_progress("library", 600,
                                  "Working out what needs what…")
         window.on_info_ready(0, "d", "n", "2026-01-01")
         assert window._progress.maximum() == 1000
@@ -2457,10 +2436,10 @@ class TestLoadProgressBar:
 
     def test_a_thread_that_dies_without_reporting_frees_the_track(
             self, window):
-        loader = app.TrackedLoader()
-        window._track_loader = loader
-        window._wire_load("tracked", loader)
-        window._switch_view("tracked")
+        loader = app.LibraryLoader()
+        window._lib_loader = loader
+        window._wire_load("library", loader)
+        window._switch_view("library")
         loader.progress.emit(400, "Working out what needs what…")
         assert window._progress.value() == 400
         loader.finished.emit()          # ended without ever reaching 1000
@@ -2468,11 +2447,11 @@ class TestLoadProgressBar:
         assert window._progress.value() == 0
 
     def test_a_stale_loaders_finish_leaves_the_new_one_alone(self, window):
-        old, new = app.TrackedLoader(), app.TrackedLoader()
-        window._track_loader = new
-        window._wire_load("tracked", old)
-        window._switch_view("tracked")
-        window._on_load_progress("tracked", 300,
+        old, new = app.LibraryLoader(), app.LibraryLoader()
+        window._lib_loader = new
+        window._wire_load("library", old)
+        window._switch_view("library")
+        window._on_load_progress("library", 300,
                                  "Reading the installed packages…")
         old.finished.emit()             # the page already moved on to `new`
         assert window._progress.maximum() == 1000
@@ -2771,7 +2750,7 @@ class FakeRemover(QObject):
 
 @pytest.fixture()
 def busy_window(qapp, monkeypatch):
-    """A window with one tracked package, no real removals."""
+    """A window with one Library package, no real removals."""
     FakeRemover.started = []
     monkeypatch.setattr(app, "_notify_update", lambda *a, **k: 0)
     monkeypatch.setattr(app, "_notify_close", lambda *a, **k: None)
@@ -2780,8 +2759,11 @@ def busy_window(qapp, monkeypatch):
     w = app.UpdateWindow(_updates(), {}, None)
     w.resize(1280, 800)
     w.show()
-    w._on_tracked_loaded([{"name": "konsole", "version": "25.08.1-1",
-                           "repo": "official"}])
+    # Let the window's own (stubbed) load chain finish first: it would
+    # otherwise deliver an empty list over the row staged here.
+    _settle_loaders(w, qapp)
+    w._on_library_loaded([app._tracked_row("konsole", "25.08.1-1",
+                                           "official")])
     qapp.processEvents()
     yield w
     w.close()
@@ -2811,10 +2793,10 @@ class TestRemovalWhileBusy:
         _accept_box(monkeypatch, "Remove when it finishes")
         w._updating = True
 
-        w._start_track_uninstall(["konsole"])
+        w._start_library_uninstall(["konsole"])
 
         assert FakeRemover.started == [], "a doomed removal was launched"
-        assert w._pending_removals == [("track", ["konsole"])]
+        assert w._pending_removals == [("library", ["konsole"])]
         assert "when the update finishes" in w._sub.text()
 
     def test_declining_the_queue_changes_nothing(self, busy_window,
@@ -2823,7 +2805,7 @@ class TestRemovalWhileBusy:
         _accept_box(monkeypatch, "Cancel")
         w._updating = True
 
-        w._start_track_uninstall(["konsole"])
+        w._start_library_uninstall(["konsole"])
 
         assert w._pending_removals == []
         assert FakeRemover.started == []
@@ -2833,7 +2815,7 @@ class TestRemovalWhileBusy:
         w = busy_window
         _accept_box(monkeypatch, "Remove when it finishes")
         w._updating = True
-        w._start_track_uninstall(["konsole"])
+        w._start_library_uninstall(["konsole"])
 
         w._updating = False
         w._drain_pending_removals()
@@ -2848,7 +2830,7 @@ class TestRemovalWhileBusy:
         _accept_box(monkeypatch)
         monkeypatch.setattr(app, "pacman_lock_held", lambda: True)
 
-        w._start_track_uninstall(["konsole"])
+        w._start_library_uninstall(["konsole"])
 
         assert FakeRemover.started == []
         assert w._pending_removals == []
@@ -2856,20 +2838,20 @@ class TestRemovalWhileBusy:
 
     def test_update_will_not_start_while_a_removal_runs(self, busy_window):
         w = busy_window
-        w._track_uninstaller = FakeRemover(["konsole"])
+        w._lib_uninstaller = FakeRemover(["konsole"])
         w._safe_names = ["konsole"]
         w.start_update()
         assert w._updating is False
         assert "removal is still running" in w._sub.text()
 
-    def test_close_stops_an_untracked_removal(self, busy_window):
-        # A live QThread destroyed by close is a hard abort — the untracked
-        # remover must be in the shutdown list like the others.
+    def test_close_stops_a_library_removal(self, busy_window):
+        # A live QThread destroyed by close is a hard abort — the
+        # library remover must be in the shutdown list like the others.
         w = busy_window
         remover = FakeRemover(["konsole"])
-        w._untracked_uninstaller = remover
+        w._lib_uninstaller = remover
         w._stop_runners()
-        assert w._untracked_uninstaller is None
+        assert w._lib_uninstaller is None
 
     def test_a_failed_update_still_runs_the_queued_removal(
             self, busy_window, monkeypatch):
@@ -2879,8 +2861,8 @@ class TestRemovalWhileBusy:
         _accept_box(monkeypatch, "Remove when it finishes")
         w._updating = True
         w._safe_names = ["konsole"]
-        w._start_track_uninstall(["konsole"])
-        assert w._pending_removals == [("track", ["konsole"])]
+        w._start_library_uninstall(["konsole"])
+        assert w._pending_removals == [("library", ["konsole"])]
 
         w._on_update_done(False, "error: boom")
 
@@ -2977,55 +2959,63 @@ class TestStatStripFilters:
         qapp.processEvents()
         assert window._model.filter_source() == ""
 
-    def test_tracked_strip_counts_and_filters(self, window, qapp):
+    def test_library_strip_counts_and_filters(self, window, qapp):
         _settle_loaders(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "konsole", "version": "1-1", "repo": "official"},
-             {"name": "aur-pkg", "version": "1-1", "repo": "aur"},
-             {"name": "cachy", "version": "1-1", "repo": "cachyos-v3"}])
+        window._on_library_loaded([
+            app._tracked_row("konsole", "1-1", "official"),
+            app._tracked_row("aur-pkg", "1-1", "aur"),
+            app._tracked_row("cachy", "1-1", "cachyos-v3"),
+            app._tracked_row("libfoo", "2-1", "official",
+                             kind="dependency")])
         qapp.processEvents()
-        cells = window._track_stat_cards
+        cells = window._lib_stat_cards
         assert {k: c._value.text() for k, c in cells.items()} == {
-            "": "3", "official": "1", "aur": "1", "managed": "1",
+            "yours": "3", "dependencies": "1", "official": "2", "aur": "1",
             "flatpak": "0", "appimage": "0"}
-        # The "everything" cell is a readout, not a filter: nothing is
-        # highlighted until a real filter is on.
+        # The two role cells cover every row: yours + deps = all (deps is the model key, DEPS the caption).
         assert not any(c.property("active") for c in cells.values())
-        cells["managed"].clicked.emit()
+        cells["aur"].clicked.emit()
         qapp.processEvents()
-        assert window._track_model.rowCount() == 1
-        assert window._track_model.item(0)["name"] == "cachy"
-        cells[""].clicked.emit()
-        qapp.processEvents()
-        assert window._track_model.rowCount() == 3
-
-    def test_untracked_strip_separates_apps_and_dependencies(
-            self, window, qapp):
-        _settle_loaders(window, qapp)
-        window._on_untracked_loaded(
-            [_row("zen", "Zen", "manual"), _row("whisper-flow", "WF",
-                                                "manual")],
-            [_row("libfoo", "libfoo", "official", kind="dependency")])
-        qapp.processEvents()
-        cells = window._un_stat_cards
-        assert {k: c._value.text() for k, c in cells.items()} == {
-            "": "3", "applications": "2", "dependencies": "1"}
+        assert window._lib_model.rowCount() == 1
+        assert window._lib_model.item(0)["name"] == "aur-pkg"
         cells["dependencies"].clicked.emit()
         qapp.processEvents()
-        assert window._un_model.rowCount() == 1
-        assert window._un_model.item(0)["name"] == "libfoo"
-        cells["applications"].clicked.emit()
+        assert window._lib_model.rowCount() == 1
+        assert window._lib_model.item(0)["name"] == "libfoo"
+        cells["dependencies"].clicked.emit()
         qapp.processEvents()
-        assert window._un_model.rowCount() == 2
-        assert window._un_model.row_of("libfoo") is None
-        cells["applications"].clicked.emit()
+        assert window._lib_model.rowCount() == 4
+
+    def test_library_strip_tells_yours_from_dependencies(
+            self, window, qapp):
+        _settle_loaders(window, qapp)
+        window._on_library_loaded([
+            app._tracked_row("zen", "1", app.SRC_MANUAL, title="Zen",
+                             kind="app"),
+            app._tracked_row("whisper-flow", "1", app.SRC_MANUAL,
+                             title="WF", kind="app"),
+            app._tracked_row("libfoo", "1", "official",
+                             kind="dependency")])
         qapp.processEvents()
-        assert window._un_model.rowCount() == 3
+        cells = window._lib_stat_cards
+        assert {k: c._value.text() for k, c in cells.items()} == {
+            "yours": "2", "dependencies": "1", "official": "1", "aur": "0",
+            "flatpak": "0", "appimage": "0"}
+        cells["dependencies"].clicked.emit()
+        qapp.processEvents()
+        assert window._lib_model.rowCount() == 1
+        assert window._lib_model.item(0)["name"] == "libfoo"
+        cells["yours"].clicked.emit()
+        qapp.processEvents()
+        assert window._lib_model.rowCount() == 2
+        assert window._lib_model.row_of("libfoo") is None
+        cells["yours"].clicked.emit()
+        qapp.processEvents()
+        assert window._lib_model.rowCount() == 3
 
     def test_every_strip_is_the_same_height(self, window, qapp):
         # Thin and uniform: the strips are one row of 38px cells.
-        for cards in (window._update_stat_cards, window._track_stat_cards,
-                      window._un_stat_cards):
+        for cards in (window._update_stat_cards, window._lib_stat_cards):
             heights = {c.height() for c in cards.values()}
             assert heights == {app._sp(38)}, heights
 
@@ -3043,19 +3033,45 @@ class TestStatStripFilters:
 def _settle_loaders(window, qapp):
     """Let the window's real background loaders finish first: their
     (empty) results arrive after a staged one and would replace it."""
-    for attr in ("_obs_checker", "_track_loader", "_untracked_loader"):
-        thread = getattr(window, attr, None)
-        if thread is not None:
-            thread.wait(25000)
-    qapp.processEvents()
-    qapp.processEvents()
+    obs = getattr(window, "_obs_checker", None)
+    if obs is not None:
+        obs.wait(25000)
+    qapp.processEvents()            # flush obs done: it chains the read
+    loader = getattr(window, "_lib_loader", None)
+    if loader is not None:
+        loader.wait(25000)
+    qapp.processEvents()            # flush the read's done
 
 
-def _row(name, title, repo, kind="app"):
-    return {"name": name, "title": title, "version": "1", "repo": repo,
-            "target": "", "source": "", "relation": "", "state": "idle",
-            "failed_op": "", "desktop": None, "desc": "", "checked": False,
-            "url": "", "path": "", "kind": kind}
+def _patch_library_read(monkeypatch):
+    """Quiet every machine call one whole Library read makes.
+
+    Call this first, then override whatever the test is about (patch
+    the function the loader calls, not the loader).
+    """
+    class _R:
+        stdout = ""
+        returncode = 1          # nothing to answer for
+
+    for name, value in (
+            ("_installed_repo_map", lambda: {}),
+            ("get_installed_packages", lambda repos=None: []),
+            ("required_by_map", lambda: {}),
+            ("_flatpak_apps", lambda: {}),
+            ("appimage_rows", lambda: []),
+            ("scan_desktop_files", lambda: []),
+            ("all_package_descs", lambda: {}),
+            ("_run", lambda *a, **k: _R())):
+        monkeypatch.setattr(app, name, value)
+
+
+def _library_rows():
+    """One whole Library read, as `done` would carry it to the window."""
+    got = []
+    loader = app.LibraryLoader()
+    loader.done.connect(got.append)
+    loader._load_all()
+    return got[0]
 
 
 class TestFlatpakRows:
@@ -3073,34 +3089,32 @@ class TestFlatpakRows:
         assert by_name["com.discordapp.Discord"]["version"] == "1.0.151"
         assert len(rows) == 2
 
-    def test_the_tracked_load_includes_flatpak(self, monkeypatch):
+    def test_the_library_load_includes_flatpak(self, monkeypatch):
+        _patch_library_read(monkeypatch)
         monkeypatch.setattr(app, "get_installed_packages",
-                            lambda: [{"name": "konsole", "version": "1-1",
-                                      "repo": "official"}])
-        monkeypatch.setattr(app, "appimage_rows", lambda: [])
+                            lambda repos=None: [
+            {"name": "konsole", "version": "1-1", "repo": "official"}])
         monkeypatch.setattr(app, "_flatpak_apps",
                             lambda: {"com.discordapp.Discord":
                                      ("1.0.151", "system")})
-        installed = app.load_tracked()
-        names = {r["name"] for r in installed}
+        names = {r["name"] for r in _library_rows()}
         assert names == {"konsole", "com.discordapp.Discord"}
 
     def test_a_broken_flatpak_call_still_lists_pacman_packages(
             self, monkeypatch):
+        _patch_library_read(monkeypatch)
         monkeypatch.setattr(app, "get_installed_packages",
-                            lambda: [{"name": "konsole", "version": "1-1",
-                                      "repo": "official"}])
-        monkeypatch.setattr(app, "appimage_rows", lambda: [])
+                            lambda repos=None: [
+            {"name": "konsole", "version": "1-1", "repo": "official"}])
 
         def boom():
             raise OSError("flatpak exploded")
 
         monkeypatch.setattr(app, "flatpak_tracked_rows", boom)
-        installed = app.load_tracked()
-        assert [r["name"] for r in installed] == ["konsole"]
+        assert [r["name"] for r in _library_rows()] == ["konsole"]
 
-    def test_untracked_leaves_flatpak_apps_to_tracked(self, monkeypatch,
-                                                      tmp_path):
+    def test_flatpak_launchers_never_become_manual_rows(self, monkeypatch,
+                                                        tmp_path):
         exports = tmp_path / "exports"
         apps = tmp_path / "applications"
         exports.mkdir()
@@ -3126,7 +3140,13 @@ class TestFlatpakRows:
                             lambda: {"com.discordapp.Discord":
                                      ("1.0.151", "system")})
         monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
-        rows, _titles = app.UntrackedLoader()._load_apps()
+
+        class _R:
+            stdout = ""
+            returncode = 1      # no pacman answers: zen stays ownerless
+
+        monkeypatch.setattr(app, "_run", lambda *a, **k: _R())
+        _launchers, rows, _titles = app.LibraryLoader()._load_apps()
         names = {r["name"] for r in rows}
         assert "com.discordapp.Discord" not in names
         assert "zen" in names
@@ -3143,15 +3163,13 @@ class TestFlatpakRows:
         monkeypatch.setattr(
             app, "_run",
             lambda *a, **k: (_ for _ in ()).throw(AssertionError("no pacman")))
-        desktop = app.TrackedEnricher._flatpak_desktop(
-            "com.discordapp.Discord")
+        desktop = app._flatpak_desktop("com.discordapp.Discord")
         assert desktop.endswith("com.discordapp.Discord.desktop")
         assert app._desktop_title(desktop) == "Discord"
-        assert app.TrackedEnricher._flatpak_desc(
-            "com.discordapp.Discord") == "Chat for gamers"
+        assert app._flatpak_desc("com.discordapp.Discord") == "Chat for gamers"
 
-    def test_uninstalling_a_tracked_flatpak_uses_flatpak(self, window, qapp,
-                                                        monkeypatch):
+    def test_uninstalling_a_flatpak_row_uses_flatpak(self, window, qapp,
+                                                     monkeypatch):
         started = []
 
         class FakeFlatpak(QObject):
@@ -3181,14 +3199,15 @@ class TestFlatpakRows:
                                      ("1.0.151", "system")})
         _accept_box(monkeypatch, "Remove")
         _settle_loaders(window, qapp)
-        window._on_untracked_loaded(
-            [_row("com.discordapp.Discord", "Discord", "flatpak")], [])
+        window._on_library_loaded(
+            [app._tracked_row("com.discordapp.Discord", "1.0.151",
+                              app.SRC_FLATPAK, title="Discord")])
         qapp.processEvents()
 
-        window._request_untracked_uninstall("com.discordapp.Discord")
+        window._request_library_uninstall("com.discordapp.Discord")
 
         assert started == [["com.discordapp.Discord"]]
-        assert window._un_kind == "flatpak"
+        assert window._lib_kind == "flatpak"
 
     def test_a_gone_flatpak_app_is_removed_from_the_list(self, window, qapp,
                                                          monkeypatch):
@@ -3215,13 +3234,14 @@ class TestFlatpakRows:
         monkeypatch.setattr(app, "_flatpak_apps", lambda: {})
         _accept_box(monkeypatch, "Remove")
         _settle_loaders(window, qapp)
-        window._on_untracked_loaded(
-            [_row("com.discordapp.Discord", "Discord", "flatpak")], [])
+        window._on_library_loaded(
+            [app._tracked_row("com.discordapp.Discord", "1.0.151",
+                              app.SRC_FLATPAK, title="Discord")])
         qapp.processEvents()
-        window._request_untracked_uninstall("com.discordapp.Discord")
-        window._untracked_uninstaller.done.emit(True, "uninstalled")
+        window._request_library_uninstall("com.discordapp.Discord")
+        window._lib_uninstaller.done.emit(True, "uninstalled")
 
-        assert window._un_model.row_of("com.discordapp.Discord") is None
+        assert window._lib_model.row_of("com.discordapp.Discord") is None
         assert "uninstalled" in window._sub.text()
 
 
@@ -3348,7 +3368,7 @@ class TestAppImageRows:
             'env "WINEPREFIX=/tmp/x" wine start %u') == ""
         assert app._appimage_in_exec("/usr/bin/zen %U") == ""
 
-    def test_untracked_leaves_appimage_launchers_to_tracked(
+    def test_appimage_launchers_never_become_manual_rows(
             self, monkeypatch, tmp_path):
         image = tmp_path / "Zen-1.0.AppImage"
         image.write_text("#!/bin/sh\n")
@@ -3361,7 +3381,13 @@ class TestAppImageRows:
                                  "title": "Other", "comment": "",
                                  "exec": "/usr/bin/other"}])
         monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
-        rows, _titles = app.UntrackedLoader()._load_apps()
+
+        class _R:
+            stdout = ""
+            returncode = 1      # no pacman answers: other stays ownerless
+
+        monkeypatch.setattr(app, "_run", lambda *a, **k: _R())
+        _launchers, rows, _titles = app.LibraryLoader()._load_apps()
         names = {r["name"] for r in rows}
         assert "zen" not in names
         assert "other" in names
@@ -3386,8 +3412,8 @@ class TestAppImageRows:
         assert not image.exists()
         assert not launcher.exists()
 
-    def test_a_tracked_appimage_uninstalls_as_a_file(self, window, qapp,
-                                                     monkeypatch):
+    def test_an_appimage_row_uninstalls_as_a_file(self, window, qapp,
+                                                  monkeypatch):
         started = []
 
         class FakeImages(QObject):
@@ -3415,17 +3441,17 @@ class TestAppImageRows:
                             lambda pkgs: [])
         _accept_box(monkeypatch, "Remove")
         _settle_loaders(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "Claude", "version": "", "repo": "appimage",
-              "title": "Claude", "path": "/home/s/Applications/Claude.AppImage",
-              "desktop": ""}])
+        window._on_library_loaded(
+            [app._tracked_row("Claude", "", app.SRC_APPIMAGE,
+                              title="Claude",
+                              path="/home/s/Applications/Claude.AppImage")])
         qapp.processEvents()
-        assert window._track_source("Claude") == "appimage"
+        assert window._lib_source("Claude") == "appimage"
 
-        window._request_track_uninstall("Claude")
+        window._request_library_uninstall("Claude")
 
         assert started == [["/home/s/Applications/Claude.AppImage"]]
-        assert window._track_kind == "appimage"
+        assert window._lib_kind == "appimage"
 
 
 class TestViewPackageLinks:
@@ -3433,14 +3459,14 @@ class TestViewPackageLinks:
     honest page for it."""
 
     def _link_rect(self, window, row):
-        d = window._track_list.itemDelegate()
-        return d._geom(row, window._track_model.item(row), 1240)["link"]
+        d = window._lib_view.itemDelegate()
+        return d._geom(row, window._lib_model.item(row), 1240)["link"]
 
     def test_a_flatpak_row_links_to_flathub(self, window, qapp, monkeypatch):
         _settle_loaders(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "com.discordapp.Discord", "version": "1",
-              "repo": "flatpak", "title": "Discord", "desktop": ""}])
+        window._on_library_loaded(
+            [app._tracked_row("com.discordapp.Discord", "1",
+                              app.SRC_FLATPAK, title="Discord")])
         qapp.processEvents()
         url = app._package_url("com.discordapp.Discord", "flatpak")
         assert url == "https://flathub.org/apps/com.discordapp.Discord"
@@ -3449,26 +3475,26 @@ class TestViewPackageLinks:
     def test_an_appimage_without_a_page_shows_no_link(self, window, qapp,
                                                       monkeypatch):
         _settle_loaders(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "Claude", "version": "", "repo": "appimage",
-              "title": "Claude", "path": "/x/Claude.AppImage"}])
+        window._on_library_loaded(
+            [app._tracked_row("Claude", "", app.SRC_APPIMAGE,
+                              title="Claude", path="/x/Claude.AppImage")])
         qapp.processEvents()
         assert self._link_rect(window, 0).isNull(), "link offered, no page"
 
     def test_an_appimage_with_a_page_shows_one(self, window, qapp,
                                               monkeypatch):
         _settle_loaders(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "Paper", "version": "0.1.10", "repo": "appimage",
-              "title": "Paper", "url": "https://paper.example/",
-              "path": "/x/Paper.AppImage"}])
+        window._on_library_loaded(
+            [app._tracked_row("Paper", "0.1.10", app.SRC_APPIMAGE,
+                              title="Paper", url="https://paper.example/",
+                              path="/x/Paper.AppImage")])
         qapp.processEvents()
         assert not self._link_rect(window, 0).isNull()
 
     def test_a_pacman_row_keeps_its_link(self, window, qapp, monkeypatch):
         _settle_loaders(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "konsole", "version": "1", "repo": "official"}])
+        window._on_library_loaded(
+            [app._tracked_row("konsole", "1", "official")])
         qapp.processEvents()
         assert not self._link_rect(window, 0).isNull()
 
@@ -3478,12 +3504,12 @@ class TestViewPackageLinks:
         monkeypatch.setattr(app.QDesktopServices, "openUrl",
                             lambda url: opened.append(url))
         _settle_loaders(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "Claude", "version": "", "repo": "appimage",
-              "title": "Claude", "path": "/x/Claude.AppImage"}])
+        window._on_library_loaded(
+            [app._tracked_row("Claude", "", app.SRC_APPIMAGE,
+                              title="Claude", path="/x/Claude.AppImage")])
         qapp.processEvents()
-        d = window._track_list.itemDelegate()
-        lay = d._geom(0, window._track_model.item(0), 1240)
+        d = window._lib_view.itemDelegate()
+        lay = d._geom(0, window._lib_model.item(0), 1240)
         assert lay["link"].isNull()
         assert opened == []
 
@@ -3493,11 +3519,12 @@ class TestOpeningFlatpakApps:
 
     def _stage(self, window, qapp, monkeypatch):
         _settle_loaders(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "com.discordapp.Discord", "version": "1",
-              "repo": "flatpak", "title": "Discord",
-              "desktop": "/var/lib/flatpak/exports/share/applications/"
-                         "com.discordapp.Discord.desktop"}])
+        window._on_library_loaded(
+            [app._tracked_row(
+                "com.discordapp.Discord", "1", app.SRC_FLATPAK,
+                title="Discord",
+                desktop="/var/lib/flatpak/exports/share/applications/"
+                        "com.discordapp.Discord.desktop")])
         qapp.processEvents()
 
     def test_open_runs_flatpak_run_with_the_app_id(self, window, qapp,
@@ -3510,7 +3537,7 @@ class TestOpeningFlatpakApps:
                 calls.append((prog, list(args or []))), True)[1]))
         self._stage(window, qapp, monkeypatch)
 
-        window._open_tracked_app("com.discordapp.Discord")
+        window._open_library_app("com.discordapp.Discord")
 
         assert calls == [("flatpak", ["run", "com.discordapp.Discord"])]
         assert "Opened" in window._log_view.toPlainText()
@@ -3526,7 +3553,7 @@ class TestOpeningFlatpakApps:
         _accept_box(monkeypatch, "Not now")
         self._stage(window, qapp, monkeypatch)
 
-        window._open_tracked_app("com.discordapp.Discord")
+        window._open_library_app("com.discordapp.Discord")
 
         assert started == []
         # The status line is elided to one line, so check the log too.
@@ -3556,7 +3583,7 @@ class TestOpeningFlatpakApps:
         _accept_box(monkeypatch, "Restart it")
         self._stage(window, qapp, monkeypatch)
 
-        window._open_tracked_app("com.discordapp.Discord")
+        window._open_library_app("com.discordapp.Discord")
 
         assert ran == [["systemctl", "--user", "restart",
                         "xdg-document-portal"]]
@@ -3568,11 +3595,11 @@ class TestOpeningFlatpakApps:
         monkeypatch.setattr(app, "_launch_desktop",
                             lambda path: (seen.append(path), True)[1])
         _settle_loaders(window, qapp)
-        window._on_tracked_loaded(
-            [{"name": "zen", "version": "1", "repo": "manual",
-              "title": "Zen", "desktop": "/u/zen.desktop"}])
+        window._on_library_loaded(
+            [app._tracked_row("zen", "1", app.SRC_MANUAL, title="Zen",
+                              desktop="/u/zen.desktop", kind="app")])
         qapp.processEvents()
 
-        window._open_tracked_app("zen")
+        window._open_library_app("zen")
 
         assert seen == ["/u/zen.desktop"]

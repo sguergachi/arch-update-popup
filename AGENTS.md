@@ -20,6 +20,17 @@ slot; it may never move the slots.
   tick, so they hide the *whole row* — a page difference, not a state change;
   within a page the row is never hidden. The **view switcher is not in here**:
   it stays in the window header, where no page can move it.
+- **The stat strip has a width budget, and the cells are built to it.** At 1280
+  the control row leaves the strip ~780px; a cell costs `10 + the digit slot +
+  8 + its caption` (see `_StatCard`). The digit slot — four digits of the stat
+  face, reserved at construction — is what keeps a count that *grows*
+  (`0 → 2163`) from eating into its caption and eliding it mid-load. That
+  budget is also why the Library has six cells (YOURS · DEPS · OFFICIAL · AUR ·
+  FLATPAK · APPIMAGE) and not seven: seven full captions need ~930px, so the
+  CACHYOS cell is gone — CachyOS-managed rows keep their real badge, stay in
+  the list and still answer the searches. Measure again before adding a cell
+  or lengthening a caption; a caption is `fontMetrics().horizontalAdvance()`
+  wide and may never elide (the shot harness asserts it).
 - **Reserve space for anything conditional.** A line that only appears during
   progress keeps its height whether or not it has text. Give the status line one
   line of fixed height, elide it, and put the full text in a tooltip — never let
@@ -27,8 +38,8 @@ slot; it may never move the slots.
 - **Rows are all the same height**, and the list uses `ResizeMode.Fixed`.
   Variable row heights make the view re-anchor itself as rows are measured,
   which looks exactly like the list scrolling on its own. A row's own bottom
-  line carries whatever it has to say — a stray dependency's applications, a
-  tracked package's requirers, a status hint — always on that one line, never
+  line carries whatever it has to say — a dependency's applications, a
+  package you installed's requirers, a status hint — always on that one line, never
   on extra ones. So a row that names eight requirers is exactly as tall as one
   that names none.
 - **A long list opens under the list, never inside a row.** A package can be
@@ -65,26 +76,26 @@ One place per fact, and no page owns a line of its own:
   one on screen — which is exactly where the removed per-page line used to sit.
   A running job (check, install, removal, scan) always keeps that line.
   A list load also **fills the track**, stage by stage, and says the stage and
-  the percent (`Reading the package database… · 34%`): `_LoadSteps` turns the
+  the percent (`Reading the installed packages… · 34%`): `_LoadSteps` turns the
   loader's own stages — weighted by how long each really takes — into one
   0..1000 bar, so a two-second read fills as it goes instead of spinning. The
   track has **one owner at a time** — a job, a load, or the release notes
   arriving — and a load takes it only while its page is on screen; a load that
   ends (or dies) hands it straight back (`_render_load_track`,
   `_on_load_progress`).
-- **The list's own placeholder carries the verdict** ("Nothing tracked",
+- **The list's own placeholder carries the verdict** ("Nothing installed",
   "Not scanned yet" — and "No matches" when a filter is hiding everything) and
-  the list footer the count (`5 tracked`). Explanations that are the same for
+  the list footer the count (`5 installed`). Explanations that are the same for
   every row — like what "obsolete" means — go once, in a tooltip on the control
   that acts on them.
 - **How much is selected lives in the footer**, next to that count:
-  `390 tracked · All 390 packages selected` (see `_selection_text`). Not beside
+  `390 installed · All 390 packages selected` (see `_selection_text`). Not beside
   Select all — that row belongs to the filter field and the cards.
-- **What needs a package lives on that row's own bottom line** — a stray
-  dependency's applications (Untracked), the packages that would go with a
-  tracked one (Tracked) — with the whole list in the panel under the list.
-  One fact, one line, and every row keeps its height whether it names one
-  requirer or none.
+- **What needs a package lives on that row's own bottom line** — a dependency
+  package's applications, the packages that would go with one you installed —
+  with the whole list in the panel under the list. The Library list holds both
+  at once (see `TrackedModel._source_match`), one fact on one line, and every
+  row keeps its height whether it names one requirer or none.
 
 Why: pressing Refresh with 13 updates and getting 0 must not make the window
 jump. Movement is read as a bug even when the new state is correct.
