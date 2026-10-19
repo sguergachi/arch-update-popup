@@ -150,7 +150,7 @@ class TestWindow:
         assert window._model.rowCount() == 4
         assert window._update_btn.isEnabled()  # 3 of 3 checkable selected
 
-    def test_header_tabs(self, window, qapp):
+    def test_tab_texts_and_counts(self, window, qapp):
         # Tabs left to right: Updates | Tracked | Untracked | Obsolete |
         # Security.
         assert not hasattr(window, "_search")
@@ -342,7 +342,7 @@ class TestWindow:
         window._select_all(False)
         assert window._model.selected_count() == 0
         assert not window._update_btn.isEnabled()
-        assert "No packages selected" in window._sel_label.text()
+        assert "No packages selected" in window._up_footer_label.text()
         window._select_all(True)
         assert window._update_btn.isEnabled()
 
@@ -707,12 +707,22 @@ class TestWindow:
         assert pwidgets.index(window._details) < pwidgets.index(window._log_view)
         # error copy button sits next to the details, log copy in log header
         assert window._copy_btn.isHidden()  # no failure yet
-        # log toggle shares the header row with the view tabs
+        # log toggle shares the header row with the title; the view
+        # switcher lives down in the window's control row, next to the
+        # filter it belongs with (see TestControlRowAndFilter).
         head = lay.itemAt(0).layout()
+        assert head.indexOf(window._log_btn) >= 0
+        tabs = window._controls.tabs
         for key in ("updates", "tracked", "untracked", "obsolete",
                     "security"):
-            assert head.indexOf(window._view_buttons[key]) >= 0
-        assert head.indexOf(window._log_btn) >= 0
+            assert tabs.indexOf(window._view_buttons[key]) >= 0
+        # Filter, then the tabs, then Select all: the order the row reads.
+        row = window._controls.layout()
+        assert row.indexOf(window._controls._filter_slot) == 0
+        tabs_at = next(i for i in range(row.count())
+                       if row.itemAt(i).layout() is window._controls.tabs)
+        assert tabs_at > 0
+        assert row.indexOf(window._controls.check) > tabs_at
 
     def test_failure_shows_error_in_panel(self, window):
         window._safe_names = ["konsole"]
@@ -923,7 +933,7 @@ class TestViews:
         assert w._empty_state.parent() is w._list.viewport()
         # Nothing stands down: hiding a container would shift the whole
         # window when the list fills (see AGENTS.md).
-        assert w._list_header.isVisible()
+        assert w._controls.isVisible()
         assert w._stats_row.isVisible()
         assert w._stat_blocked is not None
         assert w._empty_title.text() == "You're up to date"
@@ -1355,7 +1365,7 @@ class TestViews:
         # One list now: the app and the dependency package are both here.
         assert window._un_uninstall_btn.text() == "Uninstall 2 selected"
         assert window._un_uninstall_btn.isEnabled()
-        assert "All 2" in window._un_sel_label.text()
+        assert "All 2" in window._un_footer_label.text()
 
     def test_untracked_uninstall_success(self, window, qapp, monkeypatch):
         monkeypatch.setattr(app, "QMessageBox", self._AcceptBox)
@@ -1404,11 +1414,11 @@ class TestViews:
         qapp.processEvents()
         assert window._track_uninstall_btn.text() == "Uninstall 2 selected"
         assert window._track_uninstall_btn.isEnabled()
-        # The list header carries the selection: ticked when everything
-        # in view is selected, and it says so in words too.
-        assert window._track_header.check.checkState() == \
+        # The control row carries the selection state: ticked when
+        # everything in view is selected; the footer says it in words.
+        assert window._controls.check.checkState() == \
             Qt.CheckState.Checked
-        assert "All 2 packages selected" in window._track_sel_label.text()
+        assert "All 2 packages selected" in window._track_footer_label.text()
         window._select_tracked_all(False)
         assert window._track_uninstall_btn.text() == "Uninstall selected"
         assert not window._track_uninstall_btn.isEnabled()
@@ -1610,7 +1620,7 @@ class TestNoLayoutShifts:
     empty list, or streaming log output must not move anything.
     """
 
-    STRUCTURE = ("_stats_row", "_list_header", "_list", "_sub", "_progress")
+    STRUCTURE = ("_stats_row", "_controls", "_list", "_sub", "_progress")
 
     def _snap(self, window, skip=()):
         snap = {name: getattr(window, name).geometry()
@@ -1664,23 +1674,23 @@ class TestNoLayoutShifts:
 
         # Empty list, then refresh: the box itself says it is loading…
         # The two view banners may appear/disappear here (AGENTS.md allows
-        # exactly that shift), so their followers _list_header/_list are
+        # exactly that shift), so their followers _controls/_list are
         # out of scope for this phase — and must land back on `before`
         # when the check returns rows (asserted below, strongest form).
         rows_snapshot = {k: v for k, v in before.items()
-                         if k not in ("_list_header", "_list")}
+                         if k not in ("_controls", "_list")}
         window._on_recheck_empty()
         qapp.processEvents()
         assert window._empty_title.text() == "You're up to date"
         assert not window._slot_security.isVisible()
-        assert self._snap(window, skip=("_list_header", "_list")) \
+        assert self._snap(window, skip=("_controls", "_list")) \
             == rows_snapshot
         window._recheck_updates()
         qapp.processEvents()
         assert window._empty_state.isVisible()
         assert window._empty_title.text() == "Loading…"
         assert window._empty_label.text() == "Checking for updates…"
-        assert self._snap(window, skip=("_list_header", "_list")) \
+        assert self._snap(window, skip=("_controls", "_list")) \
             == rows_snapshot
 
         # …and lands back on rows, in the same place — banners restored.
@@ -1718,10 +1728,10 @@ class TestNoLayoutShifts:
         window.resize(1280, 800)
         qapp.processEvents()
         before = self._snap(window)
-        window._list_header.search.setText("aur")
+        window._controls.search.setText("aur")
         qapp.processEvents()
         assert self._snap(window) == before
-        window._list_header.search.clear()
+        window._controls.search.clear()
         qapp.processEvents()
         assert self._snap(window) == before
 
@@ -1772,6 +1782,22 @@ class TestViewBanners:
         window._swap_updates_model(_updates(8), {})
         qapp.processEvents()
         assert "2 compromised" in self._banner_text(window._slot_security)
+
+    def test_banner_never_moves_the_switcher(self, window, qapp):
+        """The banners sit *below* the control row, so the tabs stay put."""
+        window._swap_updates_model([], {})
+        window._mark_checked()
+        window._refresh_empty_state()
+        qapp.processEvents()
+        assert not window._slot_security.isVisible()
+        tabs = {k: b.geometry() for k, b in window._view_buttons.items()}
+        row = window._controls.geometry()
+        window._swap_updates_model(_updates(4), {})
+        qapp.processEvents()
+        assert window._slot_security.isVisible()
+        assert {k: b.geometry()
+                for k, b in window._view_buttons.items()} == tabs
+        assert window._controls.geometry() == row
 
 class TestCardListRemeasure:
     """Fixed-mode rows re-measure when the viewport narrows.
@@ -1896,38 +1922,121 @@ class TestEmptyState:
         w.show()
         qapp.processEvents()
         assert not w._empty_state.isVisible()
-        w._list_header.search.setText("nothing-matches")
+        w._controls.search.setText("nothing-matches")
         qapp.processEvents()
         assert w._empty_state.isVisible()
-        assert w._list_header.isVisible()
+        assert w._controls.isVisible()
         assert w._empty_title.text() == "No matches"
         w.close()
 
 
-class TestListHeaderAndFilter:
-    """Row controls live with the rows: select-all, count, and a filter."""
+class TestControlRowAndFilter:
+    """The window's one control row: filter, view switcher, Select all.
 
-    def test_header_sits_with_the_list(self, window, qapp):
-        up = window._content_stack.widget(0).layout()
-        widgets = [up.itemAt(i).widget() for i in range(up.count())]
-        assert window._list_header in widgets
-        assert widgets.index(window._list_header) < widgets.index(window._list)
+    The row is shared by all five pages — the tabs sit between the filter
+    and Select all and must stay put when pages change (see AGENTS.md).
+    The count of what is selected lives in the list footer instead.
+    """
+
+    def test_row_sits_between_the_cards_and_the_list(self, window, qapp):
+        left = window._left_col
+        widgets = [left.itemAt(i).widget() for i in range(left.count())]
+        assert window._strip_stack in widgets
+        assert window._controls in widgets
+        assert window._content_stack in widgets
+        assert widgets.index(window._strip_stack) < \
+            widgets.index(window._controls)
+        assert widgets.index(window._controls) < \
+            widgets.index(window._content_stack)
+        # The current page's cards are above the row, its list below.
+        assert window._strip_stack.currentWidget() is window._stats_row
+        assert window._content_stack.currentWidget() is window._up_page
         # ...and the footer no longer carries All/None buttons.
         assert not hasattr(window, "_select_all_btn")
         assert not hasattr(window, "_select_none_btn")
 
+    def test_switcher_stays_put_across_pages(self, window, qapp):
+        """The tabs are in the shared row: changing pages cannot move them."""
+        before = {k: b.geometry() for k, b in window._view_buttons.items()}
+        for key in ("tracked", "untracked", "obsolete", "security",
+                    "updates"):
+            window._switch_view(key)
+            qapp.processEvents()
+            assert {k: b.geometry()
+                    for k, b in window._view_buttons.items()} == before
+        # Every page shows the same row: the tabs, and the filter column
+        # reserved even where there is nothing to filter.
+        assert window._controls.search.isVisible()
+        window._switch_view("obsolete")
+        qapp.processEvents()
+        assert not window._controls.search.isVisible()
+        assert window._controls._filter_slot.width() > 0
+        window._switch_view("updates")
+
+    def test_untracked_search_filters_that_page(self, window, qapp):
+        """The one filter field serves the Untracked list too."""
+        if window._obs_checker is not None:
+            window._obs_checker.wait(25000)
+        qapp.processEvents()
+        if window._track_loader is not None:
+            window._track_loader.wait(25000)
+        qapp.processEvents()
+        window._on_untracked_loaded(
+            [app._tracked_row("firefox", "1.0-1", "official",
+                              title="Firefox", desc="Web browser",
+                              kind="app"),
+             app._tracked_row("libfoo", "2-1", "official",
+                              kind="dependency")], [])
+        window._switch_view("untracked")
+        qapp.processEvents()
+        window._controls.search.setText("firefox")
+        qapp.processEvents()
+        assert window._un_model.rowCount() == 1
+        assert window._un_model.item(0)["name"] == "firefox"
+        # Nothing ticked: the footer says so, next to the list's total.
+        assert window._un_footer_label.text() == \
+            "1 untracked · No packages selected"
+        # A filter that hides everything says so, instead of claiming the
+        # machine has nothing pacman misses.
+        window._controls.search.setText("nothing-matches")
+        qapp.processEvents()
+        assert window._un_model.rowCount() == 0
+        assert window._un_empty.title.text() == "No matches"
+        window._controls.search.clear()
+        qapp.processEvents()
+        window._switch_view("updates")
+
+    def test_tracked_empty_filter_says_no_matches(self, window, qapp):
+        if window._obs_checker is not None:
+            window._obs_checker.wait(25000)
+        qapp.processEvents()
+        if window._track_loader is not None:
+            window._track_loader.wait(25000)
+        qapp.processEvents()
+        window._on_tracked_loaded(
+            [{"name": "hyprland", "version": "1", "repo": "aur"}])
+        window._switch_view("tracked")
+        qapp.processEvents()
+        window._controls.search.setText("nothing-matches")
+        qapp.processEvents()
+        assert window._track_model.rowCount() == 0
+        assert window._track_empty.title.text() == "No matches"
+        window._controls.search.clear()
+        qapp.processEvents()
+        window._switch_view("updates")
+
     def test_select_all_checkbox_drives_selection(self, window, qapp):
         window._select_all(False)
         qapp.processEvents()
-        assert window._list_header.check.checkState() == \
+        assert window._controls.check.checkState() == \
             Qt.CheckState.Unchecked
-        window._list_header.check.click()
+        window._controls.check.click()
         qapp.processEvents()
-        assert window._list_header.check.checkState() == Qt.CheckState.Checked
+        assert window._controls.check.checkState() == Qt.CheckState.Checked
         assert window._model.selected_count() == window._model.checkable_count()
-        window._list_header.check.click()
+        window._controls.check.click()
         qapp.processEvents()
-        assert window._list_header.check.checkState() == \
+        assert window._controls.check.checkState() == \
             Qt.CheckState.Unchecked
         assert window._model.selected_count() == 0
 
@@ -1935,22 +2044,23 @@ class TestListHeaderAndFilter:
         window._select_all(False)
         window._on_row_toggled(0)
         qapp.processEvents()
-        assert window._list_header.check.checkState() == \
+        assert window._controls.check.checkState() == \
             Qt.CheckState.PartiallyChecked
-        assert window._list_header.count.isVisible()
-        assert "1 of 3 selected" in window._sel_label.text()
+        # The count lives in the footer now, next to the action it feeds.
+        assert window._up_footer_label.isVisible()
+        assert "1 of 3 selected" in window._up_footer_label.text()
 
     def test_filter_hides_non_matching_rows(self, window, qapp):
-        window._list_header.search.setText("aur")
+        window._controls.search.setText("aur")
         qapp.processEvents()
         assert window._model.rowCount() == 2
         names = [window._model.item(r)["name"] for r in
                  range(window._model.rowCount())]
         assert names == ["aur-pkg", "evil"]
-        window._list_header.search.setText("konsole")
+        window._controls.search.setText("konsole")
         qapp.processEvents()
         assert window._model.rowCount() == 1
-        window._list_header.search.clear()
+        window._controls.search.clear()
         qapp.processEvents()
         assert window._model.rowCount() == 4
 
@@ -1958,35 +2068,35 @@ class TestListHeaderAndFilter:
         window.on_info_ready(0, "A terminal emulator", "notes", "", "full",
                              "", "")
         qapp.processEvents()
-        window._list_header.search.setText("emulator")
+        window._controls.search.setText("emulator")
         qapp.processEvents()
         assert [window._model.item(r)["name"] for r in
                 range(window._model.rowCount())] == ["konsole"]
 
     def test_filter_reports_what_it_hides(self, window, qapp):
-        window._list_header.search.setText("aur")
+        window._controls.search.setText("aur")
         qapp.processEvents()
-        assert "2 of 4" in window._list_header.filtered.text()
+        assert "2 of 4" in window._controls.filtered.text()
         # The tab still answers "how many updates are pending".
         assert window._view_buttons["updates"].text() == "Updates (4)"
-        window._list_header.search.clear()
+        window._controls.search.clear()
         qapp.processEvents()
-        assert window._list_header.filtered.text() == ""
-        assert not window._list_header.filtered.isVisible()
+        assert window._controls.filtered.text() == ""
+        assert not window._controls.filtered.isVisible()
 
     def test_filter_offers_a_way_back(self, window, qapp):
-        window._list_header.search.setText("nothing-matches-this")
+        window._controls.search.setText("nothing-matches-this")
         qapp.processEvents()
         assert window._model.rowCount() == 0
         assert window._empty_label.isVisible()
         assert "Nothing here matches" in window._empty_label.text()
         assert window._empty_title.text() == "No matches"
         # With a filter on, the box that clears it stays put.
-        assert window._list_header.isVisible()
+        assert window._controls.isVisible()
 
     def test_select_all_applies_to_visible_rows_only(self, window, qapp):
         # Selecting with a filter on must not silently reach hidden rows.
-        window._list_header.search.setText("aur")
+        window._controls.search.setText("aur")
         qapp.processEvents()
         window._select_all(True)
         qapp.processEvents()
@@ -1994,7 +2104,7 @@ class TestListHeaderAndFilter:
         assert window._model.rowCount() == 2
 
     def test_row_info_still_lands_while_filtered(self, window, qapp):
-        window._list_header.search.setText("konsole")
+        window._controls.search.setText("konsole")
         qapp.processEvents()
         # The fetcher addresses rows by source index; that must keep
         # working when the visible set is a subset.
@@ -2024,11 +2134,14 @@ class TestListHeaderAndFilter:
             [{"name": "hyprland", "version": "1", "repo": "aur"},
              {"name": "firefox", "version": "2", "repo": "official"}])
         qapp.processEvents()
-        window._track_header.search.setText("hypr")
+        # One filter field, five pages: it filters whichever page is up.
+        window._switch_view("tracked")
+        qapp.processEvents()
+        window._controls.search.setText("hypr")
         qapp.processEvents()
         assert window._track_model.rowCount() == 1
         assert window._track_model.item(0)["name"] == "hyprland"
-        window._track_header.search.clear()
+        window._controls.search.clear()
         qapp.processEvents()
         assert window._track_model.rowCount() == 2
 
@@ -2635,11 +2748,11 @@ class TestStatStripFilters:
 
     def test_filtering_moves_nothing(self, window, qapp):
         # The UI law: a filter changes what is listed, never the frame.
-        before = (window._stats_row.height(), window._list_header.height(),
+        before = (window._stats_row.height(), window._controls.height(),
                   window._list.height())
         window._stat_aur.clicked.emit()
         qapp.processEvents()
-        after = (window._stats_row.height(), window._list_header.height(),
+        after = (window._stats_row.height(), window._controls.height(),
                  window._list.height())
         assert after == before
 

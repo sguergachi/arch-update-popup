@@ -3414,8 +3414,8 @@ QLabel#package-versions { font-size: %(meta)spx; color: palette(text); }
 QLabel#package-date { font-size: %(meta)spx; color: %(muted)s; }
 QLabel#package-note { font-size: %(meta)spx; color: %(muted)s; }
 
-/* — List header: the controls that act on rows, sitting with the rows — */
-QWidget#list-header { background: transparent; }
+/* — Control row: one row above every list — filter, tabs, Select all — */
+QWidget#control-row { background: transparent; }
 QCheckBox#select-all { font-size: %(meta)spx; color: palette(text); }
 QLineEdit#search {
     background: %(surface)s; color: palette(text);
@@ -3907,21 +3907,54 @@ def _card_layout(card: QWidget, accent: str | None,
     return body
 
 
-class _ListHeader(QWidget):
-    """The strip above a card list: select-all, a count, and a filter.
+# What the one filter field says on each page it serves (see _ControlsRow).
+_FILTER_HINTS = {
+    "updates": "Filter packages…",
+    "tracked": "Filter installed packages…",
+    "untracked": "Filter untracked software…",
+}
 
-    These controls act on rows, so they live with the rows instead of in
-    the footer. One tri-state box replaces the old All/None pair: tick it
-    to take everything the filter is showing, untick it to drop it all.
+
+def _selection_text(selected: int, total: int) -> str:
+    """How much of a list is ticked, in words.
+
+    This is the line that used to sit beside Select all; it now lives in
+    the list footer, next to the total it counts (see _refresh_selection_ui
+    and the footer labels).
+    """
+    if total == 0:
+        return "Nothing selected"
+    if selected >= total:
+        return f"All {total} packages selected"
+    if selected == 0:
+        return "No packages selected"
+    return f"{selected} of {total} selected"
+
+
+class _ControlsRow(QWidget):
+    """The strip above the list: filter, view switcher, selection.
+
+    One row for the whole window instead of one per page, and the view
+    switcher lives inside it — so the tabs sit at exactly the same place
+    whichever page is on screen (see AGENTS.md).
+
+    What the row holds follows the page being shown, through *slots*
+    rather than widgets: the filter column keeps its width even on the
+    pages that have nothing to filter (Obsolete, Security), which is what
+    stops the tabs sliding when you change pages. Select all sits last,
+    where it can come and go without moving anything after it. The count
+    of what is selected is not here: it belongs in the footer, next to
+    the total it counts (see `_selection_text`).
     """
 
     select_all = pyqtSignal(bool)
     filter_changed = pyqtSignal(str)
 
-    def __init__(self, placeholder: str = "", with_search: bool = True,
-                 with_select: bool = True) -> None:
+    FILTER_W = 240          # the filter column, reserved on every page
+
+    def __init__(self) -> None:
         super().__init__()
-        self.setObjectName("list-header")
+        self.setObjectName("control-row")
         # Last state we painted: Qt cycles a tri-state box *before*
         # emitting clicked(), so the click handler must not read it back.
         self._shown = Qt.CheckState.Unchecked
@@ -3929,40 +3962,52 @@ class _ListHeader(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(_sp(8))
 
-        # The filter leads the strip, at the far left, at a fixed width —
-        # a full-width bar dwarfed the count it sits next to.
-        self.search: QLineEdit | None = None
-        if with_search:
-            self.search = QLineEdit()
-            self.search.setObjectName("search")
-            self.search.setPlaceholderText(placeholder)
-            self.search.setClearButtonEnabled(True)
-            self.search.setFixedWidth(_sp(240))
-            self.search.setToolTip("Filter this list by name or description")
-            self.search.addAction(app_icon("search", 14),
-                                  QLineEdit.ActionPosition.LeadingPosition)
-            self.search.textChanged.connect(self.filter_changed)
-            lay.addWidget(self.search, 0, Qt.AlignmentFlag.AlignVCenter)
+        # A fixed-width column rather than a fixed-width field: the field
+        # inside can step aside on a page with nothing to filter and the
+        # switcher still sits where it did.
+        self._filter_slot = QWidget()
+        self._filter_slot.setFixedWidth(_sp(self.FILTER_W))
+        # A fixed height too: the field inside steps aside on the pages
+        # with nothing to filter, and the row must hold one height
+        # whatever it does — a single pixel of drift would slide the
+        # tabs (see AGENTS.md).
+        self._filter_slot.setFixedHeight(_sp(34))
+        slot_lay = QHBoxLayout(self._filter_slot)
+        slot_lay.setContentsMargins(0, 0, 0, 0)
+        self.search = QLineEdit()
+        self.search.setObjectName("search")
+        self.search.setClearButtonEnabled(True)
+        # Same fixed height as every other control in the row: a field that
+        # measured 2px taller than the tabs would make the row's height
+        # depend on whether the field is showing (see AGENTS.md).
+        self.search.setFixedHeight(_sp(34))
+        self.search.setToolTip("Filter this list by name or description")
+        self.search.addAction(app_icon("search", 14),
+                              QLineEdit.ActionPosition.LeadingPosition)
+        self.search.textChanged.connect(self.filter_changed)
+        slot_lay.addWidget(self.search)
+        lay.addWidget(self._filter_slot, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        # The switcher's slot: the window drops the tabs in here, because
+        # they belong to the window, not to any one list.
+        self.tabs = QHBoxLayout()
+        self.tabs.setContentsMargins(0, 0, 0, 0)
+        self.tabs.setSpacing(_sp(4))
+        lay.addLayout(self.tabs)
         lay.addStretch()
 
-        # What the controls are producing: the selection, then how much of
-        # the list the filter is hiding — then the control itself, far
-        # right, so the strip is anchored at both ends.
-        self.count = QLabel("")
-        self.count.setObjectName("meta")
-        lay.addWidget(self.count, 0, Qt.AlignmentFlag.AlignVCenter)
+        # How much of the list the filter is hiding — right end, next to
+        # the control that acts on the rows.
         self.filtered = QLabel("")
         self.filtered.setObjectName("meta")
         lay.addWidget(self.filtered, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        self.check: QCheckBox | None = None
-        if with_select:
-            self.check = QCheckBox("Select all")
-            self.check.setObjectName("select-all")
-            self.check.setTristate(True)
-            self.check.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.check.clicked.connect(self._on_click)
-            lay.addWidget(self.check, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.check = QCheckBox("Select all")
+        self.check.setObjectName("select-all")
+        self.check.setTristate(True)
+        self.check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.check.clicked.connect(self._on_click)
+        lay.addWidget(self.check, 0, Qt.AlignmentFlag.AlignVCenter)
 
     def _on_click(self) -> None:
         # Ask for the opposite of what we last showed; the window then
@@ -3974,50 +4019,46 @@ class _ListHeader(QWidget):
         self.select_all.emit(want)
 
     def set_state(self, selected: int, total: int) -> None:
-        """Mirror the real selection: all, none, or a partial count."""
-        if self.check is not None:
-            self.check.blockSignals(True)
-            if total == 0 or selected == 0:
-                self.check.setCheckState(Qt.CheckState.Unchecked)
-            elif selected >= total:
-                self.check.setCheckState(Qt.CheckState.Checked)
-            else:
-                self.check.setCheckState(Qt.CheckState.PartiallyChecked)
-            self.check.setEnabled(total > 0)
-            self._shown = self.check.checkState()
-            self.check.blockSignals(False)
-        # The count is always on show: the box says the state, this says
-        # the number, and together they balance the strip against the
-        # controls on the left.
-        self.count.setText(self._count_text(selected, total))
-        self.count.setVisible(True)
+        """Mirror the current page's selection: all, none, or partial."""
+        self.check.blockSignals(True)
+        if total == 0 or selected == 0:
+            self.check.setCheckState(Qt.CheckState.Unchecked)
+        elif selected >= total:
+            self.check.setCheckState(Qt.CheckState.Checked)
+        else:
+            self.check.setCheckState(Qt.CheckState.PartiallyChecked)
+        self.check.setEnabled(total > 0)
+        self._shown = self.check.checkState()
+        self.check.blockSignals(False)
 
-    @staticmethod
-    def _count_text(selected: int, total: int) -> str:
-        if total == 0:
-            return "Nothing selected"
-        if selected >= total:
-            return f"All {total} packages selected"
-        if selected == 0:
-            return "No packages selected"
-        return f"{selected} of {total} selected"
+    def show_filter(self, on: bool, placeholder: str = "") -> None:
+        """Point the filter column at the page being shown.
+
+        The column keeps its width either way — a page with nothing to
+        filter simply leaves it empty, and that is what keeps the tabs
+        still when pages change.
+        """
+        if placeholder:
+            self.search.setPlaceholderText(placeholder)
+        self.search.setVisible(on)
+
+    def set_filter_text(self, text: str) -> None:
+        """Adopt a page's filter without re-running it (see _switch_view)."""
+        if self.search.text() == text:
+            return
+        self.search.blockSignals(True)
+        self.search.setText(text)
+        self.search.blockSignals(False)
+
+    def show_select(self, on: bool) -> None:
+        """Select all only means something where rows can be ticked."""
+        self.check.setVisible(on)
 
     def set_filter_info(self, shown: int, total: int) -> None:
-        """Say how much is hidden, but only when something actually is.
-
-        The leading separator keeps it readable next to the selection
-        count, which shares this end of the strip.
-        """
+        """Say how much is hidden, but only when something actually is."""
         hidden = total - shown
         self.filtered.setText(f"·  {shown} of {total}" if hidden > 0 else "")
         self.filtered.setVisible(hidden > 0)
-
-    def filter_text(self) -> str:
-        return self.search.text() if self.search is not None else ""
-
-    def set_filter_enabled(self, enabled: bool) -> None:
-        if self.search is not None:
-            self.search.setEnabled(enabled)
 
 
 class _ListPlaceholder(QWidget):
@@ -5924,10 +5965,13 @@ class UpdateWindow(QMainWindow):
         # free header width so the status line only wraps when it must.
         head.addLayout(title_block, 1)
 
-        # View switcher lives here, right of the title: Updates | Tracked |
-        # Untracked | Obsolete | Security. Borderless segments that only
-        # fill with the accent when active, so the group reads as one
-        # control rather than five loose pills.
+        # View switcher: Updates | Tracked | Untracked | Obsolete |
+        # Security. Borderless segments that only fill with the accent
+        # when active, so the group reads as one control rather than five
+        # loose pills. They are *built* here (their counts arrive with the
+        # first model) but placed in the window's control row below the
+        # stats, between the filter and Select all — one row for every
+        # page, so the tabs never move when pages change.
         self._view_buttons: dict[str, QPushButton] = {}
         self._view_group = QButtonGroup(self)
         self._view_group.setExclusive(True)
@@ -5949,7 +5993,6 @@ class UpdateWindow(QMainWindow):
                 lambda _c=False, k=_key: self._switch_view(k))
             self._view_group.addButton(_btn)
             self._view_buttons[_key] = _btn
-            head.addWidget(_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         # The Updates tab doubles as Check Now: clicking it while active
         # re-runs the update check (see _switch_view).
         self._view_buttons["updates"].setToolTip(
@@ -5979,6 +6022,24 @@ class UpdateWindow(QMainWindow):
         left.setSpacing(_sp(12))
         content.addLayout(left, 1)
         self._left_col = left
+
+        # ── Zone 3 · Stats stack, one control row, list stack ───────────────
+        # The cards and the two banners belong to a page, so they stack
+        # with it. The control row under them belongs to the *window*:
+        # one filter, one view switcher, one Select all, in the same place
+        # on every page — the tabs must not move when you change tabs.
+        # The lists themselves are the pages, in their own stack below.
+        self._strip_stack = QStackedWidget()
+        left.addWidget(self._strip_stack)
+        self._controls = _ControlsRow()
+        left.addWidget(self._controls)
+        for _btn in self._view_buttons.values():
+            self._controls.tabs.addWidget(
+                _btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        # The row's handlers look up the page being shown: one control,
+        # whichever list is on screen (see _select_all_in_view).
+        self._controls.select_all.connect(self._select_all_in_view)
+        self._controls.filter_changed.connect(self._filter_in_view)
 
         self._content_stack = QStackedWidget()
         left.addWidget(self._content_stack, 1)
@@ -6031,7 +6092,7 @@ class UpdateWindow(QMainWindow):
         # Left-aligned grid: any leftover width is honest whitespace, not
         # a stretched empty card.
         stats.addStretch()
-        up.addWidget(self._stats_row)
+        self._strip_stack.addWidget(self._stats_row)
 
         # ── Failure banner slot ─────────────────────────────────────────────
         # NOTE: intentionally no top banner widget. A dynamically shown
@@ -6043,10 +6104,10 @@ class UpdateWindow(QMainWindow):
 
         # ── View banners (two deliberate, allowed layout shifts) ────────────
         # The security warning and the AUR→official prompt stand between
-        # the stats and the list and mirror the *current* check's facts.
-        # They are rebuilt by _refresh_view_banners() at construction and
-        # on every model swap (see AGENTS.md — these two are the only
-        # containers allowed to appear/disappear).
+        # the control row and the list and mirror the *current* check's
+        # facts. They are rebuilt by _refresh_view_banners() at
+        # construction and on every model swap (see AGENTS.md — these two
+        # are the only containers allowed to appear/disappear).
         self._slot_security = QWidget()
         lay_sec = QVBoxLayout(self._slot_security)
         lay_sec.setContentsMargins(0, 0, 0, 0)
@@ -6090,19 +6151,16 @@ class UpdateWindow(QMainWindow):
         # the list's own frame, so an empty window still reads as "a list
         # with nothing in it" rather than text floating in space.
         # The placeholder lives inside the list's frame; the frame, the
-        # header and the stat strip never move (see AGENTS.md).
+        # control row and the stat strip never move (see AGENTS.md).
         self._empty_state = _placeholder_overlay(self._list)
         self._empty_icon = self._empty_state.icon
         self._empty_title = self._empty_state.title
         self._empty_label = self._empty_state.body
 
-        # Row controls sit with the rows: select-all, the count when the
-        # selection is partial, and the filter.
-        self._list_header = _ListHeader("Filter packages…")
-        self._list_header.select_all.connect(self._select_all)
-        self._list_header.filter_changed.connect(self._on_filter_changed)
-        self._sel_label = self._list_header.count
-        up.addWidget(self._list_header)
+        # The row controls (filter, Select all, and the count of what is
+        # selected) live in the window's shared control strip now — one
+        # row, above every list (see _ControlsRow); the page keeps its
+        # banners and its list.
         up.addWidget(self._list, 1)
         self._model.rowsInserted.connect(lambda *a: self._refresh_empty_state())
         self._model.rowsRemoved.connect(lambda *a: self._refresh_empty_state())
@@ -6214,6 +6272,13 @@ class UpdateWindow(QMainWindow):
         self._foot_updates = QWidget()
         footer = QHBoxLayout(self._foot_updates)
         footer.setSpacing(8)
+        # What is selected is counted here now, next to the action it
+        # feeds — the control row above belongs to the filter and the
+        # tabs (see _selection_text). Fixed slot: only its text changes.
+        self._up_footer_label = QLabel("")
+        self._up_footer_label.setObjectName("meta")
+        footer.addWidget(self._up_footer_label, 0,
+                         Qt.AlignmentFlag.AlignVCenter)
         footer.addStretch()
 
         # "Reboot to finish" — an Arch-specific truth: once pacman replaces
@@ -6298,6 +6363,10 @@ class UpdateWindow(QMainWindow):
         self._obs_scroll.setWidget(self._obs_inner)
         ob.addWidget(self._obs_scroll, 1)
         self._content_stack.addWidget(self._obs_page)
+        # The control row stays at the same height on every page: this
+        # page has no cards of its own, so the slot above it stays empty
+        # instead of pulling the row (and its tabs) up the window.
+        self._strip_stack.addWidget(QWidget())
         self._obs_loaded = False
         self._obs_names: list[str] = []
         self._obs_cards: dict[str, QWidget] = {}
@@ -6352,6 +6421,9 @@ class UpdateWindow(QMainWindow):
         self._sec_scroll.setWidget(self._sec_inner)
         se.addWidget(self._sec_scroll, 1)
         self._content_stack.addWidget(self._sec_page)
+        # Same as Obsolete: no cards, but the slot above the control row
+        # is kept so the tabs sit at one height across all five pages.
+        self._strip_stack.addWidget(QWidget())
         self._sec_scanner: SystemScanner | None = None
         self._sec_cards: dict[str, QWidget] = {}
 
@@ -6389,13 +6461,8 @@ class UpdateWindow(QMainWindow):
                 else f"Show only {card._caption.text().lower()} packages")
             card.clicked.connect(
                 lambda _=False, k=key: self._toggle_track_filter(k))
-        tr.addWidget(_stat_strip(list(self._track_stat_cards.values())))
-        self._track_header = _ListHeader("Filter installed packages…")
-        self._track_header.select_all.connect(self._select_tracked_all)
-        self._track_header.filter_changed.connect(
-            lambda text: self._apply_tracked_filter(text))
-        self._track_sel_label = self._track_header.count
-        tr.addWidget(self._track_header)
+        self._track_strip = _stat_strip(list(self._track_stat_cards.values()))
+        self._strip_stack.addWidget(self._track_strip)
         self._track_model = TrackedModel()
         self._track_list = QListView()
         self._track_list.setObjectName("package-list")
@@ -6527,11 +6594,8 @@ class UpdateWindow(QMainWindow):
                 else f"Show only {card._caption.text().lower()}")
             card.clicked.connect(
                 lambda _=False, k=key: self._toggle_un_filter(k))
-        un.addWidget(_stat_strip(list(self._un_stat_cards.values())))
-        self._un_header = _ListHeader("", with_search=False)
-        self._un_header.select_all.connect(self._select_untracked_all)
-        self._un_sel_label = self._un_header.count
-        un.addWidget(self._un_header)
+        self._un_strip = _stat_strip(list(self._un_stat_cards.values()))
+        self._strip_stack.addWidget(self._un_strip)
         self._un_model = TrackedModel()
         self._un_view, self._un_delegate = self._make_card_list(
             self._un_model)
@@ -6574,8 +6638,8 @@ class UpdateWindow(QMainWindow):
         self._footer_stack.addWidget(self._foot_untracked)
         # Tab order is Updates | Tracked | Untracked | Obsolete |
         # Security, but pages are built in creation order — re-slot
-        # tracked to 1 and untracked to 2 in both stacks (removeWidget
-        # never deletes, just detaches).
+        # tracked to 1 and untracked to 2 in all three stacks
+        # (removeWidget never deletes, just detaches).
         self._content_stack.removeWidget(self._track_page)
         self._content_stack.insertWidget(1, self._track_page)
         self._footer_stack.removeWidget(self._foot_tracked)
@@ -6584,6 +6648,10 @@ class UpdateWindow(QMainWindow):
         self._content_stack.insertWidget(2, self._un_page)
         self._footer_stack.removeWidget(self._foot_untracked)
         self._footer_stack.insertWidget(2, self._foot_untracked)
+        self._strip_stack.removeWidget(self._track_strip)
+        self._strip_stack.insertWidget(1, self._track_strip)
+        self._strip_stack.removeWidget(self._un_strip)
+        self._strip_stack.insertWidget(2, self._un_strip)
 
         left.addWidget(self._footer_stack)
         self._update_view_badges()
@@ -6728,7 +6796,10 @@ class UpdateWindow(QMainWindow):
     def _refresh_selection_ui(self) -> None:
         sel = self._model.selected_count()
         total = self._model.checkable_count()
-        self._list_header.set_state(sel, total)
+        # How much is ticked is said in the footer, next to the action it
+        # feeds: one slot, one shape, text swapped (see _selection_text).
+        self._up_footer_label.setText(_selection_text(sel, total))
+        self._sync_controls("updates")
         if self._updating:
             return
         # Nothing to install → the update action is simply off. It never
@@ -6755,6 +6826,7 @@ class UpdateWindow(QMainWindow):
         self._current_view = key
         idx = {"updates": 0, "tracked": 1, "untracked": 2,
                "obsolete": 3, "security": 4}[key]
+        self._strip_stack.setCurrentIndex(idx)
         self._content_stack.setCurrentIndex(idx)
         self._footer_stack.setCurrentIndex(idx)
         self._view_buttons[key].setChecked(True)
@@ -6781,6 +6853,88 @@ class UpdateWindow(QMainWindow):
             self._untracked_loader.start()
         self._update_view_badges()
 
+    # ── The one control row: filter, switcher, Select all ────────────────────
+    # One row serves all five pages, so its handlers look up the page that
+    # is on screen instead of holding their own list (see _ControlsRow).
+    def _controls_model(self):
+        """The model the control row drives: the page being shown.
+
+        Obsolete and Security list cards, not rows: they have nothing to
+        filter and nothing to tick, so they answer None (and their
+        columns simply stay empty). The track/untrack models are built
+        with their pages, so those lookups are forgiving while the window
+        is still assembling.
+        """
+        if self._current_view == "tracked":
+            return getattr(self, "_track_model", None)
+        if self._current_view == "untracked":
+            return getattr(self, "_un_model", None)
+        if self._current_view == "updates":
+            return self._model
+        return None
+
+    def _select_all_in_view(self, want: bool) -> None:
+        """Select all — on whichever page is on screen.
+
+        One box, five lists: it always acts on what you are looking at.
+        Pages with nothing to tick (Obsolete, Security) don't show it.
+        """
+        if self._current_view == "tracked":
+            self._select_tracked_all(want)
+        elif self._current_view == "untracked":
+            self._select_untracked_all(want)
+        elif self._current_view == "updates":
+            self._select_all(want)
+
+    def _filter_in_view(self, text: str) -> None:
+        """Filter — the page on screen, through that model's own filter."""
+        if self._current_view == "tracked":
+            self._apply_tracked_filter(text)
+        elif self._current_view == "untracked":
+            self._apply_untracked_filter(text)
+        elif self._current_view == "updates":
+            self._on_filter_changed(text)
+
+    def _sync_controls(self, view: str | None = None) -> None:
+        """Point the shared control row at the page being shown.
+
+        The row never moves: what follows the page is what its slots
+        *hold* — the filter's text and placeholder, whether this page has
+        anything to filter or tick, and the selection state. Called for
+        the page on screen (on every switch, and whenever that page's own
+        numbers change); a page that is not on screen is skipped, because
+        its state is read again the moment it is.
+        """
+        if view is not None and view != self._current_view:
+            return
+        key = self._current_view
+        model = self._controls_model()
+        if model is None:
+            # Obsolete and Security list cards, not rows: nothing to
+            # filter and nothing to tick. Their columns stay empty so the
+            # tabs above them cannot move.
+            self._controls.show_filter(False)
+            self._controls.show_select(False)
+            self._controls.set_filter_info(0, 0)
+            return
+        self._controls.show_filter(True, _FILTER_HINTS.get(key, ""))
+        self._controls.set_filter_text(model.filter_text())
+        self._controls.show_select(True)
+        if key == "updates":
+            self._controls.set_state(self._model.selected_count(),
+                                     self._model.checkable_count())
+            self._controls.set_filter_info(self._model.rowCount(),
+                                           self._model.source_count())
+        elif key == "tracked":
+            n = self._track_model.rowCount()
+            self._controls.set_state(len(self._track_model.checked_names()), n)
+            self._controls.set_filter_info(
+                n, self._track_model.source_count())
+        else:
+            n = self._un_model.rowCount()
+            self._controls.set_state(len(self._un_selected_names()), n)
+            self._controls.set_filter_info(n, self._un_model.source_count())
+
     def _on_filter_changed(self, text: str) -> None:
         """Filter the Updates list (name, description, notes, repo)."""
         if not self._model.set_filter(text):
@@ -6795,6 +6949,12 @@ class UpdateWindow(QMainWindow):
             return
         self._track_delegate.invalidate()
         self._refresh_tracked_summary()
+
+    def _apply_untracked_filter(self, text: str) -> None:
+        if not self._un_model.set_filter(text):
+            return
+        self._un_delegate.invalidate()
+        self._refresh_untracked_summary()
 
     # — Stat-strip filters: click a cell to filter, click it again to clear —
     def _toggle_update_filter(self, key: str) -> None:
@@ -6890,7 +7050,7 @@ class UpdateWindow(QMainWindow):
         elif self._loading:
             self._empty_state.show_loading("Checking for updates…")
         elif filtered:
-            # Keep the header: the filter box is how you get back.
+            # Keep the frame: the filter box is how you get back.
             source = self._model.filter_source()
             what = (f"“{self._model.filter_text()}”"
                     if self._model.filter_text()
@@ -7442,6 +7602,15 @@ class UpdateWindow(QMainWindow):
         elif self._track_loading:
             self._track_empty.show_loading("Reading the installed package "
                                            "list…")
+        elif self._track_loaded and self._track_model.filter_text():
+            # A filter that hides everything is not an empty package set:
+            # say so, or the list looks like it lost its contents.
+            self._track_empty.show_state(
+                "No matches",
+                f"Nothing installed matches "
+                f"“{self._track_model.filter_text()}”. Clear the filter to "
+                "see every installed package.",
+                icon="search", colour="muted")
         elif self._track_loaded:
             self._track_empty.show_state(
                 "Nothing tracked",
@@ -7477,16 +7646,18 @@ class UpdateWindow(QMainWindow):
         Any checked rows → the main button becomes
         "Uninstall N selected". Otherwise it offers the move-all action.
         """
+        n = self._track_model.rowCount()
+        sel = self._track_model.checked_names()
+        n_sel = len(sel)
+        # The control row above mirrors this page's selection; the footer
+        # below says the same number in words, next to the total.
+        self._sync_controls("tracked")
         if not getattr(self, "_track_loaded", False):
             self._track_footer_label.setText("Loading…")
             self._track_uninstall_btn.setText("Uninstall selected")
             self._track_uninstall_btn.setEnabled(False)
             return
-        n = self._track_model.rowCount()
-        sel = self._track_model.checked_names()
-        n_sel = len(sel)
         running = self._track_uninstaller is not None
-        self._track_header.set_state(n_sel, n)
         if running:
             self._track_footer_label.setText(
                 f"Removing {len(self._track_uninstall_names)} "
@@ -7494,10 +7665,11 @@ class UpdateWindow(QMainWindow):
             self._track_uninstall_btn.setText("Removing…")
             self._track_uninstall_btn.setEnabled(False)
             return
-        self._track_footer_label.setText(f"{n} tracked" if n
-                                         else "Nothing tracked")
-        # The header carries the count; the footer names the action the
-        # button is about to take, and the button never changes size.
+        self._track_footer_label.setText(
+            f"{n} tracked · {_selection_text(n_sel, n)}" if n
+            else "Nothing tracked")
+        # The footer names the action the button is about to take, and
+        # the button never changes size.
         self._track_uninstall_btn.setText(
             f"Uninstall {n_sel} selected" if n_sel else "Uninstall selected")
         self._track_uninstall_btn.setEnabled(bool(n_sel))
@@ -7518,12 +7690,11 @@ class UpdateWindow(QMainWindow):
 
     def _update_view_badges(self) -> None:
         # The tab answers "how many updates are pending", so it counts the
-        # whole list; the header reports what the filter is showing.
+        # whole list; the control row reports what the filter is showing.
         # The count never disappears at zero: dropping it would narrow the
         # switcher and slide every tab sideways — 13 updates, refresh, 0,
-        # and the header jumps (see AGENTS.md).
+        # and the switcher jumps (see AGENTS.md).
         n_up = self._model.source_count()
-        self._list_header.set_filter_info(self._model.rowCount(), n_up)
         self._view_buttons["updates"].setText(f"Updates ({n_up})")
         if getattr(self, "_obs_loaded", False):
             n_ob = len(self._obs_names)
@@ -7536,6 +7707,9 @@ class UpdateWindow(QMainWindow):
         if getattr(self, "_untracked_loaded", False):
             n_un = self._un_model.rowCount()
             self._view_buttons["untracked"].setText(f"Untracked ({n_un})")
+        # Whatever changed, the control row speaks for the page on screen
+        # (and only that one — the others are read again when shown).
+        self._sync_controls()
 
     # — Per-package uninstall (Tracked tab) —
     def _busy_with_update(self) -> bool:
@@ -7979,6 +8153,16 @@ class UpdateWindow(QMainWindow):
         if self._un_model.rowCount():
             self._un_empty.hide_state()
             return
+        if self._un_model.filter_text():
+            # Same as the Tracked page: a filter that hides everything
+            # says so, instead of claiming there is nothing to find.
+            self._un_empty.show_state(
+                "No matches",
+                f"Nothing untracked matches "
+                f"“{self._un_model.filter_text()}”. Clear the filter to see "
+                "everything pacman doesn't track.",
+                icon="search", colour="muted")
+            return
         src = self._un_model.filter_source()
         if src:
             label = {"applications": "an application",
@@ -8038,9 +8222,9 @@ class UpdateWindow(QMainWindow):
         sel = self._un_selected_names()
         n_sel = len(sel)
         n = self._un_model.rowCount()
-        # The header's count is kept current even while the scan runs, so
-        # that strip never looks half-empty.
-        self._un_header.set_state(n_sel, n)
+        # The control row above mirrors this page's selection even while
+        # the scan runs, so that strip never looks half-empty.
+        self._sync_controls("untracked")
         if not getattr(self, "_untracked_loaded", False):
             self._un_footer_label.setText("Loading…")
             self._un_uninstall_btn.setText("Uninstall selected")
@@ -8054,16 +8238,12 @@ class UpdateWindow(QMainWindow):
             self._un_uninstall_btn.setText("Removing…")
             self._un_uninstall_btn.setEnabled(False)
             return
-        if n_sel:
-            self._un_footer_label.setText("")
-            self._un_uninstall_btn.setText(
-                f"Uninstall {n_sel} selected")
-            self._un_uninstall_btn.setEnabled(True)
-            return
         self._un_footer_label.setText(
-            f"{self._un_model.rowCount()} untracked")
-        self._un_uninstall_btn.setText("Uninstall selected")
-        self._un_uninstall_btn.setEnabled(False)
+            f"{n} untracked · {_selection_text(n_sel, n)}" if n
+            else f"{n} untracked")
+        self._un_uninstall_btn.setText(
+            f"Uninstall {n_sel} selected" if n_sel else "Uninstall selected")
+        self._un_uninstall_btn.setEnabled(bool(n_sel))
 
     def _select_untracked_all(self, checked: bool) -> None:
         for m in self._un_models():

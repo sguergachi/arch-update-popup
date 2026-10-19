@@ -5,10 +5,17 @@
 The window's layout is **fixed**. A state change may change what is *inside* a
 slot; it may never move the slots.
 
-- **Never show/hide a container to signal state.** The stat strip, the list
-  header, the list frame and the footer controls are always present. Hiding one
+- **Never show/hide a container to signal state.** The stat strip, the control
+  row, the list frame and the footer controls are always present. Hiding one
   moves everything below it — that reads as a glitch and makes the app feel
   unstable. Disable a control instead of hiding it, and swap its *text*.
+- **The view switcher lives in the control row, and it never moves.** One row
+  (`_ControlsRow`) serves all five pages, between the page's cards and its
+  list: filter, tabs, Select all. It is a window-level widget, not one per
+  page, and `_sync_controls` only swaps what its *slots* hold. The filter
+  column keeps its width on pages that have nothing to filter (Obsolete,
+  Security) precisely so the tabs cannot slide when you change pages. Its
+  height is pinned there too, for the same reason.
 - **Reserve space for anything conditional.** A line that only appears during
   progress keeps its height whether or not it has text. Give the status line one
   line of fixed height, elide it, and put the full text in a tooltip — never let
@@ -41,9 +48,13 @@ One place per fact, and no page owns a line of its own:
   one on screen — which is exactly where the removed per-page line used to sit.
   A running job (check, install, removal, scan) always keeps that line.
 - **The list's own placeholder carries the verdict** ("Nothing tracked",
-  "Not scanned yet") and the list footer the count (`5 tracked`). Explanations
-  that are the same for every row — like what "obsolete" means — go once, in a
-  tooltip on the control that acts on them.
+  "Not scanned yet" — and "No matches" when a filter is hiding everything) and
+  the list footer the count (`5 tracked`). Explanations that are the same for
+  every row — like what "obsolete" means — go once, in a tooltip on the control
+  that acts on them.
+- **How much is selected lives in the footer**, next to that count:
+  `390 tracked · All 390 packages selected` (see `_selection_text`). Not beside
+  Select all — that row belongs to the filter and the tabs.
 
 Why: pressing Refresh with 13 updates and getting 0 must not make the window
 jump. Movement is read as a bug even when the new state is correct.
