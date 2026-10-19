@@ -902,11 +902,12 @@ class TestRequirerLine:
         assert lay["req_note_txt"] == ""
         assert lay["req_more"].isNull()
 
-    def test_tracked_rows_ask_the_other_way(self, deps_view):
-        # The same relation, read from the side of a package you installed
-        # yourself: what would go with it.
+    def test_every_row_wears_the_same_heading(self, deps_view):
+        # One heading, whatever the row is: the relation is the same read
+        # from two sides, and two headings only made the reader compare
+        # words instead of names.
         lay = self._lay(deps_view, "pipewire")
-        assert lay["req_label_txt"] == "\u21b3 NEEDED BY:"
+        assert lay["req_label_txt"] == "\u21b3 DEPENDENCY FOR:"
         assert lay["req_names_txt"] == "plasma-desktop · firefox"
 
     def test_every_row_is_the_same_height(self, deps_view):
@@ -927,7 +928,7 @@ class TestRequirerLine:
         assert len(tip.splitlines()) == 9
         pipe = m.row_of("pipewire")
         assert m.data(m.index(pipe), Qt.ItemDataRole.ToolTipRole) \
-            .splitlines() == ["NEEDED BY:", "\u2022 plasma-desktop",
+            .splitlines() == ["DEPENDENCY FOR:", "\u2022 plasma-desktop",
                               "\u2022 firefox"]
         assert m.data(m.index(m.row_of("zen")),
                       Qt.ItemDataRole.ToolTipRole) is None

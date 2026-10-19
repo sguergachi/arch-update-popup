@@ -91,11 +91,14 @@ One place per fact, and no page owns a line of its own:
 - **How much is selected lives in the footer**, next to that count:
   `390 installed · All 390 packages selected` (see `_selection_text`). Not beside
   Select all — that row belongs to the filter field and the cards.
-- **What needs a package lives on that row's own bottom line** — a dependency
-  package's applications, the packages that would go with one you installed —
-  with the whole list in the panel under the list. The Library list holds both
-  at once (see `TrackedModel._source_match`), one fact on one line, and every
-  row keeps its height whether it names one requirer or none.
+- **What needs a package lives on that row's own bottom line** — the packages
+  that need it, wherever the row came from — with the whole list in the panel
+  under the list. One heading for every row (`REQ_LABEL`, "DEPENDENCY FOR:"):
+  a dependency's applications and a package you installed's requirers are the
+  same relation read from two sides, and two headings only made the reader
+  compare words instead of reading names. The Library list holds both at once
+  (see `TrackedModel._source_match`), one fact on one line, and every row keeps
+  its height whether it names one requirer or none.
 
 Why: pressing Refresh with 13 updates and getting 0 must not make the window
 jump. Movement is read as a bug even when the new state is correct.

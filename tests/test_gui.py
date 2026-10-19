@@ -2309,13 +2309,13 @@ class TestRequirerPanel:
         opt = QStyleOptionViewItem()
         opt.rect = window._lib_view.visualRect(m.index(row))
         lay = d._geom(row, m.item(row), opt.rect.width())
-        # The same relation, from the side of a package you installed.
-        assert lay["req_label_txt"] == "\u21b3 NEEDED BY:"
+        # One heading, whatever the row is.
+        assert lay["req_label_txt"] == "\u21b3 DEPENDENCY FOR:"
         assert lay["req_more_txt"] == "Show more"
         d.toggle_detail(row)
         qapp.processEvents()
         assert window._detail_panel.isVisible()
-        assert window._detail_panel._label.text() == "\u21b3 NEEDED BY:"
+        assert window._detail_panel._label.text() == "\u21b3 DEPENDENCY FOR:"
         assert window._detail_panel._name.text() == "bluez-libs"
         # A package nothing needs claims nothing: no line, no control.
         row = m.row_of("pipewire")

@@ -85,6 +85,13 @@ SRC_MANAGED = "managed"      # a third-party pacman repo (cachyos, …)
 LIB_YOURS = "yours"
 LIB_DEPS = "dependencies"
 
+# The requirer line's heading — one heading for every row. "Needed by" and
+# "dependency for" were the same relation read from two sides, and two
+# headings made the reader compare words instead of reading names: the row
+# and the detail strip wear the arrow, the tooltip's first line is plain.
+REQ_HEADING = "DEPENDENCY FOR:"
+REQ_LABEL = f"\u21b3 {REQ_HEADING}"
+
 _SOURCE_META: dict[str, tuple[str, str]] = {
     # key → (label, filter-card caption)
     SRC_OFFICIAL: ("official", "official"),
@@ -2172,9 +2179,9 @@ def _tracked_row(name: str, version: str, repo: str, title: str = "",
 
     `kind` separates the things the Library list holds: "" (a package
     installed on purpose), "dependency" (a package pulled in by another),
-    and "app" (a launcher no package owns). A dependency row also carries
-    `needs`: the applications that would go with it, by their human
-    names, for the "DEPENDENCY FOR" block.
+    and "app" (a launcher no package owns). Rows also carry `needs`: the
+    applications that would go with the package — or that pulled it in —
+    by their human names, for the requirer line (see REQ_LABEL).
     """
     return {"name": name, "title": title, "version": version, "repo": repo,
             "state": "idle", "failed_op": "",
@@ -5285,10 +5292,7 @@ class TrackedModel(_FilterableModel, QAbstractListModel):
             # whole list — a library can be needed by hundreds.
             needs = [str(n) for n in (item.get("needs") or []) if n]
             if needs:
-                head = ("DEPENDENCY FOR:"
-                        if item.get("kind") == "dependency"
-                        else "NEEDED BY:")
-                return head + "\n" + "\n".join(
+                return REQ_HEADING + "\n" + "\n".join(
                     f"\u2022 {n}" for n in needs)
             if item.get("kind") == "dependency":
                 return "No explicitly installed package needs it."
@@ -5415,16 +5419,6 @@ class TrackedDelegate(QStyledItemDelegate):
             return []
         return [str(n) for n in (item.get("needs") or []) if n]
 
-    def _req_heading(self, item: dict) -> str:
-        """What the requirer line is about, per row.
-
-        A dependency row *is* a package that came along with something
-        else, and the question is who pulled it in; a row of your own
-        software answers what would go with it (see AGENTS.md).
-        """
-        return ("\u21b3 DEPENDENCY FOR:"
-                if item.get("kind") == "dependency" else "\u21b3 NEEDED BY:")
-
     def set_detail(self, name: str) -> None:
         """Which package's requirer list the panel shows ("" = none)."""
         if self._detail_name == name:
@@ -5452,7 +5446,7 @@ class TrackedDelegate(QStyledItemDelegate):
             self.detail_requested.emit("", "", [])
             return
         self.set_detail(name)
-        self.detail_requested.emit(name, self._req_heading(item), names)
+        self.detail_requested.emit(name, REQ_LABEL, names)
 
     def _geom(self, row: int, item: dict, width: int) -> dict:
         # Same card as the Updates list: rail, name row with the one row
@@ -5545,7 +5539,7 @@ class TrackedDelegate(QStyledItemDelegate):
         req_more_txt = ""
         if requirers:
             fm_eye = QFontMetrics(self._f_eyebrow)
-            req_label_txt = self._req_heading(item)
+            req_label_txt = REQ_LABEL
             head_w = fm_eye.horizontalAdvance(req_label_txt) + 8
             names_w = max(40, hint.width() - head_w)
             joined = " · ".join(requirers)
