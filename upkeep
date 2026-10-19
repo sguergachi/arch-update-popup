@@ -3925,32 +3925,36 @@ def _selection_text(selected: int, total: int) -> str:
     if total == 0:
         return "Nothing selected"
     if selected >= total:
-        return f"All {total} packages selected"
+        return (f"All {total} packages selected" if total > 1
+                else "1 package selected")
     if selected == 0:
         return "No packages selected"
     return f"{selected} of {total} selected"
 
 
 class _ControlsRow(QWidget):
-    """The strip above the list: filter, view switcher, selection.
+    """The row above a list: its filter field, its filter cells, Select all.
 
-    One row for the whole window instead of one per page, and the view
-    switcher lives inside it — so the tabs sit at exactly the same place
-    whichever page is on screen (see AGENTS.md).
+    One row for the whole window (see `_sync_controls`) instead of one per
+    page, and it reads left to right: the filter field, then the page's
+    stat cells — numbers that double as the source filters, each one a
+    click away from filtering the list below — then Select all at the far
+    right. The pages that hold nothing to filter and nothing to tick
+    (Obsolete, Security) hide the whole row; their content starts at the
+    top of the window, the way it always has.
 
-    What the row holds follows the page being shown, through *slots*
-    rather than widgets: the filter column keeps its width even on the
-    pages that have nothing to filter (Obsolete, Security), which is what
-    stops the tabs sliding when you change pages. Select all sits last,
-    where it can come and go without moving anything after it. The count
-    of what is selected is not here: it belongs in the footer, next to
-    the total it counts (see `_selection_text`).
+    Nothing in here may change size: the field has its fixed width, the
+    "N of M" has its reserved slot, and the cards between them only ever
+    swap for another page's cards. The count of what is *selected* is not
+    here at all — it lives in the list footer, next to the total it counts
+    (see `_selection_text`).
     """
 
     select_all = pyqtSignal(bool)
     filter_changed = pyqtSignal(str)
 
-    FILTER_W = 240          # the filter column, reserved on every page
+    FILTER_W = 240          # the filter field, the same on every page
+    INFO_W = 110            # reserved for "·  1933 of 1933"
 
     def __init__(self) -> None:
         super().__init__()
@@ -3962,44 +3966,36 @@ class _ControlsRow(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(_sp(8))
 
-        # A fixed-width column rather than a fixed-width field: the field
-        # inside can step aside on a page with nothing to filter and the
-        # switcher still sits where it did.
-        self._filter_slot = QWidget()
-        self._filter_slot.setFixedWidth(_sp(self.FILTER_W))
-        # A fixed height too: the field inside steps aside on the pages
-        # with nothing to filter, and the row must hold one height
-        # whatever it does — a single pixel of drift would slide the
-        # tabs (see AGENTS.md).
-        self._filter_slot.setFixedHeight(_sp(34))
-        slot_lay = QHBoxLayout(self._filter_slot)
-        slot_lay.setContentsMargins(0, 0, 0, 0)
+        # The filter field leads the row at its fixed width: it is the
+        # leftmost thing on every page that has a row at all, so nothing
+        # the filter finds can ever move it.
         self.search = QLineEdit()
         self.search.setObjectName("search")
         self.search.setClearButtonEnabled(True)
-        # Same fixed height as every other control in the row: a field that
-        # measured 2px taller than the tabs would make the row's height
-        # depend on whether the field is showing (see AGENTS.md).
-        self.search.setFixedHeight(_sp(34))
+        self.search.setFixedWidth(_sp(self.FILTER_W))
+        # As tall as the cards beside it, so the row's own height cannot
+        # depend on which of the two happens to be taller (see AGENTS.md).
+        self.search.setFixedHeight(_sp(38))
         self.search.setToolTip("Filter this list by name or description")
         self.search.addAction(app_icon("search", 14),
                               QLineEdit.ActionPosition.LeadingPosition)
         self.search.textChanged.connect(self.filter_changed)
-        slot_lay.addWidget(self.search)
-        lay.addWidget(self._filter_slot, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(self.search, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        # The switcher's slot: the window drops the tabs in here, because
-        # they belong to the window, not to any one list.
-        self.tabs = QHBoxLayout()
-        self.tabs.setContentsMargins(0, 0, 0, 0)
-        self.tabs.setSpacing(_sp(4))
-        lay.addLayout(self.tabs)
-        lay.addStretch()
+        # The page's stat cells, filters included: the window drops each
+        # page's strip in here (see the strip stack in UpdateWindow).
+        self.cells = QStackedWidget()
+        lay.addWidget(self.cells, 1)
 
         # How much of the list the filter is hiding — right end, next to
-        # the control that acts on the rows.
+        # the control that acts on the rows. Fixed slot, text swapped
+        # inside it: an empty slot is a state, not a reason to resize the
+        # cards to its left.
         self.filtered = QLabel("")
         self.filtered.setObjectName("meta")
+        self.filtered.setFixedWidth(_sp(self.INFO_W))
+        self.filtered.setAlignment(Qt.AlignmentFlag.AlignRight
+                                   | Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self.filtered, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.check = QCheckBox("Select all")
@@ -4031,16 +4027,9 @@ class _ControlsRow(QWidget):
         self._shown = self.check.checkState()
         self.check.blockSignals(False)
 
-    def show_filter(self, on: bool, placeholder: str = "") -> None:
-        """Point the filter column at the page being shown.
-
-        The column keeps its width either way — a page with nothing to
-        filter simply leaves it empty, and that is what keeps the tabs
-        still when pages change.
-        """
-        if placeholder:
-            self.search.setPlaceholderText(placeholder)
-        self.search.setVisible(on)
+    def set_placeholder(self, text: str) -> None:
+        """Point the field at the page being shown (same field, new hint)."""
+        self.search.setPlaceholderText(text)
 
     def set_filter_text(self, text: str) -> None:
         """Adopt a page's filter without re-running it (see _switch_view)."""
@@ -4050,15 +4039,18 @@ class _ControlsRow(QWidget):
         self.search.setText(text)
         self.search.blockSignals(False)
 
-    def show_select(self, on: bool) -> None:
-        """Select all only means something where rows can be ticked."""
-        self.check.setVisible(on)
-
     def set_filter_info(self, shown: int, total: int) -> None:
-        """Say how much is hidden, but only when something actually is."""
+        """Say how much is hidden, in a slot that keeps its width.
+
+        The slot is reserved at both ends of the text's life so the cards
+        beside it never resize when a filter starts or stops hiding rows;
+        the whole sentence goes in the tooltip.
+        """
         hidden = total - shown
-        self.filtered.setText(f"·  {shown} of {total}" if hidden > 0 else "")
-        self.filtered.setVisible(hidden > 0)
+        text = f"·  {shown} of {total}" if hidden > 0 else ""
+        self.filtered.setText(self.filtered.fontMetrics().elidedText(
+            text, Qt.TextElideMode.ElideRight, _sp(self.INFO_W)))
+        self.filtered.setToolTip(text)
 
 
 class _ListPlaceholder(QWidget):
@@ -5965,13 +5957,10 @@ class UpdateWindow(QMainWindow):
         # free header width so the status line only wraps when it must.
         head.addLayout(title_block, 1)
 
-        # View switcher: Updates | Tracked | Untracked | Obsolete |
-        # Security. Borderless segments that only fill with the accent
-        # when active, so the group reads as one control rather than five
-        # loose pills. They are *built* here (their counts arrive with the
-        # first model) but placed in the window's control row below the
-        # stats, between the filter and Select all — one row for every
-        # page, so the tabs never move when pages change.
+        # View switcher lives here, right of the title: Updates | Tracked |
+        # Untracked | Obsolete | Security. Borderless segments that only
+        # fill with the accent when active, so the group reads as one
+        # control rather than five loose pills.
         self._view_buttons: dict[str, QPushButton] = {}
         self._view_group = QButtonGroup(self)
         self._view_group.setExclusive(True)
@@ -5993,6 +5982,7 @@ class UpdateWindow(QMainWindow):
                 lambda _c=False, k=_key: self._switch_view(k))
             self._view_group.addButton(_btn)
             self._view_buttons[_key] = _btn
+            head.addWidget(_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         # The Updates tab doubles as Check Now: clicking it while active
         # re-runs the update check (see _switch_view).
         self._view_buttons["updates"].setToolTip(
@@ -6023,19 +6013,15 @@ class UpdateWindow(QMainWindow):
         content.addLayout(left, 1)
         self._left_col = left
 
-        # ── Zone 3 · Stats stack, one control row, list stack ───────────────
-        # The cards and the two banners belong to a page, so they stack
-        # with it. The control row under them belongs to the *window*:
-        # one filter, one view switcher, one Select all, in the same place
-        # on every page — the tabs must not move when you change tabs.
-        # The lists themselves are the pages, in their own stack below.
-        self._strip_stack = QStackedWidget()
-        left.addWidget(self._strip_stack)
+        # ── Zone 3 · One control row, then the lists ────────────────────────
+        # The row holds the filter field and, next to it, the stat cells
+        # of the page on screen — numbers that double as the source
+        # filters, one click from filtering the list below (see
+        # _ControlsRow). Those cells are a stack, so switching pages swaps
+        # them without moving the row; the lists themselves are the pages,
+        # in their own stack under it.
         self._controls = _ControlsRow()
         left.addWidget(self._controls)
-        for _btn in self._view_buttons.values():
-            self._controls.tabs.addWidget(
-                _btn, 0, Qt.AlignmentFlag.AlignVCenter)
         # The row's handlers look up the page being shown: one control,
         # whichever list is on screen (see _select_all_in_view).
         self._controls.select_all.connect(self._select_all_in_view)
@@ -6092,7 +6078,7 @@ class UpdateWindow(QMainWindow):
         # Left-aligned grid: any leftover width is honest whitespace, not
         # a stretched empty card.
         stats.addStretch()
-        self._strip_stack.addWidget(self._stats_row)
+        self._controls.cells.addWidget(self._stats_row)
 
         # ── Failure banner slot ─────────────────────────────────────────────
         # NOTE: intentionally no top banner widget. A dynamically shown
@@ -6363,10 +6349,9 @@ class UpdateWindow(QMainWindow):
         self._obs_scroll.setWidget(self._obs_inner)
         ob.addWidget(self._obs_scroll, 1)
         self._content_stack.addWidget(self._obs_page)
-        # The control row stays at the same height on every page: this
-        # page has no cards of its own, so the slot above it stays empty
-        # instead of pulling the row (and its tabs) up the window.
-        self._strip_stack.addWidget(QWidget())
+        # The row hides on this page (see _sync_controls), but the stack
+        # of cells keeps a slot for it so the pages stay index-aligned.
+        self._controls.cells.addWidget(QWidget())
         self._obs_loaded = False
         self._obs_names: list[str] = []
         self._obs_cards: dict[str, QWidget] = {}
@@ -6421,9 +6406,8 @@ class UpdateWindow(QMainWindow):
         self._sec_scroll.setWidget(self._sec_inner)
         se.addWidget(self._sec_scroll, 1)
         self._content_stack.addWidget(self._sec_page)
-        # Same as Obsolete: no cards, but the slot above the control row
-        # is kept so the tabs sit at one height across all five pages.
-        self._strip_stack.addWidget(QWidget())
+        # Same as Obsolete: no cards, and the row steps aside entirely.
+        self._controls.cells.addWidget(QWidget())
         self._sec_scanner: SystemScanner | None = None
         self._sec_cards: dict[str, QWidget] = {}
 
@@ -6462,7 +6446,7 @@ class UpdateWindow(QMainWindow):
             card.clicked.connect(
                 lambda _=False, k=key: self._toggle_track_filter(k))
         self._track_strip = _stat_strip(list(self._track_stat_cards.values()))
-        self._strip_stack.addWidget(self._track_strip)
+        self._controls.cells.addWidget(self._track_strip)
         self._track_model = TrackedModel()
         self._track_list = QListView()
         self._track_list.setObjectName("package-list")
@@ -6595,7 +6579,7 @@ class UpdateWindow(QMainWindow):
             card.clicked.connect(
                 lambda _=False, k=key: self._toggle_un_filter(k))
         self._un_strip = _stat_strip(list(self._un_stat_cards.values()))
-        self._strip_stack.addWidget(self._un_strip)
+        self._controls.cells.addWidget(self._un_strip)
         self._un_model = TrackedModel()
         self._un_view, self._un_delegate = self._make_card_list(
             self._un_model)
@@ -6648,10 +6632,10 @@ class UpdateWindow(QMainWindow):
         self._content_stack.insertWidget(2, self._un_page)
         self._footer_stack.removeWidget(self._foot_untracked)
         self._footer_stack.insertWidget(2, self._foot_untracked)
-        self._strip_stack.removeWidget(self._track_strip)
-        self._strip_stack.insertWidget(1, self._track_strip)
-        self._strip_stack.removeWidget(self._un_strip)
-        self._strip_stack.insertWidget(2, self._un_strip)
+        self._controls.cells.removeWidget(self._track_strip)
+        self._controls.cells.insertWidget(1, self._track_strip)
+        self._controls.cells.removeWidget(self._un_strip)
+        self._controls.cells.insertWidget(2, self._un_strip)
 
         left.addWidget(self._footer_stack)
         self._update_view_badges()
@@ -6826,7 +6810,7 @@ class UpdateWindow(QMainWindow):
         self._current_view = key
         idx = {"updates": 0, "tracked": 1, "untracked": 2,
                "obsolete": 3, "security": 4}[key]
-        self._strip_stack.setCurrentIndex(idx)
+        self._controls.cells.setCurrentIndex(idx)
         self._content_stack.setCurrentIndex(idx)
         self._footer_stack.setCurrentIndex(idx)
         self._view_buttons[key].setChecked(True)
@@ -6909,17 +6893,15 @@ class UpdateWindow(QMainWindow):
             return
         key = self._current_view
         model = self._controls_model()
+        # Obsolete and Security list cards and have nothing to filter or
+        # to tick, so the whole row steps aside: those pages start at the
+        # top of the window, the way they always have.
+        self._controls.setVisible(model is not None)
         if model is None:
-            # Obsolete and Security list cards, not rows: nothing to
-            # filter and nothing to tick. Their columns stay empty so the
-            # tabs above them cannot move.
-            self._controls.show_filter(False)
-            self._controls.show_select(False)
             self._controls.set_filter_info(0, 0)
             return
-        self._controls.show_filter(True, _FILTER_HINTS.get(key, ""))
+        self._controls.set_placeholder(_FILTER_HINTS.get(key, ""))
         self._controls.set_filter_text(model.filter_text())
-        self._controls.show_select(True)
         if key == "updates":
             self._controls.set_state(self._model.selected_count(),
                                      self._model.checkable_count())

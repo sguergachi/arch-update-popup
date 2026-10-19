@@ -707,22 +707,17 @@ class TestWindow:
         assert pwidgets.index(window._details) < pwidgets.index(window._log_view)
         # error copy button sits next to the details, log copy in log header
         assert window._copy_btn.isHidden()  # no failure yet
-        # log toggle shares the header row with the title; the view
-        # switcher lives down in the window's control row, next to the
-        # filter it belongs with (see TestControlRowAndFilter).
+        # log toggle shares the header row with the view tabs
         head = lay.itemAt(0).layout()
-        assert head.indexOf(window._log_btn) >= 0
-        tabs = window._controls.tabs
         for key in ("updates", "tracked", "untracked", "obsolete",
                     "security"):
-            assert tabs.indexOf(window._view_buttons[key]) >= 0
-        # Filter, then the tabs, then Select all: the order the row reads.
+            assert head.indexOf(window._view_buttons[key]) >= 0
+        assert head.indexOf(window._log_btn) >= 0
+        # The control row reads: filter field, the page's cards, Select all.
         row = window._controls.layout()
-        assert row.indexOf(window._controls._filter_slot) == 0
-        tabs_at = next(i for i in range(row.count())
-                       if row.itemAt(i).layout() is window._controls.tabs)
-        assert tabs_at > 0
-        assert row.indexOf(window._controls.check) > tabs_at
+        assert row.indexOf(window._controls.search) == 0
+        assert row.indexOf(window._controls.cells) == 1
+        assert row.indexOf(window._controls.check) > 1
 
     def test_failure_shows_error_in_panel(self, window):
         window._safe_names = ["konsole"]
@@ -1000,6 +995,11 @@ class TestViews:
 
     def test_obsolete_view_lists_and_removes(
             self, window, qapp, monkeypatch):
+        # This test feeds the preload by hand: silence the stubbed checker
+        # thread, or its empty result can land after these names and wipe
+        # them (see _on_obs_preload_done).
+        monkeypatch.setattr(app.ObsoleteChecker, "start",
+                            lambda self: None)
         window._obs_loaded = False
         window._switch_view("obsolete")
         qapp.processEvents()
@@ -1931,32 +1931,53 @@ class TestEmptyState:
 
 
 class TestControlRowAndFilter:
-    """The window's one control row: filter, view switcher, Select all.
+    """The window's one control row: the filter field and the filter cards.
 
-    The row is shared by all five pages — the tabs sit between the filter
-    and Select all and must stay put when pages change (see AGENTS.md).
-    The count of what is selected lives in the list footer instead.
+    The row is shared by all five pages: the field on the left, the page's
+    own stat cells (numbers that double as source filters) right beside
+    it, Select all at the far right. It holds its shape when pages change;
+    the pages that have nothing to filter hide the whole row. The count of
+    what is selected lives in the list footer instead (see AGENTS.md).
     """
 
-    def test_row_sits_between_the_cards_and_the_list(self, window, qapp):
+    def test_row_holds_the_pages_cards_next_to_the_filter(
+            self, window, qapp):
         left = window._left_col
         widgets = [left.itemAt(i).widget() for i in range(left.count())]
-        assert window._strip_stack in widgets
         assert window._controls in widgets
         assert window._content_stack in widgets
-        assert widgets.index(window._strip_stack) < \
-            widgets.index(window._controls)
         assert widgets.index(window._controls) < \
             widgets.index(window._content_stack)
-        # The current page's cards are above the row, its list below.
-        assert window._strip_stack.currentWidget() is window._stats_row
+        # The current page's cards sit *in* the row, beside the field,
+        # and its list below it.
+        assert window._controls.cells.currentWidget() is window._stats_row
         assert window._content_stack.currentWidget() is window._up_page
         # ...and the footer no longer carries All/None buttons.
         assert not hasattr(window, "_select_all_btn")
         assert not hasattr(window, "_select_none_btn")
 
+    def test_the_cards_are_the_source_filters(self, window, qapp):
+        """Each cell in the row filters the list it stands for."""
+        window._toggle_update_filter("aur")
+        qapp.processEvents()
+        assert window._model.filter_source() == "aur"
+        assert window._stat_aur.property("active") is True
+        assert window._stat_ready.property("active") is False
+        window._toggle_update_filter("aur")
+        qapp.processEvents()
+        assert window._model.filter_source() == ""
+        assert window._stat_aur.property("active") is False
+
+    def test_selection_text_reads_in_english(self):
+        """One package is not "All 1 packages selected"."""
+        assert app._selection_text(0, 0) == "Nothing selected"
+        assert app._selection_text(0, 3) == "No packages selected"
+        assert app._selection_text(1, 1) == "1 package selected"
+        assert app._selection_text(2, 2) == "All 2 packages selected"
+        assert app._selection_text(1, 3) == "1 of 3 selected"
+
     def test_switcher_stays_put_across_pages(self, window, qapp):
-        """The tabs are in the shared row: changing pages cannot move them."""
+        """The tabs are in the window header: pages cannot move them."""
         before = {k: b.geometry() for k, b in window._view_buttons.items()}
         for key in ("tracked", "untracked", "obsolete", "security",
                     "updates"):
@@ -1964,14 +1985,26 @@ class TestControlRowAndFilter:
             qapp.processEvents()
             assert {k: b.geometry()
                     for k, b in window._view_buttons.items()} == before
-        # Every page shows the same row: the tabs, and the filter column
-        # reserved even where there is nothing to filter.
-        assert window._controls.search.isVisible()
-        window._switch_view("obsolete")
-        qapp.processEvents()
-        assert not window._controls.search.isVisible()
-        assert window._controls._filter_slot.width() > 0
+
+    def test_the_filter_field_does_not_move_between_pages(self, window,
+                                                          qapp):
+        """The field leads the row on every page that has one, and the
+        row steps aside on the two pages that have nothing to filter."""
+        places = []
+        for key in ("updates", "tracked", "untracked"):
+            window._switch_view(key)
+            qapp.processEvents()
+            assert window._controls.isVisible()
+            places.append(window._controls.search.geometry())
+        assert places[0] == places[1] == places[2]
+        for key in ("obsolete", "security"):
+            window._switch_view(key)
+            qapp.processEvents()
+            # Nothing to filter, nothing to tick: no row at all, so the
+            # page starts at the top of the window.
+            assert not window._controls.isVisible()
         window._switch_view("updates")
+        qapp.processEvents()
 
     def test_untracked_search_filters_that_page(self, window, qapp):
         """The one filter field serves the Untracked list too."""
@@ -2074,15 +2107,22 @@ class TestControlRowAndFilter:
                 range(window._model.rowCount())] == ["konsole"]
 
     def test_filter_reports_what_it_hides(self, window, qapp):
+        cards = {k: c.geometry() for k, c in window._update_stat_cards.items()}
         window._controls.search.setText("aur")
         qapp.processEvents()
         assert "2 of 4" in window._controls.filtered.text()
         # The tab still answers "how many updates are pending".
         assert window._view_buttons["updates"].text() == "Updates (4)"
+        # Saying how much is hidden must not resize the cards beside it:
+        # the info keeps its reserved slot either way.
+        assert {k: c.geometry()
+                for k, c in window._update_stat_cards.items()} == cards
         window._controls.search.clear()
         qapp.processEvents()
         assert window._controls.filtered.text() == ""
-        assert not window._controls.filtered.isVisible()
+        assert window._controls.filtered.isVisible()
+        assert {k: c.geometry()
+                for k, c in window._update_stat_cards.items()} == cards
 
     def test_filter_offers_a_way_back(self, window, qapp):
         window._controls.search.setText("nothing-matches-this")

@@ -5,17 +5,21 @@
 The window's layout is **fixed**. A state change may change what is *inside* a
 slot; it may never move the slots.
 
-- **Never show/hide a container to signal state.** The stat strip, the control
-  row, the list frame and the footer controls are always present. Hiding one
-  moves everything below it — that reads as a glitch and makes the app feel
-  unstable. Disable a control instead of hiding it, and swap its *text*.
-- **The view switcher lives in the control row, and it never moves.** One row
-  (`_ControlsRow`) serves all five pages, between the page's cards and its
-  list: filter, tabs, Select all. It is a window-level widget, not one per
-  page, and `_sync_controls` only swaps what its *slots* hold. The filter
-  column keeps its width on pages that have nothing to filter (Obsolete,
-  Security) precisely so the tabs cannot slide when you change pages. Its
-  height is pinned there too, for the same reason.
+- **Never show/hide a container to signal state.** The stat cells, the control
+  row, the list frame and the footer controls are always present on a page that
+  has them. Hiding one moves everything below it — that reads as a glitch and
+  makes the app feel unstable. Disable a control instead of hiding it, and swap
+  its *text*.
+- **The filter field and the cards live in one control row.** `_ControlsRow` is
+  a window-level widget that serves the pages which have something to filter:
+  the field on the left at its fixed width, then the page's stat cells — the
+  numbers that double as the source filters — then Select all at the far right.
+  Nothing in the row may change size: the field is fixed, and "N of M" has a
+  reserved slot so the cards beside it never resize when a filter starts
+  hiding rows. Obsolete and Security have nothing to filter and nothing to
+  tick, so they hide the *whole row* — a page difference, not a state change;
+  within a page the row is never hidden. The **view switcher is not in here**:
+  it stays in the window header, where no page can move it.
 - **Reserve space for anything conditional.** A line that only appears during
   progress keeps its height whether or not it has text. Give the status line one
   line of fixed height, elide it, and put the full text in a tooltip — never let
@@ -40,8 +44,10 @@ slot; it may never move the slots.
 
 One place per fact, and no page owns a line of its own:
 
-- **Numbers live in the stat strip.** How many packages, from where — the
-  cards above the list say it. A page never repeats them in a paragraph.
+- **Numbers live in the stat cells** — the cards in the control row, beside the
+  filter field. How many packages, from where, and each card is one click from
+  filtering the list down to what it counted. A page never repeats them in a
+  paragraph.
 - **Loading info lives on the status line, top left** (with the header progress
   track under it). Not beside the list, not in a footer: a list in flight
   reports itself there (`_set_load_status`), and only while its own page is the
@@ -54,7 +60,7 @@ One place per fact, and no page owns a line of its own:
   that acts on them.
 - **How much is selected lives in the footer**, next to that count:
   `390 tracked · All 390 packages selected` (see `_selection_text`). Not beside
-  Select all — that row belongs to the filter and the tabs.
+  Select all — that row belongs to the filter field and the cards.
 
 Why: pressing Refresh with 13 updates and getting 0 must not make the window
 jump. Movement is read as a bug even when the new state is correct.
