@@ -2390,6 +2390,95 @@ class TestProgressReadout:
         assert "<b>100%</b>" in window._progress_phrase()
 
 
+class TestLoadProgressBar:
+    """A list load fills the header track — one owner at a time."""
+
+    def test_the_visible_pages_load_fills_the_track(self, window):
+        window._switch_view("tracked")
+        window._on_load_progress("tracked", 450,
+                                 "Working out what needs what…")
+        assert window._progress.maximum() == 1000
+        assert window._progress.value() == 450
+        assert window._progress.property("state") == "running"
+        assert "Working out what needs what… · 45%" in window._sub.text()
+
+    def test_a_load_on_another_page_waits_its_turn(self, window, qapp):
+        # Updates is on screen: the scan's progress is kept, not painted.
+        before = (window._progress.minimum(), window._progress.maximum(),
+                  window._progress.value())
+        window._on_load_progress("untracked", 340,
+                                 "Reading the package database…")
+        assert (window._progress.minimum(), window._progress.maximum(),
+                window._progress.value()) == before
+        assert "Reading the package database" not in window._sub.text()
+        window._untracked_loaded = True     # no lazy scan on the way in
+        window._switch_view("untracked")
+        assert window._progress.maximum() == 1000
+        assert window._progress.value() == 340
+        assert "Reading the package database… · 34%" in window._sub.text()
+
+    def test_a_job_keeps_the_track_and_hands_it_back(self, window):
+        window._switch_view("tracked")
+        window._on_load_progress("tracked", 340,
+                                 "Reading the installed packages…")
+        window._set_status("Installing 2 packages…", "info")
+        window._progress.setRange(0, 2)
+        window._progress.setValue(1)
+        window._on_load_progress("tracked", 600,
+                                 "Working out what needs what…")
+        assert window._progress.maximum() == 2     # the job's bar, untouched
+        assert window._progress.value() == 1
+        assert "Working out what needs what" not in window._sub.text()
+        # The job is over: the load takes the track back where it stands.
+        window._end_job_status()
+        assert window._progress.maximum() == 1000
+        assert window._progress.value() == 600
+
+    def test_the_load_ending_gives_the_track_back(self, window):
+        window._switch_view("tracked")
+        window._on_load_progress("tracked", 950,
+                                 "Adding Flatpak apps and AppImages…")
+        window._clear_load_track("tracked")
+        assert window._progress.maximum() == 1
+        assert window._progress.value() == 0
+        assert window._progress.property("state") == "idle"
+        assert "Adding Flatpak" not in window._sub.text()
+
+    def test_release_notes_leave_a_loads_bar_alone(self, window):
+        window._switch_view("tracked")
+        window._on_load_progress("tracked", 600,
+                                 "Working out what needs what…")
+        window.on_info_ready(0, "d", "n", "2026-01-01")
+        assert window._progress.maximum() == 1000
+        assert window._progress.value() == 600
+        window.on_fetch_done()
+        assert window._progress.maximum() == 1000
+        assert window._progress.value() == 600
+
+    def test_a_thread_that_dies_without_reporting_frees_the_track(
+            self, window):
+        loader = app.TrackedLoader()
+        window._track_loader = loader
+        window._wire_load("tracked", loader)
+        window._switch_view("tracked")
+        loader.progress.emit(400, "Working out what needs what…")
+        assert window._progress.value() == 400
+        loader.finished.emit()          # ended without ever reaching 1000
+        assert window._progress.maximum() == 1
+        assert window._progress.value() == 0
+
+    def test_a_stale_loaders_finish_leaves_the_new_one_alone(self, window):
+        old, new = app.TrackedLoader(), app.TrackedLoader()
+        window._track_loader = new
+        window._wire_load("tracked", old)
+        window._switch_view("tracked")
+        window._on_load_progress("tracked", 300,
+                                 "Reading the installed packages…")
+        old.finished.emit()             # the page already moved on to `new`
+        assert window._progress.maximum() == 1000
+        assert window._progress.value() == 300
+
+
 class TestPerf:
     def test_layout_and_paint_budget(self, qapp):
         ups = _updates(322)

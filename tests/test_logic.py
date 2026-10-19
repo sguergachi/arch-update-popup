@@ -1040,6 +1040,131 @@ class TestDependencyRows:
         assert rows[0]["needs_known"] is False
 
 
+class TestLoadSteps:
+    """A list load reports its stages as a bar that fills (see _LoadSteps)."""
+
+    def test_each_stage_takes_the_share_its_weight_declares(self):
+        seen = []
+        steps = app._LoadSteps(lambda p, what: seen.append((p, what)))
+        steps.plan([("First…", 3), ("Second…", 1)])
+        steps.begin()
+        assert seen == [(0, "First…")]
+        steps.item(1, 2)
+        assert seen[-1][0] == 375           # half of the first stage
+        steps.begin()
+        assert seen[-1] == (750, "Second…")
+        steps.finish()
+        assert seen[-1] == (1000, "Second…")
+
+    def test_items_fill_the_stage_that_is_running(self):
+        seen = []
+        steps = app._LoadSteps(lambda p, what: seen.append(p))
+        steps.plan([("Work…", 1)])
+        steps.begin()
+        steps.item(50, 100)
+        assert seen == [0, 500]
+
+    def test_the_bar_only_ever_moves_forward(self):
+        seen = []
+        steps = app._LoadSteps(lambda p, what: seen.append(p))
+        steps.plan([("Work…", 1)])
+        steps.begin()
+        for i in range(1, 2001):
+            steps.item(i, 2000)
+        assert seen == sorted(set(seen))
+        assert seen[0] == 0 and seen[-1] == 1000
+        # ~1% steps: a 1900-item loop never writes what it cannot show.
+        assert len(seen) <= 102
+
+    def test_a_new_stage_is_said_even_at_the_same_permille(self):
+        seen = []
+        steps = app._LoadSteps(lambda p, what: seen.append((p, what)))
+        steps.plan([("One…", 1), ("Two…", 1)])
+        steps.begin()
+        steps.item(10, 10)
+        steps.begin()               # same place on the bar, new label
+        assert seen[-2:] == [(500, "One…"), (500, "Two…")]
+
+    def test_a_load_with_nothing_to_say_stays_silent(self):
+        # The loaders hand a no-op reporter to helpers called on their own
+        # (see _load_apps), so those calls must never fabricate progress.
+        seen = []
+        steps = app._LoadSteps(lambda p, what: seen.append(p))
+        steps.begin()
+        steps.item(1, 2)
+        steps.finish()
+        assert seen == []
+
+    def test_one_stage_alone_still_reaches_a_full_bar(self):
+        seen = []
+        steps = app._LoadSteps(lambda p, what: seen.append(p))
+        steps.plan([("Only…", 7)])
+        steps.begin()
+        steps.finish()
+        assert seen == [0, 1000]
+
+
+class TestLoadProgress:
+    """Both list loads narrate their stages for the status line and track."""
+
+    def test_the_tracked_load_names_every_stage_it_fills(self, monkeypatch):
+        monkeypatch.setattr(app, "get_installed_packages", lambda: [])
+        monkeypatch.setattr(app, "required_by_map", lambda: {})
+        monkeypatch.setattr(app, "flatpak_tracked_rows", lambda: [])
+        monkeypatch.setattr(app, "appimage_rows", lambda: [])
+        seen = []
+        app.load_tracked(app._LoadSteps(lambda p, what:
+                                        seen.append((p, what))))
+        assert seen == [
+            (0, "Reading the installed packages…"),
+            (600, "Working out what needs what…"),
+            (950, "Adding Flatpak apps and AppImages…"),
+            (1000, "Adding Flatpak apps and AppImages…")]
+
+    def test_the_untracked_scan_names_every_stage_it_fills(self, monkeypatch):
+        class R:
+            stdout = ""
+            returncode = 0
+
+        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
+        monkeypatch.setattr(app, "scan_desktop_files", lambda: [])
+        monkeypatch.setattr(app, "_installed_version_map", lambda: {})
+        monkeypatch.setattr(app, "_explicit_package_set", lambda: set())
+        monkeypatch.setattr(app, "required_by_map", lambda: {})
+        monkeypatch.setattr(app, "all_package_descs", lambda: {})
+        monkeypatch.setattr(app, "_run", lambda *a, **k: R())
+        seen = []
+        loader = app.UntrackedLoader()
+        loader.progress.connect(lambda p, what: seen.append((p, what)))
+        loader.run()
+        assert seen == [
+            (0, "Reading the package database…"),
+            (340, "Matching applications to packages…"),
+            (560, "Working out what needs what…"),
+            (850, "Naming the apps behind each dependency…"),
+            (1000, "Naming the apps behind each dependency…")]
+
+    def test_the_dependency_rows_fill_their_stage_row_by_row(self,
+                                                             monkeypatch):
+        class R:
+            stdout = "".join(f"lib{i} 1-1\n" for i in range(400))
+            returncode = 0
+
+        monkeypatch.setattr(app, "_run", lambda *a, **k: R())
+        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
+        monkeypatch.setattr(app, "required_by_map", lambda: {"lib1": ["x"]})
+        monkeypatch.setattr(app, "_explicit_package_set", lambda: {"x"})
+        monkeypatch.setattr(app, "all_package_descs", lambda: {})
+        seen = []
+        steps = app._LoadSteps(lambda p, what: seen.append(p))
+        steps.plan([("Reading the dependency list…", 3), ("Rows…", 1)])
+        steps.begin()
+        rows = app.UntrackedLoader()._load_deps({}, {}, steps)
+        assert len(rows) == 400
+        assert seen[0] == 0 and seen[-1] == 1000
+        assert len(seen) > 10       # 400 rows fill it, they do not jump it
+
+
 class TestTrackedRequirers:
     """Tracked rows say what would go with them, like stray dependencies.
 

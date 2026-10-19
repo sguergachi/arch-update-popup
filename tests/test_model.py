@@ -684,6 +684,63 @@ class TestUntrackedScan:
             ("A", "foo", "1-1"), ("B", "b", "")]
         assert [(r["name"], r["version"]) for r in pkgs] == [("dep", "2-1")]
 
+    def test_a_batch_that_answered_is_never_asked_again_file_by_file(
+            self, qapp, monkeypatch):
+        """An unowned file answers the same way however it is asked, so a
+        batched reply settles the whole desktop — asking the leftovers one
+        by one cost 5.8 seconds for zero rows on a real machine."""
+        calls = []
+
+        class R:
+            def __init__(self, rc, out):
+                self.returncode = rc
+                self.stdout = out
+
+        def fake_run(cmd, **k):
+            calls.append(list(cmd))
+            if cmd[:2] == ["pacman", "-Qo"]:
+                return R(1, "/u/owned.desktop is owned by foo 1-1\n"
+                            "error: No package owns /u/stray.desktop")
+            return R(1, "")
+
+        monkeypatch.setattr(app, "_run", fake_run)
+        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
+        monkeypatch.setattr(app, "scan_desktop_files", lambda: [
+            {"file": "/u/owned.desktop", "title": "Owned", "comment": "",
+             "exec": "owned"},
+            {"file": "/u/stray.desktop", "title": "Stray", "comment": "",
+             "exec": "stray"}])
+        app.UntrackedLoader()._load_apps({}, app._LoadSteps())
+        asked = [c for c in calls if c[:2] == ["pacman", "-Qo"]]
+        assert asked == [["pacman", "-Qo", "/u/owned.desktop",
+                          "/u/stray.desktop"]]
+
+    def test_a_batch_that_could_not_run_falls_back_file_by_file(
+            self, qapp, monkeypatch):
+        """A refused command line (too many launchers, say) is the one case
+        the per-file query still answers: the batch never spoke."""
+
+        class R:
+            def __init__(self, rc, out):
+                self.returncode = rc
+                self.stdout = out
+
+        def fake_run(cmd, **k):
+            if cmd[:2] == ["pacman", "-Qo"] and len(cmd) > 3:
+                raise OSError("argument list too long")
+            if cmd[:2] == ["pacman", "-Qo"]:
+                return R(0, f"{cmd[2]} is owned by foo 1-1")
+            return R(1, "")
+
+        monkeypatch.setattr(app, "_run", fake_run)
+        monkeypatch.setattr(app, "_installed_repo_map", lambda: {})
+        monkeypatch.setattr(app, "scan_desktop_files", lambda: [
+            {"file": "/u/zen.desktop", "title": "Zen", "comment": "",
+             "exec": "zen"}])
+        rows, _titles = app.UntrackedLoader()._load_apps({},
+                                                         app._LoadSteps())
+        assert [(r["name"], r["version"]) for r in rows] == [("foo", "1-1")]
+
     def test_loader_dedupes_same_app(self, qapp, monkeypatch):
         class R:
             def __init__(self, rc, out):

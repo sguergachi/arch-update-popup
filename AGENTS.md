@@ -64,6 +64,14 @@ One place per fact, and no page owns a line of its own:
   reports itself there (`_set_load_status`), and only while its own page is the
   one on screen — which is exactly where the removed per-page line used to sit.
   A running job (check, install, removal, scan) always keeps that line.
+  A list load also **fills the track**, stage by stage, and says the stage and
+  the percent (`Reading the package database… · 34%`): `_LoadSteps` turns the
+  loader's own stages — weighted by how long each really takes — into one
+  0..1000 bar, so a two-second read fills as it goes instead of spinning. The
+  track has **one owner at a time** — a job, a load, or the release notes
+  arriving — and a load takes it only while its page is on screen; a load that
+  ends (or dies) hands it straight back (`_render_load_track`,
+  `_on_load_progress`).
 - **The list's own placeholder carries the verdict** ("Nothing tracked",
   "Not scanned yet" — and "No matches" when a filter is hiding everything) and
   the list footer the count (`5 tracked`). Explanations that are the same for

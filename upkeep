@@ -1670,13 +1670,96 @@ def flatpak_tracked_rows() -> list[dict]:
     return rows
 
 
-def load_tracked() -> list[dict]:
+class _LoadSteps:
+    """Report one list load as a bar filling through its real stages.
+
+    A loader knows its own stages but not how long each will take on this
+    machine, and a bar that fills on a timer lies the moment the machine
+    is slow. So every stage declares a weight up front — milliseconds as
+    measured on a real machine, written where the stage is declared — and
+    reports its items as they finish. The slow stages then fill smoothly
+    instead of jumping at their end, a stage that turns out cheap simply
+    completes, and the label always names the work in hand, which is the
+    honest answer to "how long is this going to take".
+
+    A weight only sets the bar's rate; nothing here ever claims a time.
+    Reports `(permille, label)` on the 0..1000 scale of the header track.
+    """
+
+    # Report every 1% of the whole load: finer than the eye can tell on
+    # the header track, and it keeps a 1900-item loop from flogging the
+    # GUI thread with writes it cannot show.
+    STEP = 10
+
+    def __init__(self, report=None) -> None:
+        self._report = report
+        self._stages: list[tuple[str, int]] = []
+        self._total = 0
+        self._done = 0
+        self._span = 0
+        self._i = -1
+        self._sent = -1
+
+    def plan(self, stages: list[tuple[str, int]]) -> None:
+        """Declare the stages — (label, weight) — before the first one."""
+        self._stages = [(label, max(0, weight)) for label, weight in stages]
+        self._total = sum(weight for _label, weight in self._stages) or 1
+
+    def begin(self) -> None:
+        """The next declared stage is starting."""
+        self._done += self._span    # the stage that just ended
+        self._i += 1
+        self._span = (self._stages[self._i][1]
+                      if 0 <= self._i < len(self._stages) else 0)
+        self._put(0.0, force=True)  # a new label must be said
+
+    def item(self, done: float, total: float) -> None:
+        """`done` of `total` items in the current stage are finished."""
+        self._put((done / total) if total else 1.0)
+
+    def finish(self) -> None:
+        """The load is over: the bar is full and nobody is waiting."""
+        self._done = self._total
+        self._span = 0
+        self._put(1.0)
+
+    @property
+    def label(self) -> str:
+        """What the load is doing right now."""
+        if 0 <= self._i < len(self._stages):
+            return self._stages[self._i][0]
+        return ""
+
+    def _put(self, frac: float, force: bool = False) -> None:
+        if self._report is None or not self._total:
+            return
+        frac = min(1.0, max(0.0, frac))
+        permille = min(1000, int(1000 * (self._done + self._span * frac)
+                                  / self._total))
+        # A bar that only ever moves: no writes it cannot show, and none
+        # that could step backwards (the weight in hand is monotone).
+        if not force and permille - self._sent < self.STEP and permille < 1000:
+            return
+        self._sent = permille
+        self._report(permille, self.label)
+
+
+def load_tracked(steps: _LoadSteps | None = None) -> list[dict]:
     """Everything the Tracked tab shows: explicitly installed packages,
     installed Flatpak apps, and installed AppImages."""
+    steps = steps or _LoadSteps()
+    # Weights are the split as measured on a real machine (see
+    # _LoadSteps): the package list with its repos is most of the load,
+    # the requirer map most of the rest, the extras a moment at the end.
+    steps.plan([("Reading the installed packages…", 60),
+                ("Working out what needs what…", 35),
+                ("Adding Flatpak apps and AppImages…", 5)])
+    steps.begin()
     try:
         installed = get_installed_packages()
     except Exception:
         installed = []
+    steps.begin()
     # What would go with each package if it were removed: the explicit
     # packages that (transitively) need it, resolved to the top of the
     # chain so the answer names an application, not another library (see
@@ -1692,6 +1775,7 @@ def load_tracked() -> list[dict]:
                 pkg["needs_known"] = True
     except Exception:
         pass
+    steps.begin()
     try:
         installed += flatpak_tracked_rows()
     except Exception:
@@ -1700,15 +1784,17 @@ def load_tracked() -> list[dict]:
         installed += appimage_rows()
     except Exception:
         pass
+    steps.finish()
     return installed
 
 
 class TrackedLoader(QThread):
     """Loads explicitly installed packages + Flatpak apps + AppImages."""
-    done = pyqtSignal(list)  # installed
+    done = pyqtSignal(list)          # installed
+    progress = pyqtSignal(int, str)  # permille of the load, what it reads
 
     def run(self) -> None:
-        self.done.emit(load_tracked())
+        self.done.emit(load_tracked(_LoadSteps(self.progress.emit)))
 
 
 def pick_desktop_file(pkgname: str, paths: list[str]) -> str:
@@ -2567,55 +2653,80 @@ class UntrackedLoader(QThread):
     via a single batched `pacman -Qo`; dependency packages from one
     `pacman -Qd`. Pure compute — safe to interrupt + park on shutdown.
     """
-    done = pyqtSignal(list, list)  # (app_rows, dep_rows)
+    done = pyqtSignal(list, list)    # (app_rows, dep_rows)
+    progress = pyqtSignal(int, str)  # permille of the scan, what it reads
 
     def run(self) -> None:
+        # The split as measured on a real machine (see _LoadSteps): the
+        # package database ~680ms, matching the launchers ~440ms, the
+        # requirer map ~540ms, naming the apps behind each dependency
+        # ~380ms. Stages shorter than a label can be read are merged.
+        steps = _LoadSteps(self.progress.emit)
+        steps.plan([("Reading the package database…", 34),
+                    ("Matching applications to packages…", 22),
+                    ("Working out what needs what…", 29),
+                    ("Naming the apps behind each dependency…", 15)])
         try:
+            steps.begin()
             repos = _installed_repo_map()
-            apps, titles = self._load_apps(repos)
+            steps.begin()
+            apps, titles = self._load_apps(repos, steps)
             if self.isInterruptionRequested():
                 return
-            pkgs = self._load_deps(titles, repos)
+            steps.begin()
+            pkgs = self._load_deps(titles, repos, steps)
         except Exception:
             return
+        steps.finish()
         self.done.emit(apps, pkgs)
 
     def _load_apps(self, repos: dict[str, str] | None = None,
+                   steps: _LoadSteps | None = None,
                    ) -> tuple[list[dict], dict[str, str]]:
         """(app rows, {package: launcher title}) — the titles cover every
         package that ships a launcher, explicit or not, so a dependency can
         name the applications that need it."""
+        steps = steps or _LoadSteps()
         repos = repos if repos is not None else _installed_repo_map()
         found = scan_desktop_files()
         owners: dict[str, tuple[str | None, str]] = {}
         files = [a["file"] for a in found if not _flatpak_id_for(a)]
         if files and not self.isInterruptionRequested():
-            # pacman prints owned lines even when it exits nonzero over
-            # unowned files — always parse stdout, then resolve only the
-            # files still missing one by one.
+            # One batched call answers for the whole desktop. pacman
+            # prints the owned lines even when it exits nonzero over
+            # unowned files, and an unowned file answers the same way
+            # however it is asked — so the per-file fallback runs only
+            # when the batched call could not run at all (a refused
+            # command line, say). Asking each unowned file individually
+            # cost 5.8 seconds for zero rows on a real machine.
+            batch_failed = False
             try:
                 r = _run(["pacman", "-Qo", *files],
                          capture_output=True, text=True)
                 out = r.stdout or ""
             except Exception:
+                batch_failed = True
                 out = ""
             for line in out.splitlines():
                 f, owner, ver = parse_qo_owner(line)
                 if owner:
                     owners[f] = (owner, ver)
-            for f in files:
-                if f in owners or self.isInterruptionRequested():
-                    continue
-                try:
-                    r = _run(["pacman", "-Qo", f],
-                             capture_output=True, text=True)
-                    o = r.stdout or ""
-                except Exception:
-                    o = ""
-                for line in o.splitlines():
-                    ff, owner, ver = parse_qo_owner(line)
-                    if owner:
-                        owners[ff] = (owner, ver)
+            if batch_failed:
+                missing = [f for f in files if f not in owners]
+                for i, f in enumerate(missing, 1):
+                    if self.isInterruptionRequested():
+                        break
+                    try:
+                        r = _run(["pacman", "-Qo", f],
+                                 capture_output=True, text=True)
+                        o = r.stdout or ""
+                    except Exception:
+                        o = ""
+                    for line in o.splitlines():
+                        ff, owner, ver = parse_qo_owner(line)
+                        if owner:
+                            owners[ff] = (owner, ver)
+                    steps.item(i, len(missing))
         # Launcher title per owning package, for naming apps in messages.
         titles: dict[str, str] = {}
         for app in found:
@@ -2664,7 +2775,9 @@ class UntrackedLoader(QThread):
         return rows, titles
 
     def _load_deps(self, titles: dict[str, str] | None = None,
-                   repos: dict[str, str] | None = None) -> list[dict]:
+                   repos: dict[str, str] | None = None,
+                   steps: _LoadSteps | None = None) -> list[dict]:
+        steps = steps or _LoadSteps()
         try:
             r = _run(["pacman", "-Qd"], capture_output=True, text=True)
         except Exception:
@@ -2679,8 +2792,12 @@ class UntrackedLoader(QThread):
         known = bool(required_by)
         explicit = _explicit_package_set() if known else set()
         descs = all_package_descs()
+        # The requirer map is in hand: what is left is one row per stray
+        # dependency, which is the part that can be counted.
+        steps.begin()
         rows = []
-        for line in r.stdout.splitlines():
+        lines = r.stdout.splitlines()
+        for i, line in enumerate(lines, 1):
             if self.isInterruptionRequested():
                 return []
             parts = line.split()
@@ -2693,6 +2810,7 @@ class UntrackedLoader(QThread):
                 parts[0], parts[1], repos.get(parts[0]) or "official",
                 desc=descs.get(parts[0], ""), kind="dependency",
                 needs=needs, needs_known=known))
+            steps.item(i, len(lines))
         rows.sort(key=lambda it: it["name"].lower())
         return rows
 
@@ -5969,6 +6087,12 @@ class UpdateWindow(QMainWindow):
         # view key -> what that page is reading, while it reads (see
         # _set_load_status).
         self._loads: dict[str, str] = {}
+        # …and how far each page's load has come (permille) plus which
+        # page holds the header track right now — a load fills the same
+        # track a job does, so one of them owns it at a time (see
+        # _on_load_progress).
+        self._load_pct: dict[str, int] = {}
+        self._load_track = ""
         # Single-flight guard for the failure dialog (see _show_error_dialog).
         self._error_dialog_open = False
         # Set when a change (e.g. enabling a source) needs a restart to
@@ -6935,8 +7059,9 @@ class UpdateWindow(QMainWindow):
         self._view_buttons[key].setChecked(True)
         # The status line follows the page you are looking at: a load on
         # this page speaks, a load on another one goes quiet (see
-        # _render_resting_status).
+        # _render_resting_status). The header track follows the same law.
         self._render_resting_status()
+        self._render_load_track()
         if key == "obsolete" and not self._obs_loaded:
             # Never compute on the GUI thread (pacman spawns freeze
             # the UI) — say so on the status line and in the box; the
@@ -6953,6 +7078,7 @@ class UpdateWindow(QMainWindow):
             self._refresh_untracked_summary()
             self._untracked_loader = UntrackedLoader()
             self._untracked_loader.done.connect(self._on_untracked_loaded)
+            self._wire_load("untracked", self._untracked_loader)
             self._untracked_loader.start()
         self._update_view_badges()
 
@@ -7286,10 +7412,12 @@ class UpdateWindow(QMainWindow):
         self._fail_sig = None
         self._fail_streak = 0
         self._hide_failure_ui()
-        self._set_progress_state("normal")
-        self._progress.setRange(0, 1)
-        self._progress.setValue(0)
-        self._progress.setFormat("")
+        if not self._load_track:
+            # A page load filling the track keeps it (see _render_load_track).
+            self._set_progress_state("normal")
+            self._progress.setRange(0, 1)
+            self._progress.setValue(0)
+            self._progress.setFormat("")
         n = len(updates)
         self._stat_ready.set_caption("ready to install")
         self._stat_ready.set_accent(_positive_hex())
@@ -7299,7 +7427,7 @@ class UpdateWindow(QMainWindow):
         # The check that produced these rows is done speaking: the line
         # goes back to rest (or to whatever the visible page is reading).
         self._end_job_status()
-        if n_cached < n:
+        if n_cached < n and not self._load_track:
             self._progress.setRange(0, max(n, 1))
             self._progress.setValue(n_cached)
         self.setWindowTitle(
@@ -7450,6 +7578,7 @@ class UpdateWindow(QMainWindow):
         if not self._track_loaded and self._track_loader is None:
             self._track_loader = TrackedLoader()
             self._track_loader.done.connect(self._on_tracked_loaded)
+            self._wire_load("tracked", self._track_loader)
             self._track_loader.start()
 
     def _fill_obsolete_view(self, names: list[str]) -> None:
@@ -7582,6 +7711,7 @@ class UpdateWindow(QMainWindow):
     # ── Tracked view ─────────────────────────────────────────────────────────
     def _on_tracked_loaded(self, installed: list[dict]) -> None:
         self._release_thread("_track_loader")
+        self._clear_load_track("tracked")
         self._track_loaded = True
         self._track_loading = False
         self._track_model.set_packages(installed)
@@ -7740,6 +7870,7 @@ class UpdateWindow(QMainWindow):
         self._release_thread("_track_loader")
         self._track_loader = TrackedLoader()
         self._track_loader.done.connect(self._on_tracked_loaded)
+        self._wire_load("tracked", self._track_loader)
         self._track_loader.start()
         self._refresh_tracked_summary()
         self._update_view_badges()
@@ -8243,6 +8374,7 @@ class UpdateWindow(QMainWindow):
     def _on_untracked_loaded(self, apps: list[dict],
                              pkgs: list[dict]) -> None:
         self._release_thread("_untracked_loader")
+        self._clear_load_track("untracked")
         self._untracked_loaded = True
         self._un_loading = False
         # One list: applications first, then the stray dependencies, so
@@ -8300,6 +8432,7 @@ class UpdateWindow(QMainWindow):
         self._release_thread("_untracked_loader")
         self._untracked_loader = UntrackedLoader()
         self._untracked_loader.done.connect(self._on_untracked_loaded)
+        self._wire_load("untracked", self._untracked_loader)
         self._untracked_loader.start()
         self._refresh_untracked_summary()
         self._update_view_badges()
@@ -8681,6 +8814,9 @@ class UpdateWindow(QMainWindow):
             text = f"<b style='color:{_positive_hex()}'>✓</b> {text}"
         self._status_active = True
         self._status_owner = "job"
+        # A job owns the line and the header track while it speaks: a
+        # page load filling the track steps aside (see _render_load_track).
+        self._load_track = ""
         self._sub.setText(self._fit_status_line(text))
 
     def _set_load_status(self, key: str, text: str) -> None:
@@ -8698,6 +8834,84 @@ class UpdateWindow(QMainWindow):
             self._loads.pop(key, None)
         self._render_resting_status()
 
+    def _wire_load(self, key: str, loader) -> None:
+        """Point a list loader's progress at the status line and the track.
+
+        One place knows how a load speaks (see _on_load_progress), so the
+        four places that start one only have to say which page it serves.
+        """
+        loader.progress.connect(
+            lambda permille, what: self._on_load_progress(key, permille, what))
+        loader.finished.connect(
+            lambda: self._on_load_thread_finished(key, loader))
+
+    def _on_load_progress(self, key: str, permille: int, what: str) -> None:
+        """A list load reports how far it has come (see _LoadSteps).
+
+        The stage label rides the one status line, with the percent, and
+        the header track fills as it goes. Both speak only while this page
+        is the one on screen and no job owns the line — a load on another
+        page is remembered and paints the moment you open it.
+        """
+        self._set_load_status(key, f"{what} · {permille // 10}%" if what
+                              else "")
+        self._load_pct[key] = permille
+        self._render_load_track()
+
+    def _on_load_thread_finished(self, key: str, loader) -> None:
+        """A list loader's thread ended: give the header track back.
+
+        The load's own `done` handler does that too; this is the net for a
+        thread that died before it could report, so the bar never sits
+        half full over a page that is not reading anything any more.
+        """
+        attr = {"tracked": "_track_loader", "untracked": "_untracked_loader"}
+        if getattr(self, attr[key]) is not loader:
+            return      # the page has already moved on to a newer load
+        self._clear_load_track(key)
+
+    def _clear_load_track(self, key: str) -> None:
+        """This page is not loading any more: forget how far it had come."""
+        self._load_pct.pop(key, None)
+        if key in self._loads:
+            # The line stops reading too: a load that ended mid-sentence
+            # (a thread that died, say) may not keep narrating.
+            self._set_load_status(key, "")
+        if self._load_track == key:
+            self._load_track = ""
+            self._rest_track()
+
+    def _rest_track(self) -> None:
+        """Leave the header track as the empty hairline it rests at."""
+        self._set_progress_state("normal")
+        self._progress.setFormat("")
+        self._progress.setRange(0, 1)
+        self._progress.setValue(0)
+
+    def _render_load_track(self) -> None:
+        """The header track when no job owns it: the visible page's load.
+
+        One owner at a time — a job, a page load, or the release notes
+        arriving (they fill a bar of their own, see on_info_ready) — and a
+        load holds it only while its page is on screen. A load that never
+        reports leaves the track exactly as it found it.
+        """
+        key = self._current_view
+        if self._load_track and self._load_track != key:
+            # The page that held it is no longer the one on screen.
+            self._load_track = ""
+            self._rest_track()
+        permille = self._load_pct.get(key)
+        if permille is None or self._status_owner == "job":
+            if self._load_track == key:
+                self._clear_load_track(key)     # done: the bar goes back
+            return
+        self._load_track = key
+        self._set_progress_state("active")
+        self._progress.setFormat("")
+        self._progress.setRange(0, 1000)
+        self._progress.setValue(permille)
+
     def _end_job_status(self) -> None:
         """The job that owned the status line is over: hand the line back.
 
@@ -8706,6 +8920,8 @@ class UpdateWindow(QMainWindow):
         self._status_owner = ""
         self._status_active = False
         self._render_resting_status()
+        # …and the header track goes back to whatever load was filling it.
+        self._render_load_track()
 
     def _render_resting_status(self) -> None:
         """The line when no job owns it: what this page is loading, else
@@ -8785,7 +9001,9 @@ class UpdateWindow(QMainWindow):
         if 0 <= row < self._model.source_count():
             self._model.set_info(row, desc, notes, date, full, source,
                                  source_url, repo)
-        if not self._updating:
+        if not self._updating and not self._load_track:
+            # The track belongs to a page load while one is filling it: it
+            # counts a different thing (see _render_load_track).
             if self._progress.maximum() <= 1:
                 # Hairline → determinate on first fresh arrival.
                 self._progress.setRange(0, max(self._model.rowCount(), 1))
@@ -8801,10 +9019,12 @@ class UpdateWindow(QMainWindow):
             # The check is done speaking: the line goes back to rest (or
             # to whatever the visible page is still reading).
             self._end_job_status()
-            # Release notes in: relax to an empty hairline divider.
-            self._set_progress_state("normal")
-            self._progress.setRange(0, 1)
-            self._progress.setValue(0)
+            if not self._load_track:
+                # Release notes in: relax to an empty hairline divider —
+                # unless a page load is filling the track right now.
+                self._set_progress_state("normal")
+                self._progress.setRange(0, 1)
+                self._progress.setValue(0)
 
     # ── Update flow ────────────────────────────────────────────────────────────
 
