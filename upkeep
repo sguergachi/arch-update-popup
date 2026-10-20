@@ -4256,17 +4256,19 @@ class _StatCard(QWidget):
             lbl.setAlignment(Qt.AlignmentFlag.AlignLeft
                              | Qt.AlignmentFlag.AlignBaseline)
             lay.addWidget(lbl, 0, Qt.AlignmentFlag.AlignBaseline)
-        # The number keeps a reserved slot — four digits of the stat face,
-        # right-aligned — so a count that grows (0 → 2163) cannot eat into
-        # its caption: the caption would elide mid-load, and the strip
-        # would reflow as the digits arrive (AGENTS.md: no layout shifts).
-        # Every number and every caption then line up in their own column.
+        # The number keeps a reserved slot — four digits of the stat face —
+        # so a count that grows (0 → 2163) cannot eat into its caption: the
+        # caption would elide mid-load, and the strip would reflow as the
+        # digits arrive (AGENTS.md: no layout shifts). Inside the slot the
+        # number starts at the cell's own left padding, so a short count
+        # does not read as an over-padded cell; the caption keeps its x
+        # because the slot's width never changes.
         stat_font = QFont(self.font())
         stat_font.setPixelSize(_sp(22))
         stat_font.setWeight(QFont.Weight.DemiBold)
         self._value.setFixedWidth(
             QFontMetrics(stat_font).horizontalAdvance("0000") + _sp(2))
-        self._value.setAlignment(Qt.AlignmentFlag.AlignRight
+        self._value.setAlignment(Qt.AlignmentFlag.AlignLeft
                                  | Qt.AlignmentFlag.AlignBaseline)
         lay.addStretch()
 

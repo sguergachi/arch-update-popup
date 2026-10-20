@@ -24,7 +24,10 @@ slot; it may never move the slots.
   the control row leaves the strip ~780px; a cell costs `10 + the digit slot +
   8 + its caption` (see `_StatCard`). The digit slot — four digits of the stat
   face, reserved at construction — is what keeps a count that *grows*
-  (`0 → 2163`) from eating into its caption and eliding it mid-load. That
+  (`0 → 2163`) from eating into its caption and eliding it mid-load. Inside
+  the slot the number starts at the cell's own padding, so a short count does
+  not read as an over-padded cell; the caption keeps its x because the slot's
+  width never changes. That
   budget is also why the Library has six cells (YOURS · DEPS · OFFICIAL · AUR ·
   FLATPAK · APPIMAGE) and not seven: seven full captions need ~930px, so the
   CACHYOS cell is gone — CachyOS-managed rows keep their real badge, stay in
