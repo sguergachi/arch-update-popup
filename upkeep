@@ -37,7 +37,7 @@ import urllib.error
 import urllib.request
 
 from PyQt6.QtCore import Qt, QAbstractListModel, QByteArray, QEvent, QModelIndex, QObject, QProcess, QRect, QRectF, QSize, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon, QPainter, QPalette, QPen, QPixmap, QTextDocument
+from PyQt6.QtGui import QBrush, QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPalette, QPen, QPixmap, QTextDocument
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QAbstractScrollArea, QButtonGroup,
@@ -4325,6 +4325,132 @@ def _stat_strip(cards: list[_StatCard]) -> QWidget:
     return row
 
 
+class _HeaderMark(QWidget):
+    """The app mark beside the title — it works while the track does.
+
+    At rest it is the app icon: the accent square, the down arrow and the
+    open tray. While the header's progress track runs (see
+    UpdateWindow._set_progress_state) the arrow keeps falling into the
+    tray — in at the top, down through its place, gone into the tray —
+    and repeats. One calm loop instead of a spinner, and the mark is
+    exactly the icon again the moment the track rests.
+    """
+
+    # One fall, in seconds; where the first one begins; and how far the
+    # arrow travels above and below its place, in the icon's 48-unit space.
+    CYCLE = 1.15
+    START = 0.45
+    ENTRY = -4.6
+    DEEP = 5.0
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Only the rounded square is the mark: the header shows through
+        # the corners, the way the pixmap sat on the window before.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._wanted = False       # the window says work is happening
+        self._t0 = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)      # ~60fps; the phase is time-based
+        self._timer.timeout.connect(self.update)
+        self._arrow, self._tray = self._paths()
+
+    # The mark's own geometry, straight from _ICON_BODY (the 48-unit SVG).
+    @staticmethod
+    def _paths() -> tuple[QPainterPath, QPainterPath]:
+        arrow = QPainterPath()
+        arrow.moveTo(24.0, 12.5)
+        arrow.lineTo(24.0, 25.5)
+        arrow.moveTo(18.2, 20.3)
+        arrow.lineTo(24.0, 26.1)
+        arrow.lineTo(29.8, 20.3)
+        tray = QPainterPath()
+        tray.moveTo(12.8, 29.6)
+        tray.cubicTo(16.2, 33.8, 19.9, 35.9, 24.0, 35.9)
+        tray.cubicTo(28.1, 35.9, 31.8, 33.8, 35.2, 29.6)
+        return arrow, tray
+
+    def _phase(self) -> tuple[float, float]:
+        """The arrow's offset and opacity for this instant."""
+        elapsed = time.monotonic() - self._t0
+        return self._phase_at((self.START + elapsed / self.CYCLE) % 1.0)
+
+    def _phase_at(self, u: float) -> tuple[float, float]:
+        """The loop at `u` (0..1): a fall, eased at both ends.
+
+        The arrow comes in at the top, passes its resting place and sinks
+        into the tray; the fade hides the jump back to the top, so the
+        motion only ever reads downwards.
+        """
+        fall = min(1.0, u / 0.90)
+        fall = fall * fall * (3.0 - 2.0 * fall)
+        offset = self.ENTRY + (self.DEEP - self.ENTRY) * fall
+        # Solid while it falls; it dissolves at the tray's rim, so the
+        # jump back to the top is never seen.
+        if u < 0.09:
+            alpha = u / 0.09
+        elif u < 0.66:
+            alpha = 1.0
+        elif u < 0.80:
+            alpha = (0.80 - u) / 0.14
+        else:
+            alpha = 0.0
+        return offset, alpha
+
+    def set_running(self, running: bool) -> None:
+        """The track is working (or has stopped): follow it, nothing else."""
+        running = bool(running)
+        if running == self._wanted:
+            return
+        self._wanted = running
+        self._sync()
+
+    def _sync(self) -> None:
+        """Run the timer exactly while the window is visible and working."""
+        should = self._wanted and self.isVisible()
+        if should and not self._timer.isActive():
+            self._t0 = time.monotonic()
+            self._timer.start()
+        elif not should and self._timer.isActive():
+            self._timer.stop()
+        self.update()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._sync()
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        super().hideEvent(event)
+        self._sync()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        side = min(self.width(), self.height())
+        painter.scale(side / 48.0, side / 48.0)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(_accent_hex()))
+        painter.drawRoundedRect(QRectF(2.0, 2.0, 44.0, 44.0), 13.0, 13.0)
+
+        pen = QPen(QColor(_on_accent_hex()), 3.4)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(self._tray)
+
+        if self._timer.isActive():
+            offset, alpha = self._phase()
+        else:
+            offset, alpha = 0.0, 1.0
+        if alpha > 0.004:
+            painter.setOpacity(alpha)
+            painter.translate(0.0, offset)
+            painter.drawPath(self._arrow)
+        painter.end()
+
+
 # ── Virtualized package list ─────────────────────────────────────────────
 #
 # Hundreds of package cards must scroll at 60fps with no dropped frames,
@@ -5973,11 +6099,11 @@ class UpdateWindow(QMainWindow):
         # ── Zone 1 · Header: identity left, view switcher right ─────────────
         head = QHBoxLayout()
         head.setSpacing(_sp(16))
-        icon_lbl = QLabel()
-        self._icon_lbl = icon_lbl
-        icon_lbl.setPixmap(_app_icon().pixmap(_sp(36), _sp(36)))
-        icon_lbl.setFixedSize(_sp(36), _sp(36))
-        head.addWidget(icon_lbl, 0, Qt.AlignmentFlag.AlignTop)
+        # The app mark: the icon at rest, and the update arrow falling into
+        # the tray while the header track runs (see _HeaderMark).
+        self._icon_mark = _HeaderMark()
+        self._icon_mark.setFixedSize(_sp(36), _sp(36))
+        head.addWidget(self._icon_mark, 0, Qt.AlignmentFlag.AlignTop)
 
         title_block = QVBoxLayout()
         title_block.setSpacing(_sp(4))
@@ -8276,6 +8402,11 @@ class UpdateWindow(QMainWindow):
         style.polish(self._progress)
         if text:
             self._progress.setFormat(text)
+        # The mark beside the title works for exactly as long as the track
+        # does (see _HeaderMark): one animation, telling the same truth.
+        mark = getattr(self, "_icon_mark", None)
+        if mark is not None:
+            mark.set_running(key == "running")
 
     def _hide_failure_ui(self) -> None:
         self._fail_row = None
@@ -9220,9 +9351,9 @@ class UpdateWindow(QMainWindow):
         Inline stylesheets and pixmaps snapshot the theme when they are
         built, so a live light/dark flip has to rebuild them too.
         """
-        icon_lbl = getattr(self, "_icon_lbl", None)
-        if icon_lbl is not None:
-            icon_lbl.setPixmap(_app_icon().pixmap(_sp(36), _sp(36)))
+        mark = getattr(self, "_icon_mark", None)
+        if mark is not None:
+            mark.update()      # it paints the accent of this moment
         for attr, color in (("_stat_ready", _positive_hex()),
                             ("_stat_official", _accent_hex()),
                             ("_stat_aur", _warning_hex()),

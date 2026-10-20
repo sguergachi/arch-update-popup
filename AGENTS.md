@@ -82,7 +82,11 @@ One place per fact, and no page owns a line of its own:
   track has **one owner at a time** — a job, a load, or the release notes
   arriving — and a load takes it only while its page is on screen; a load that
   ends (or dies) hands it straight back (`_render_load_track`,
-  `_on_load_progress`).
+  `_on_load_progress`). The **app mark beside the title works for exactly as
+  long as the track does**: `_HeaderMark` is started and stopped by
+  `_set_progress_state`, and its arrow falls into the tray and repeats — the
+  icon and the bar tell the same truth, and the mark is the plain icon again
+  the moment the bar rests.
 - **The list's own placeholder carries the verdict** ("Nothing installed",
   "Not scanned yet" — and "No matches" when a filter is hiding everything) and
   the list footer the count (`5 installed`). Explanations that are the same for

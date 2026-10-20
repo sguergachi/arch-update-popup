@@ -3,8 +3,10 @@ import time
 
 import pytest
 
-from PyQt6.QtCore import QObject, QPointF, Qt, pyqtSignal
-from PyQt6.QtGui import QFontMetrics, QMouseEvent
+from PyQt6.QtCore import QByteArray, QObject, QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import (QColor, QFontMetrics, QImage, QMouseEvent, QPainter,
+                         QPixmap)
+from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import QApplication, QLabel
 
 from conftest import load_app
@@ -15,6 +17,26 @@ app = load_app("app_gui")
 @pytest.fixture(scope="module")
 def qapp():
     return QApplication.instance() or QApplication([])
+
+
+def _mark_image(mark) -> QImage:
+    """Render the header mark over the colour it always sits on."""
+    pm = QPixmap(mark.size())
+    pm.fill(QColor("#202326"))
+    mark.render(pm)
+    return pm.toImage()
+
+
+def _mean_diff(a: QImage, b: QImage) -> float:
+    """Mean absolute channel difference between two same-sized images."""
+    total = 0
+    for y in range(a.height()):
+        for x in range(a.width()):
+            ca, cb = a.pixelColor(x, y), b.pixelColor(x, y)
+            total += (abs(ca.red() - cb.red()) + abs(ca.green() - cb.green())
+                      + abs(ca.blue() - cb.blue())
+                      + abs(ca.alpha() - cb.alpha()))
+    return total / (a.width() * a.height() * 4)
 
 
 def _updates(n=4):
@@ -996,9 +1018,9 @@ class TestViews:
         # them (see _on_obs_preload_done).
         monkeypatch.setattr(app.ObsoleteChecker, "start",
                             lambda self: None)
-        window._obs_loaded = False
         window._switch_view("obsolete")
-        qapp.processEvents()
+        qapp.processEvents()      # drain any report already in flight
+        window._obs_loaded = False
         window._on_obs_preload_done(["old-a", "old-b"])
         qapp.processEvents()
         assert set(window._obs_cards) == {"old-a", "old-b"}
@@ -1022,9 +1044,9 @@ class TestViews:
         assert "✓" in window._sub.text()
 
     def test_obsolete_empty_state(self, window, qapp, monkeypatch):
-        window._obs_loaded = False
         window._switch_view("obsolete")
-        qapp.processEvents()
+        qapp.processEvents()      # drain any report already in flight
+        window._obs_loaded = False
         window._on_obs_preload_done([])
         qapp.processEvents()
         assert window._obs_cards == {}
@@ -1038,12 +1060,17 @@ class TestViews:
             raise AssertionError("must not run on GUI thread")
 
         monkeypatch.setattr(app, "get_obsolete_packages", _boom)
+        # No checker thread may report back behind the test: the only
+        # result this page sees is the one fed below.
+        monkeypatch.setattr(app.ObsoleteChecker, "start",
+                            lambda self: None)
         window._obs_loaded = False
         window._switch_view("obsolete")  # would raise if sync
         # The page owns no loading line of its own: the status line says
         # so at once, and the box keeps the frame (see AGENTS.md).
         assert "no repository provides" in window._sub.text()
-        qapp.processEvents()
+        qapp.processEvents()      # drain any report already in flight
+        window._obs_loaded = False
         window._on_obs_preload_done(["x"])
         assert set(window._obs_cards) == {"x"}
 
@@ -1826,14 +1853,18 @@ class TestCardListRemeasure:
 class TestPlaceholdersEverywhere:
     """No list box is ever blank: every one explains itself, in place."""
 
-    def test_obsolete_says_it_is_scanning_on_first_open(self, window, qapp):
-        # Deterministic: the loading state is set when the scan starts,
-        # before the stubbed thread can report back.
+    def test_obsolete_says_it_is_scanning_on_first_open(
+            self, window, qapp, monkeypatch):
+        # Deterministic: no checker thread may report back mid-assert —
+        # the loading state is set when the scan is asked for, and the
+        # only result this test sees is the one it feeds itself.
+        monkeypatch.setattr(app.ObsoleteChecker, "start",
+                            lambda self: None)
         window._switch_view("obsolete")
+        qapp.processEvents()      # drain any report already in flight
         window._obs_loaded = False
         window._obs_empty.hide_state()
         window._load_obsolete_async()
-        qapp.processEvents()
         assert window._obs_empty.isVisible()
         assert window._obs_empty.title.text() == "Loading…"
         # And when it reports, the same box swaps its text.
@@ -2456,6 +2487,74 @@ class TestLoadProgressBar:
         old.finished.emit()             # the page already moved on to `new`
         assert window._progress.maximum() == 1000
         assert window._progress.value() == 300
+
+
+class TestHeaderMark:
+    """The mark beside the title works while the header track does."""
+
+    def test_a_job_starts_and_stops_it(self, window):
+        mark = window._icon_mark
+        assert not mark._timer.isActive()
+        window._set_progress_state("active")
+        assert mark._timer.isActive()
+        window._set_progress_state("ok")
+        assert not mark._timer.isActive()
+        assert window._progress.property("state") == "done"
+
+    def test_a_page_load_starts_and_stops_it(self, window):
+        mark = window._icon_mark
+        window._switch_view("library")
+        window._on_load_progress("library", 450,
+                                 "Working out what needs what…")
+        assert mark._timer.isActive()
+        window._clear_load_track("library")
+        assert not mark._timer.isActive()
+
+    def test_a_hidden_window_rests_the_mark(self, window, qapp):
+        window._set_progress_state("active")
+        assert window._icon_mark._timer.isActive()
+        window.hide()
+        qapp.processEvents()
+        assert not window._icon_mark._timer.isActive()
+        window.show()
+        qapp.processEvents()
+        assert window._icon_mark._timer.isActive()
+
+    def test_the_arrow_only_ever_falls(self):
+        mark = app._HeaderMark()
+        offsets = [mark._phase_at(i / 200.0)[0] for i in range(201)]
+        assert offsets == sorted(offsets)    # never rises, never jumps up
+        assert offsets[0] == mark.ENTRY
+        assert offsets[-1] == mark.DEEP
+        # Off while it wraps from the tray back to the top.
+        assert mark._phase_at(0.0)[1] == 0.0
+        assert mark._phase_at(0.95)[1] == 0.0
+        assert mark._phase_at(0.40)[1] == 1.0
+
+    def test_at_rest_it_is_the_icon(self):
+        mark = app._HeaderMark()
+        mark.setFixedSize(36, 36)
+        idle = _mark_image(mark)
+        expected = QImage(36, 36, QImage.Format.Format_ARGB32)
+        expected.fill(QColor("#202326"))
+        painter = QPainter(expected)
+        QSvgRenderer(QByteArray(app._icon_svg(
+            app._accent_hex(), app._on_accent_hex()))).render(
+                painter, QRectF(0, 0, 36, 36))
+        painter.end()
+        assert _mean_diff(idle, expected) < 2.0
+
+    def test_stopping_puts_the_arrow_back_at_rest(self):
+        mark = app._HeaderMark()
+        mark.setFixedSize(36, 36)
+        mark._wanted = True
+        mark._timer.start()
+        mark._t0 = time.monotonic() - 0.5 * mark.CYCLE
+        running = _mark_image(mark)
+        mark._timer.stop()
+        resting = _mark_image(mark)
+        assert _mean_diff(running, resting) > 2.0
+        assert _mean_diff(resting, _mark_image(mark)) == 0.0
 
 
 class TestPerf:
